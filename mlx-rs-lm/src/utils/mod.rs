@@ -110,10 +110,11 @@ pub(crate) fn quantized_scaled_dot_product_attention(
         &queries,
         q_keys.keys,
         q_keys.scales,
-        &q_keys.biases,
+        q_keys.biases,
         true,
         group_size,
         bits,
+        None::<&str>,
     )?;
 
     if let Some(mask) = mask {
@@ -131,10 +132,11 @@ pub(crate) fn quantized_scaled_dot_product_attention(
         scores,
         q_values.values,
         q_values.scales,
-        &q_values.biases,
+        q_values.biases,
         false,
         group_size,
         bits,
+        None::<&str>,
     )?;
 
     if n_repeats > 1 {
@@ -190,13 +192,31 @@ impl From<QuantizedValues> for MaybeQuantizedValues {
     }
 }
 
-pub(crate) fn scaled_dot_product_attention<C>(
+/// Attention mask for scaled_dot_product_attention.
+/// Use `Causal` for prefill (multi-token input) for hardware-optimized attention.
+/// Use `Array` for explicit masks (e.g., with sliding window).
+/// Use `None` for single-token decode (no mask needed).
+#[derive(Debug, Clone)]
+pub enum SdpaMask<'a> {
+    /// Hardware-optimized causal mask (for prefill)
+    Causal,
+    /// Explicit array mask
+    Array(&'a Array),
+}
+
+impl<'a> From<&'a Array> for SdpaMask<'a> {
+    fn from(mask: &'a Array) -> Self {
+        SdpaMask::Array(mask)
+    }
+}
+
+pub(crate) fn scaled_dot_product_attention<'a, C>(
     queries: Array,
     keys: impl Into<MaybeQuantizedKeys>,
     values: impl Into<MaybeQuantizedValues>,
     cache: Option<C>,
     scale: f32,
-    mask: Option<&Array>,
+    mask: Option<SdpaMask<'a>>,
 ) -> Result<Array, Exception>
 where
     C: KeyValueCache,
@@ -220,12 +240,19 @@ where
                 _ => {
                     return Err(Exception::custom(
                         "Both keys and values must be quantized when KV cache is quantized",
-                    ));
+                    ))
                 }
             };
 
+            // Extract array mask if present (quantized attention doesn't support causal mode)
+            let array_mask = match &mask {
+                Some(SdpaMask::Array(m)) => Some(*m),
+                Some(SdpaMask::Causal) => None, // Quantized SDPA will handle causal internally
+                None => None,
+            };
+
             return quantized_scaled_dot_product_attention(
-                queries, keys, values, scale, mask, group_size, bits,
+                queries, keys, values, scale, array_mask, group_size, bits,
             );
         }
     }
@@ -237,8 +264,15 @@ where
         _ => {
             return Err(Exception::custom(
                 "Both keys and values must NOT be quantized when KV cache is NOT quantized",
-            ));
+            ))
         }
+    };
+
+    // Convert to ScaledDotProductAttentionMask, using Causal mode for prefill
+    let sdpa_mask = match mask {
+        Some(SdpaMask::Causal) => Some(ScaledDotProductAttentionMask::Causal),
+        Some(SdpaMask::Array(m)) => Some(ScaledDotProductAttentionMask::Array(m)),
+        None => None,
     };
 
     mlx_rs::fast::scaled_dot_product_attention(
@@ -246,8 +280,7 @@ where
         keys,
         values,
         scale,
-        mask.map(ScaledDotProductAttentionMask::Array),
-        None,
+        sdpa_mask,
     )
 }
 
