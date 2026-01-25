@@ -38,3 +38,11 @@ path = "examples/compare_stft.rs"
 [[example]]
 name = "compare_cif_batch"
 path = "examples/compare_cif_batch.rs"
+
+[[example]]
+name = "validate_correctness"
+path = "examples/validate_correctness.rs"
+
+[[example]]
+name = "overall_performance"
+path = "examples/overall_performance.rs"
