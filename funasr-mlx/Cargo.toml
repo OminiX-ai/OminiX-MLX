@@ -30,3 +30,11 @@ path = "examples/transcribe.rs"
 [[example]]
 name = "benchmark"
 path = "examples/benchmark.rs"
+
+[[example]]
+name = "compare_stft"
+path = "examples/compare_stft.rs"
+
+[[example]]
+name = "compare_cif_batch"
+path = "examples/compare_cif_batch.rs"
