@@ -1,0 +1,29 @@
+[package]
+name = "funasr-mlx"
+version = "0.1.0"
+edition = "2021"
+description = "FunASR Paraformer speech recognition on Apple Silicon using MLX"
+license = "MIT OR Apache-2.0"
+keywords = ["asr", "speech-recognition", "mlx", "apple-silicon", "paraformer"]
+categories = ["science::ml", "multimedia::audio"]
+
+[dependencies]
+# MLX core - using path dependency for development
+mlx-rs = { path = "../mlx-rs", features = ["metal", "accelerate"] }
+
+# Error handling
+thiserror = "2"
+
+# High-quality audio resampling
+rubato = "0.14"
+
+[dev-dependencies]
+# For examples only
+
+[[example]]
+name = "transcribe"
+path = "examples/transcribe.rs"
+
+[[example]]
+name = "benchmark"
+path = "examples/benchmark.rs"
