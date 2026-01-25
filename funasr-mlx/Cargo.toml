@@ -17,6 +17,9 @@ thiserror = "2"
 # High-quality audio resampling
 rubato = "0.14"
 
+# FFT for efficient STFT computation (replaces O(N²) manual DFT)
+rustfft = "6.2"
+
 [dev-dependencies]
 # For examples only
 

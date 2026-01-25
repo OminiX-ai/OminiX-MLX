@@ -30,6 +30,9 @@ use std::collections::HashMap;
 use std::f32::consts::PI;
 use std::fs;
 use std::path::Path;
+use std::sync::Arc;
+
+use rustfft::{num_complex::Complex, FftPlanner};
 
 use mlx_rs::{
     argmax_axis, array,
@@ -147,14 +150,46 @@ impl Default for ParaformerConfig {
 
 /// Mel spectrogram frontend for Paraformer
 ///
-/// Computes 80-bin mel spectrogram with LFR (Low Frame Rate) stacking
-#[derive(Debug, Clone)]
+/// Computes 80-bin mel spectrogram with LFR (Low Frame Rate) stacking.
+/// Uses FFT for efficient STFT computation (O(N log N) instead of O(N²)).
 pub struct MelFrontend {
     config: ParaformerConfig,
     mel_filters: Vec<f32>,
     window: Vec<f32>,
     cmvn_addshift: Option<Vec<f32>>,
     cmvn_rescale: Option<Vec<f32>>,
+    /// Cached FFT instance for efficient repeated STFT computation
+    fft: Arc<dyn rustfft::Fft<f32>>,
+}
+
+impl std::fmt::Debug for MelFrontend {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.debug_struct("MelFrontend")
+            .field("config", &self.config)
+            .field("mel_filters_len", &self.mel_filters.len())
+            .field("window_len", &self.window.len())
+            .field("cmvn_addshift", &self.cmvn_addshift.is_some())
+            .field("cmvn_rescale", &self.cmvn_rescale.is_some())
+            .field("fft_len", &self.fft.len())
+            .finish()
+    }
+}
+
+impl Clone for MelFrontend {
+    fn clone(&self) -> Self {
+        // Re-create FFT planner for clone since Arc<dyn Fft> is not Clone
+        let mut planner = FftPlanner::<f32>::new();
+        let fft = planner.plan_fft_forward(self.config.n_fft as usize);
+
+        Self {
+            config: self.config.clone(),
+            mel_filters: self.mel_filters.clone(),
+            window: self.window.clone(),
+            cmvn_addshift: self.cmvn_addshift.clone(),
+            cmvn_rescale: self.cmvn_rescale.clone(),
+            fft,
+        }
+    }
 }
 
 impl MelFrontend {
@@ -173,12 +208,17 @@ impl MelFrontend {
 
         let mel_filters = Self::create_mel_filterbank(n_fft, n_mels, sample_rate);
 
+        // Pre-create FFT planner for efficient repeated use
+        let mut planner = FftPlanner::<f32>::new();
+        let fft = planner.plan_fft_forward(n_fft);
+
         Self {
             config: config.clone(),
             mel_filters,
             window,
             cmvn_addshift: None,
             cmvn_rescale: None,
+            fft,
         }
     }
 
@@ -326,6 +366,11 @@ impl MelFrontend {
         ))
     }
 
+    /// Compute STFT using cached FFT (O(N log N) instead of O(N²) manual DFT)
+    ///
+    /// Performance improvement: ~45x faster than manual DFT for n_fft=400
+    /// - Manual DFT: ~160,000 operations per frame
+    /// - FFT: ~3,500 operations per frame
     fn compute_stft(&self, samples: &[f32]) -> Vec<f32> {
         let n_fft = self.config.n_fft as usize;
         let hop_length = self.config.hop_length as usize;
@@ -342,26 +387,23 @@ impl MelFrontend {
         }
 
         let mut power_spec = vec![0.0f32; n_frames * n_freqs];
+        let mut buffer: Vec<Complex<f32>> = vec![Complex::new(0.0, 0.0); n_fft];
 
         for frame in 0..n_frames {
             let start = frame * hop_length;
 
-            let mut windowed = vec![0.0f32; n_fft];
+            // Apply window and convert to complex
             for i in 0..n_fft {
-                windowed[i] = samples[start + i] * self.window[i];
+                buffer[i] = Complex::new(samples[start + i] * self.window[i], 0.0);
             }
 
+            // Compute FFT in-place using cached FFT instance
+            self.fft.process(&mut buffer);
+
+            // Extract power spectrum (only positive frequencies)
             for k in 0..n_freqs {
-                let mut real = 0.0f32;
-                let mut imag = 0.0f32;
-
-                for n in 0..n_fft {
-                    let angle = 2.0 * PI * k as f32 * n as f32 / n_fft as f32;
-                    real += windowed[n] * angle.cos();
-                    imag -= windowed[n] * angle.sin();
-                }
-
-                power_spec[frame * n_freqs + k] = real * real + imag * imag;
+                let c = buffer[k];
+                power_spec[frame * n_freqs + k] = c.re * c.re + c.im * c.im;
             }
         }
 
@@ -725,10 +767,15 @@ impl CIFPredictor {
         let h = self.conv.forward(encoder_out)?;
         let h = nn::relu(&h)?;
         let alphas = self.output_proj.forward(&h)?;
-        let alphas = alphas.squeeze()?;
+        // Squeeze the last dimension (1) but keep batch dimension
+        let alphas = alphas.squeeze_axes(&[-1])?;
         ops::sigmoid(&alphas)
     }
 
+    /// CIF fire mechanism with batch support
+    ///
+    /// Now supports batch_size > 1 for improved throughput.
+    /// For batched input, pads output to max token count across batch.
     fn cif_fire(
         &self,
         hidden: &Array,
@@ -737,68 +784,96 @@ impl CIFPredictor {
         let shape = hidden.shape();
         let (batch, len_time, hidden_size) = (shape[0], shape[1], shape[2]);
 
-        if batch != 1 {
-            return Err(Exception::from("CIF currently only supports batch_size=1"));
-        }
-
-        let alphas_data: Vec<f32> = alphas
-            .try_as_slice::<f32>()
-            .map_err(|_| Exception::from("Failed to get alphas slice"))?
-            .to_vec();
+        // Get data as contiguous slices
         let hidden_data: Vec<f32> = hidden
             .try_as_slice::<f32>()
             .map_err(|_| Exception::from("Failed to get hidden slice"))?
             .to_vec();
 
-        let mut integrate = 0.0f32;
-        let mut frame = vec![0.0f32; hidden_size as usize];
-        let mut list_frames: Vec<Vec<f32>> = Vec::new();
+        // Handle potentially 2D or 1D alphas based on batch size
+        let alphas_flat: Vec<f32> = alphas
+            .try_as_slice::<f32>()
+            .map_err(|_| Exception::from("Failed to get alphas slice"))?
+            .to_vec();
 
-        for t in 0..len_time as usize {
-            let alpha = alphas_data[t];
-            let distribution_completion = 1.0 - integrate;
+        // Process each batch item
+        let mut all_batch_frames: Vec<Vec<Vec<f32>>> = Vec::with_capacity(batch as usize);
+        let mut token_counts: Vec<i32> = Vec::with_capacity(batch as usize);
 
-            integrate += alpha;
+        for b in 0..batch as usize {
+            let mut integrate = 0.0f32;
+            let mut frame = vec![0.0f32; hidden_size as usize];
+            let mut list_frames: Vec<Vec<f32>> = Vec::new();
 
-            let fire_place = integrate >= self.threshold;
-            if fire_place {
-                integrate -= 1.0;
-            }
+            for t in 0..len_time as usize {
+                // Index into flattened arrays
+                let alpha_idx = b * len_time as usize + t;
+                let hidden_offset = b * (len_time as usize * hidden_size as usize)
+                    + t * hidden_size as usize;
 
-            let cur = if fire_place {
-                distribution_completion
-            } else {
-                alpha
-            };
-            let remainds = alpha - cur;
+                let alpha = alphas_flat[alpha_idx];
+                let distribution_completion = 1.0 - integrate;
 
-            for d in 0..hidden_size as usize {
-                frame[d] += cur * hidden_data[t * hidden_size as usize + d];
-            }
+                integrate += alpha;
 
-            if fire_place {
-                list_frames.push(frame.clone());
+                let fire_place = integrate >= self.threshold;
+                if fire_place {
+                    integrate -= 1.0;
+                }
+
+                let cur = if fire_place {
+                    distribution_completion
+                } else {
+                    alpha
+                };
+                let remainds = alpha - cur;
+
                 for d in 0..hidden_size as usize {
-                    frame[d] = remainds * hidden_data[t * hidden_size as usize + d];
+                    frame[d] += cur * hidden_data[hidden_offset + d];
+                }
+
+                if fire_place {
+                    list_frames.push(frame.clone());
+                    for d in 0..hidden_size as usize {
+                        frame[d] = remainds * hidden_data[hidden_offset + d];
+                    }
+                }
+            }
+
+            // Handle tail
+            if integrate > self.tail_threshold {
+                list_frames.push(frame);
+            }
+
+            token_counts.push(list_frames.len() as i32);
+            all_batch_frames.push(list_frames);
+        }
+
+        // Find max token count for padding
+        let max_tokens = token_counts.iter().copied().max().unwrap_or(0) as usize;
+
+        if max_tokens == 0 {
+            return Ok((
+                Array::zeros::<f32>(&[batch, 0, hidden_size])?,
+                Array::from_slice(&token_counts, &[batch]),
+            ));
+        }
+
+        // Create padded output array
+        let mut flat_embeds = vec![0.0f32; batch as usize * max_tokens * hidden_size as usize];
+
+        for (b, batch_frames) in all_batch_frames.into_iter().enumerate() {
+            for (t, frame) in batch_frames.into_iter().enumerate() {
+                let offset = b * max_tokens * hidden_size as usize + t * hidden_size as usize;
+                for (d, &val) in frame.iter().enumerate() {
+                    flat_embeds[offset + d] = val;
                 }
             }
         }
 
-        if integrate > self.tail_threshold {
-            list_frames.push(frame);
-        }
-
-        let num_tokens = list_frames.len();
-        if num_tokens == 0 {
-            return Ok((
-                Array::zeros::<f32>(&[1, 0, hidden_size])?,
-                Array::from_slice(&[0i32], &[1]),
-            ));
-        }
-
-        let flat_embeds: Vec<f32> = list_frames.into_iter().flatten().collect();
-        let embeds_array = Array::from_slice(&flat_embeds, &[1, num_tokens as i32, hidden_size]);
-        let token_num = Array::from_slice(&[num_tokens as i32], &[1]);
+        let embeds_array =
+            Array::from_slice(&flat_embeds, &[batch, max_tokens as i32, hidden_size]);
+        let token_num = Array::from_slice(&token_counts, &[batch]);
 
         Ok((embeds_array, token_num))
     }
@@ -1153,6 +1228,31 @@ impl Paraformer {
 
         let token_ids = argmax_axis!(logits, -1)?;
         Ok(token_ids.as_dtype(mlx_rs::Dtype::Int32)?)
+    }
+
+    /// Transcribe from pre-computed mel features (for batched processing)
+    ///
+    /// Use this when you have already computed mel spectrograms and want
+    /// to process them in a batch for better throughput.
+    pub fn transcribe_from_mel(&mut self, mel: &Array) -> Result<(Array, Array)> {
+        let encoder_out = self.encoder.forward(mel)?;
+        let (acoustic_embeds, token_num) = self.predictor.forward(&encoder_out)?;
+
+        if acoustic_embeds.shape()[1] == 0 {
+            let batch = mel.shape()[0];
+            return Ok((
+                Array::from_slice::<i32>(&[], &[batch, 0]),
+                Array::zeros::<i32>(&[batch])?,
+            ));
+        }
+
+        let logits = self.decoder.forward(DecoderInput {
+            acoustic_embeds: &acoustic_embeds,
+            encoder_out: &encoder_out,
+        })?;
+
+        let token_ids = argmax_axis!(logits, -1)?;
+        Ok((token_ids.as_dtype(mlx_rs::Dtype::Int32)?, token_num))
     }
 
     /// Set CMVN normalization parameters
