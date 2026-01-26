@@ -67,7 +67,7 @@ Each decoder layer has 4 LayerNorms:
 ## Examples
 
 ```bash
-cargo run --example generate --release -- ./GLM-4-9B "你好"
+cargo run --release --example generate_glm4 -- ./GLM-4-9B "你好"
 ```
 
 ## Supported Models

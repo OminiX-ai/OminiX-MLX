@@ -4,6 +4,7 @@
 name = "gpt-sovits-mlx"
 version = "0.1.0"
 edition = "2021"
+autoexamples = false
 authors = ["YueChen"]
 description = "GPT-SoVITS voice cloning in pure Rust with MLX acceleration"
 repository = "https://github.com/user/gpt-sovits-mlx"

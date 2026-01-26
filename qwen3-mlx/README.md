@@ -53,10 +53,10 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
 
 ```bash
 # Text generation
-cargo run --example generate --release -- ./Qwen3-4B-bf16 "Hello, how are you?"
+cargo run --release --example generate_qwen3 -- ./Qwen3-4B-bf16 "Hello, how are you?"
 
 # Interactive chat
-cargo run --example chat --release -- ./Qwen3-4B-bf16
+cargo run --release --example chat_qwen3 -- ./Qwen3-4B-bf16
 ```
 
 ## Supported Models

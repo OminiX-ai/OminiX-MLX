@@ -48,10 +48,20 @@ Audio (16kHz)
 | Fun-ASR-Nano-2512 | ZH, EN, JA | 800M |
 | Fun-ASR-MLT-Nano-2512 | 31 languages | 800M |
 
+## CLI Usage
+
+```bash
+# Basic transcription
+cargo run --release --example transcribe -- ./Fun-ASR-Nano-2512 ./audio.wav
+
+# Benchmark
+cargo run --release --example benchmark -- ./Fun-ASR-Nano-2512 ./audio.wav
+```
+
 ## Usage
 
 ```rust
-use funasr_nano_mlx::{FunASRNano, load_model, transcribe};
+use funasr_nano_mlx::{FunASRNano, load_model};
 
 fn main() -> Result<(), Box<dyn std::error::Error>> {
     // Load model

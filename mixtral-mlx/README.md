@@ -86,7 +86,7 @@ On M3 Max (40-core GPU):
 ## Example
 
 ```bash
-cargo run --example generate --release -- ./Mixtral-8x7B-4bit "Tell me about"
+cargo run --release --example generate_mixtral -- ./Mixtral-8x7B-4bit "Tell me about"
 ```
 
 ## License
