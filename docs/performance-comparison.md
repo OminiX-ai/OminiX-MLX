@@ -149,7 +149,7 @@ Python mlx-lm:
   Generation: 83.5 tok/s
   Peak memory: 4.3 GB
 
-Rust mistral-mlx (with shared mlx-lm-core):
+Rust mistral-mlx (with shared mlx-rs-core):
   Run 1: 82.7 tok/s
   Run 2: 82.9 tok/s
   Run 3: 82.7 tok/s
