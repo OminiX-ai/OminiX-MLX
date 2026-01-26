@@ -1,8 +1,8 @@
 [package]
-name = "mistral-mlx"
+name = "mixtral-mlx"
 version = "0.1.0"
 edition = "2021"
-description = "Mistral LLM inference on Apple Silicon with MLX"
+description = "Mixtral MoE LLM inference on Apple Silicon with MLX"
 license = "MIT OR Apache-2.0"
 
 [dependencies]
@@ -14,15 +14,6 @@ serde = { version = "1", features = ["derive"] }
 serde_json = "1"
 tokenizers = "0.21"
 
-[dev-dependencies]
-clap = { version = "4", features = ["derive"] }
-hf-hub = "0.4"
-anyhow = "1"
-
 [[example]]
-name = "generate_mistral"
-path = "examples/generate_mistral.rs"
-
-[[example]]
-name = "benchmark_mistral"
-path = "examples/benchmark_mistral.rs"
+name = "generate_mixtral"
+path = "examples/generate_mixtral.rs"

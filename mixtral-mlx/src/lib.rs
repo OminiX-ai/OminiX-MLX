@@ -1,24 +1,24 @@
-//! # glm4-moe-mlx
+//! # mixtral-mlx
 //!
-//! GLM-4.5 MoE (Mixture of Experts) LLM inference on Apple Silicon with MLX.
+//! Mixtral MoE (Mixture of Experts) LLM inference on Apple Silicon with MLX.
 //!
 //! ## Features
 //!
-//! - Partial RoPE (rotary position embedding on partial dimensions)
-//! - Mixture of Experts with top-k routing (shared + routed experts)
+//! - 8 experts with top-2 routing per token
 //! - Custom fused SwiGLU Metal kernel (10-12x faster)
-//! - 3-bit quantization support
+//! - Optimized gather_qmm for expert dispatch
+//! - Support for 4-bit quantized models
 //!
 //! ## Quick Start
 //!
 //! ```rust,ignore
-//! use glm4_moe_mlx::{load_model, load_tokenizer, Generate, KVCache};
+//! use mixtral_mlx::{load_model, load_tokenizer, Generate, KVCache};
 //! use mlx_rs::ops::indexing::NewAxis;
 //!
-//! let mut model = load_model("path/to/GLM-4-9B-Chat-1M")?;
-//! let tokenizer = load_tokenizer("path/to/GLM-4-9B-Chat-1M")?;
+//! let mut model = load_model("path/to/Mixtral-8x7B-4bit")?;
+//! let tokenizer = load_tokenizer("path/to/Mixtral-8x7B-4bit")?;
 //!
-//! let encoding = tokenizer.encode("你好", true)?;
+//! let encoding = tokenizer.encode("Hello, ", true)?;
 //! let prompt = mlx_rs::Array::from(encoding.get_ids()).index(NewAxis);
 //! let mut cache = Vec::new();
 //!
@@ -36,14 +36,15 @@ pub mod model;
 pub use mlx_rs_core::{
     cache::{ConcatKeyValueCache, KVCache, KeyValueCache},
     error::{Error, Result},
-    fused_swiglu,  // Custom Metal kernel
+    fused_swiglu,  // Custom Metal kernel from shared crate
     utils::{create_attention_mask, scaled_dot_product_attention,
             AttentionMask, SdpaMask},
+    load_tokenizer,
 };
 
 pub use model::{
-    load_model, load_tokenizer, get_model_args, init_cache,
+    load_model, get_model_args,
     Generate, GenerateState, Model, ModelArgs, ModelInput,
-    Attention, AttentionInput, MLP, MoE, MoEGate, SwitchGLU, DecoderLayer, LanguageModel,
+    Attention, AttentionInput, MixtralSparseMoeBlock, SwitchGLU, DecoderLayer, MixtralModel,
     sample,
 };

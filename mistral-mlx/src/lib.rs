@@ -32,8 +32,8 @@
 
 pub mod model;
 
-// Re-export shared components from mlx-lm-core
-pub use mlx_lm_core::{
+// Re-export shared components from mlx-rs-core
+pub use mlx_rs_core::{
     cache::{ConcatKeyValueCache, KVCache, KeyValueCache},
     error::{Error, Result},
     utils::{create_attention_mask, scaled_dot_product_attention, AttentionMask, SdpaMask},

@@ -21,13 +21,13 @@ members = [
     "mlx-sys",
     "mlx-rs",
     "mlx-internal-macros",
-    "mlx-rs-lm",
     "mlx-lm-utils",
-    "mlx-lm-core",
+    "mlx-rs-core",
     "mlx-tests",
     "flux-klein-mlx",
     "zimage-mlx",
     "funasr-mlx",
+    "funasr-nano-mlx",
     "qwen3-mlx",
     "glm4-mlx",
     "glm4-moe-mlx",
@@ -46,8 +46,8 @@ mlx-sys = { version = "=0.2.0", path = "mlx-sys" }
 mlx-macros = { version = "0.25", path = "mlx-macros" }
 mlx-internal-macros = { version = "0.25", path = "mlx-internal-macros" }
 mlx-rs = { version = "0.25", path = "mlx-rs" }
-mlx-rs-lm = { version = "0.0.1", path = "mlx-rs-lm" }
 mlx-lm-utils = { version = "0.0.1", path = "mlx-lm-utils" }
+mlx-rs-core = { version = "0.1.0", path = "mlx-rs-core" }
 
 # external dependencies
 thiserror = "2"

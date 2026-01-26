@@ -1,0 +1,48 @@
+[package]
+name = "funasr-nano-mlx"
+version = "0.1.0"
+edition = "2021"
+description = "Fun-ASR-Nano speech recognition on Apple Silicon with MLX"
+license = "MIT"
+repository = "https://github.com/example/funasr-nano-mlx"
+
+[dependencies]
+# MLX framework
+mlx-rs = { path = "../mlx-rs", features = ["metal", "accelerate"] }
+mlx-sys = { path = "../mlx-sys" }
+
+# Shared LLM infrastructure
+mlx-rs-core = { path = "../mlx-rs-core" }
+
+# Serialization
+serde = { version = "1", features = ["derive"] }
+serde_json = "1"
+serde_yaml = "0.9"
+
+# Tokenization
+tokenizers = "0.21"
+
+# Error handling
+thiserror = "2"
+
+# Audio processing
+rubato = "0.16"  # High-quality resampling
+hound = "3.5"    # WAV file reading
+rustfft = "6.2"  # FFT for mel spectrogram (45x faster than manual DFT)
+
+[dev-dependencies]
+
+[[example]]
+name = "transcribe"
+path = "examples/transcribe.rs"
+
+[[example]]
+name = "benchmark"
+path = "examples/benchmark.rs"
+
+[[example]]
+name = "fair_benchmark"
+path = "examples/fair_benchmark.rs"
+[[example]]
+name = "profile_test"
+path = "examples/profile_test.rs"

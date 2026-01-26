@@ -1,0 +1,17 @@
+[package]
+name = "mlx-rs-core"
+version = "0.1.0"
+edition = "2021"
+description = "Shared inference infrastructure for MLX Rust crates"
+license = "MIT OR Apache-2.0"
+
+[dependencies]
+mlx-rs = { path = "../mlx-rs", features = ["metal", "accelerate"] }
+mlx-sys = { path = "../mlx-sys" }
+thiserror = "2"
+serde = { version = "1", features = ["derive"] }
+serde_json = "1"
+tokenizers = "0.21"
+
+# Audio processing dependencies
+rubato = "0.14"  # High-quality audio resampling

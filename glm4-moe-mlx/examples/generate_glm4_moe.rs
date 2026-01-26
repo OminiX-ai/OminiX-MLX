@@ -1,0 +1,83 @@
+//! Simple text generation example with GLM-4.5 MoE
+
+use std::env;
+use std::time::Instant;
+use mlx_rs::ops::indexing::{IndexOp, NewAxis};
+use mlx_rs::transforms::eval;
+use glm4_moe_mlx::{load_model, load_tokenizer, Generate, KVCache, Error};
+
+fn main() -> Result<(), Error> {
+    let args: Vec<String> = env::args().collect();
+    if args.len() < 2 {
+        eprintln!("Usage: {} <model_dir> [prompt]", args[0]);
+        eprintln!("Note: GLM-4.5 MoE requires quantized model weights.");
+        std::process::exit(1);
+    }
+
+    let model_dir = &args[1];
+    let prompt = args.get(2)
+        .map(|s| s.as_str())
+        .unwrap_or("你好，请介绍一下自己。");
+
+    println!("Loading GLM-4.5 MoE model from: {}", model_dir);
+    let start = Instant::now();
+
+    let tokenizer = load_tokenizer(model_dir)?;
+    let mut model = load_model(model_dir)?;
+
+    println!("Model loaded in {:.2}s", start.elapsed().as_secs_f32());
+
+    let encoding = tokenizer.encode(prompt, true)?;
+    let prompt_tokens = mlx_rs::Array::from(encoding.get_ids()).index(NewAxis);
+    let prompt_len = encoding.get_ids().len();
+
+    println!("Prompt ({} tokens): {}", prompt_len, prompt);
+    println!("---");
+
+    let mut cache = Vec::new();
+    let temperature = 0.7;
+    let max_tokens = 100;
+
+    let generate_start = Instant::now();
+
+    let generator = Generate::<KVCache>::new(
+        &mut model,
+        &mut cache,
+        temperature,
+        &prompt_tokens,
+    );
+
+    let mut tokens = Vec::new();
+
+    for (i, token) in generator.enumerate() {
+        let token = token?;
+        tokens.push(token.clone());
+
+        if tokens.len() % 10 == 0 {
+            eval(&tokens)?;
+            let slice: Vec<u32> = tokens.drain(..).map(|t| t.item::<u32>()).collect();
+            let text = tokenizer.decode(&slice, true)?;
+            print!("{}", text);
+        }
+
+        if i >= max_tokens - 1 {
+            break;
+        }
+    }
+
+    if !tokens.is_empty() {
+        eval(&tokens)?;
+        let slice: Vec<u32> = tokens.drain(..).map(|t| t.item::<u32>()).collect();
+        let text = tokenizer.decode(&slice, true)?;
+        print!("{}", text);
+    }
+    println!();
+
+    let gen_time = generate_start.elapsed().as_secs_f32();
+    let tokens_per_sec = max_tokens as f32 / gen_time;
+
+    println!("---");
+    println!("Generated {} tokens in {:.2}s ({:.1} tok/s)", max_tokens, gen_time, tokens_per_sec);
+
+    Ok(())
+}

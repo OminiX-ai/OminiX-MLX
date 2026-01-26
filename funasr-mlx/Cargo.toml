@@ -11,11 +11,11 @@ categories = ["science::ml", "multimedia::audio"]
 # MLX core - using path dependency for development
 mlx-rs = { path = "../mlx-rs", features = ["metal", "accelerate"] }
 
+# Shared infrastructure
+mlx-rs-core = { path = "../mlx-rs-core" }
+
 # Error handling
 thiserror = "2"
-
-# High-quality audio resampling
-rubato = "0.14"
 
 # FFT for efficient STFT computation (replaces O(N²) manual DFT)
 rustfft = "6.2"
