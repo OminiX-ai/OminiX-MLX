@@ -56,6 +56,22 @@ cargo run --release --example voice_clone -- \
     --text "你好，世界！"
 ```
 
+### Model Download
+
+Download pre-converted MLX models:
+
+```bash
+# GPT-SoVITS model pack (includes all required files)
+huggingface-cli download lj1995/GPT-SoVITS-MLX --local-dir ./models/gpt-sovits
+
+# Or download individual components:
+# CNHubert encoder
+huggingface-cli download TencentGameMate/chinese-hubert-base --local-dir ./models/hubert
+
+# Chinese BERT
+huggingface-cli download hfl/chinese-roberta-wwm-ext --local-dir ./models/bert
+```
+
 ### Model Files
 
 A complete model setup requires:

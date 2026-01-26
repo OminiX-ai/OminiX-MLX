@@ -66,14 +66,31 @@ Uses `gather_qmm` for efficient batched expert computation:
 - Tokens sorted by expert for coalesced memory access
 - Single kernel call for all experts
 
-## Preparing Models
+## Model Download
 
-Mixtral requires 4-bit quantization to fit on consumer GPUs:
+Download pre-converted MLX models from Hugging Face:
+
+```bash
+# Mixtral-8x7B 4-bit (recommended, fits in 32GB)
+huggingface-cli download mlx-community/Mixtral-8x7B-Instruct-v0.1-4bit --local-dir ./models/Mixtral-8x7B-4bit
+
+# Mixtral-8x22B 4-bit (requires 64GB+ memory)
+huggingface-cli download mlx-community/Mixtral-8x22B-Instruct-v0.1-4bit --local-dir ./models/Mixtral-8x22B-4bit
+```
+
+Or convert from Hugging Face yourself (4-bit quantization required for consumer hardware):
 
 ```bash
 pip install mlx-lm
-mlx_lm.convert --hf-path mistralai/Mixtral-8x7B-v0.1 -q
+mlx_lm.convert --hf-path mistralai/Mixtral-8x7B-Instruct-v0.1 -q
 ```
+
+## Supported Models
+
+| Model | HuggingFace Path | Size |
+|-------|------------------|------|
+| Mixtral-8x7B-4bit | `mlx-community/Mixtral-8x7B-Instruct-v0.1-4bit` | 26 GB |
+| Mixtral-8x22B-4bit | `mlx-community/Mixtral-8x22B-Instruct-v0.1-4bit` | 70 GB |
 
 ## Performance
 

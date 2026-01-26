@@ -59,21 +59,38 @@ cargo run --release --example generate_qwen3 -- ./Qwen3-4B-bf16 "Hello, how are 
 cargo run --release --example chat_qwen3 -- ./Qwen3-4B-bf16
 ```
 
-## Supported Models
+## Model Download
 
-- Qwen3-0.6B
-- Qwen3-1.7B
-- Qwen3-4B
-- Qwen3-8B
-- Qwen3-14B
-- Qwen3-32B
+Download pre-converted MLX models from Hugging Face:
 
-Models can be downloaded from Hugging Face and converted using `mlx-lm`:
+```bash
+# Qwen3-4B (recommended for testing)
+huggingface-cli download mlx-community/Qwen3-4B-bf16 --local-dir ./models/Qwen3-4B
+
+# Qwen3-8B
+huggingface-cli download mlx-community/Qwen3-8B-bf16 --local-dir ./models/Qwen3-8B
+
+# Qwen3-4B 4-bit quantized (smaller, faster)
+huggingface-cli download mlx-community/Qwen3-4B-4bit --local-dir ./models/Qwen3-4B-4bit
+```
+
+Or convert from Hugging Face yourself:
 
 ```bash
 pip install mlx-lm
 mlx_lm.convert --hf-path Qwen/Qwen3-4B -q
 ```
+
+## Supported Models
+
+| Model | HuggingFace Path | Size |
+|-------|------------------|------|
+| Qwen3-0.6B | `mlx-community/Qwen3-0.6B-bf16` | 1.2 GB |
+| Qwen3-1.7B | `mlx-community/Qwen3-1.7B-bf16` | 3.4 GB |
+| Qwen3-4B | `mlx-community/Qwen3-4B-bf16` | 8 GB |
+| Qwen3-8B | `mlx-community/Qwen3-8B-bf16` | 16 GB |
+| Qwen3-14B | `mlx-community/Qwen3-14B-bf16` | 28 GB |
+| Qwen3-32B | `mlx-community/Qwen3-32B-bf16` | 64 GB |
 
 ## Performance
 

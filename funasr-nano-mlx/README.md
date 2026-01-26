@@ -48,14 +48,26 @@ Audio (16kHz)
 | Fun-ASR-Nano-2512 | ZH, EN, JA | 800M |
 | Fun-ASR-MLT-Nano-2512 | 31 languages | 800M |
 
+## Model Download
+
+Download models from Hugging Face:
+
+```bash
+# Fun-ASR-Nano (Chinese, English, Japanese)
+huggingface-cli download FunAudioLLM/Fun-ASR-Nano-2512 --local-dir ./models/Fun-ASR-Nano-2512
+
+# Fun-ASR-MLT-Nano (31 languages)
+huggingface-cli download FunAudioLLM/Fun-ASR-MLT-Nano-2512 --local-dir ./models/Fun-ASR-MLT-Nano-2512
+```
+
 ## CLI Usage
 
 ```bash
 # Basic transcription
-cargo run --release --example transcribe -- ./Fun-ASR-Nano-2512 ./audio.wav
+cargo run --release --example transcribe -- ./models/Fun-ASR-Nano-2512 ./audio.wav
 
 # Benchmark
-cargo run --release --example benchmark -- ./Fun-ASR-Nano-2512 ./audio.wav
+cargo run --release --example benchmark -- ./models/Fun-ASR-Nano-2512 ./audio.wav
 ```
 
 ## Usage

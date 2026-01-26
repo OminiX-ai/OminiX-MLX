@@ -70,10 +70,31 @@ Each decoder layer has 4 LayerNorms:
 cargo run --release --example generate_glm4 -- ./GLM-4-9B "你好"
 ```
 
+## Model Download
+
+Download pre-converted MLX models from Hugging Face:
+
+```bash
+# GLM-4-9B Chat (recommended)
+huggingface-cli download mlx-community/glm-4-9b-chat-4bit --local-dir ./models/GLM-4-9B-4bit
+
+# GLM-4-9B bf16 (requires 18GB+ memory)
+huggingface-cli download mlx-community/glm-4-9b-chat-bf16 --local-dir ./models/GLM-4-9B
+```
+
+Or convert from Hugging Face yourself:
+
+```bash
+pip install mlx-lm
+mlx_lm.convert --hf-path THUDM/glm-4-9b-chat -q
+```
+
 ## Supported Models
 
-- GLM-4-9B
-- GLM-4-9B-Chat
+| Model | HuggingFace Path | Size |
+|-------|------------------|------|
+| GLM-4-9B | `mlx-community/glm-4-9b-chat-bf16` | 18 GB |
+| GLM-4-9B-4bit | `mlx-community/glm-4-9b-chat-4bit` | 6 GB |
 
 ## License
 

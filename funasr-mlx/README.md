@@ -50,17 +50,26 @@ Or from git:
 funasr-mlx = { git = "https://github.com/oxideai/mlx-rs" }
 ```
 
-## Model Files
+## Model Download
 
-You need to obtain the FunASR Paraformer-large model files:
+Download pre-converted MLX model from Hugging Face:
 
-1. **Weights**: Convert FunASR PyTorch checkpoint to safetensors format
-2. **CMVN**: `am.mvn` file from FunASR model directory
-3. **Vocabulary**: `tokens.txt` with 8404 Chinese tokens
+```bash
+# Paraformer-large (Chinese ASR)
+huggingface-cli download funaudiollm/paraformer-large-mlx --local-dir ./models/paraformer
+```
 
-### Converting Weights
+Model directory structure:
+```
+models/paraformer/
+├── paraformer.safetensors   # Model weights
+├── am.mvn                   # CMVN normalization
+└── tokens.txt               # Vocabulary (8404 tokens)
+```
 
-Use the conversion script to convert FunASR weights:
+### Converting from FunASR (Alternative)
+
+If you need to convert from the original FunASR checkpoint:
 
 ```python
 # scripts/convert_paraformer.py
