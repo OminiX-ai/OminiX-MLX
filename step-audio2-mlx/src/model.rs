@@ -336,6 +336,12 @@ impl StepAudio2 {
     }
 
     /// Generate text tokens using placeholder-based audio insertion
+    ///
+    /// Performance notes:
+    /// - MLX lazy evaluation batches operations within each iteration
+    /// - item() forces synchronization to get token value for stopping conditions
+    /// - KV cache is updated incrementally, avoiding recomputation
+    /// - For longer generations, consider speculative decoding
     fn generate_text(
         &mut self,
         audio_features: &Array,
@@ -378,22 +384,24 @@ impl StepAudio2 {
             mlx_rs::ops::concatenate_axis(&[&before_audio, audio_features], 1)?
         };
 
-        // Run prefill with combined embeddings
+        // Run prefill with combined embeddings (this is the heavy computation)
         let logits = self.llm.forward_embeddings(&combined, &mut self.cache)?;
 
         // Get last token logits
         let seq_len = logits.shape()[1];
         let last_logits = logits.index((.., seq_len - 1, ..));
 
-        // Sample first token
+        // Sample first token - item() forces evaluation
         let mut token = sample(&last_logits, temperature)?;
         let mut token_id = token.item::<i32>();
 
         let mut output_tokens = vec![token_id];
 
-        // Generate remaining tokens
+        // Autoregressive generation loop
+        // Each iteration: embed -> forward -> sample -> check stopping
+        // MLX batches lazy operations within each iteration automatically
         for _ in 1..max_tokens {
-            // Check for EOS/EOT tokens
+            // Check stopping conditions (requires evaluated token_id)
             if token_id == tokens::EOS_TOKEN
                || token_id == tokens::EOT_TOKEN
                || token_id == tokens::IM_END_TOKEN {
@@ -405,15 +413,13 @@ impl StepAudio2 {
                 break;
             }
 
-            // Get embedding for current token
+            // Single token forward pass (incremental decoding)
             let token_array = Array::from_slice(&[token_id], &[1, 1]);
             let token_embed = self.llm.get_token_embeddings(&token_array)?;
-
-            // Forward through LLM
             let logits = self.llm.forward_embeddings(&token_embed, &mut self.cache)?;
             let last_logits = logits.index((.., 0, ..));
 
-            // Sample next token
+            // Sample next token - item() is the synchronization point
             token = sample(&last_logits, temperature)?;
             token_id = token.item::<i32>();
             output_tokens.push(token_id);
@@ -681,8 +687,13 @@ mod tests {
 
     #[test]
     fn test_key_mapping() {
-        let key = "blocks.0.attn.q_proj.weight";
+        // Test encoder key mapping
+        let key = "blocks.0.attn.query.weight";
         let mapped = map_encoder_key(key);
         assert_eq!(&*mapped, "layers.0.self_attn.q_proj.weight");
+
+        let key = "blocks.0.attn.key.weight";
+        let mapped = map_encoder_key(key);
+        assert_eq!(&*mapped, "layers.0.self_attn.k_proj.weight");
     }
 }
