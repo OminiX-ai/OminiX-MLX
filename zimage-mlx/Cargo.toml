@@ -1,0 +1,27 @@
+[package]
+name = "zimage-mlx"
+version = "0.1.0"
+edition = "2021"
+description = "Z-Image-Turbo image generation model for MLX"
+license = "MIT OR Apache-2.0"
+repository = "https://github.com/oxideai/mlx-rs"
+keywords = ["mlx", "zimage", "image-generation", "diffusion"]
+categories = ["science", "multimedia::images"]
+
+[dependencies]
+mlx-rs = { path = "../mlx-rs" }
+mlx-macros = { path = "../mlx-macros" }
+flux-klein-mlx = { path = "../flux-klein-mlx" }  # Shared components
+thiserror = { workspace = true }
+safetensors = { workspace = true }
+bytemuck = { workspace = true }
+memmap2 = { workspace = true }
+half = { workspace = true }
+regex = "1"
+serde = { version = "1", features = ["derive"] }
+serde_json = "1"
+
+[dev-dependencies]
+hf-hub = "0.3"
+tokenizers = "0.21"
+image = "0.25"

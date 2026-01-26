@@ -22,3 +22,34 @@ cache/
 
 # Inspiration
 inspiration/
+
+# Generated images and outputs
+*.png
+*.ppm
+*.pgm
+*.jpg
+*.jpeg
+*.wav
+*.mp3
+*.mp4
+
+# Model files
+*.safetensors
+*.pt
+*.pth
+*.bin
+*.gguf
+*.onnx
+model.pt
+*.mlpackage/
+
+# Python artifacts
+__pycache__/
+*.pyc
+*.egg-info/
+.eggs/
+dist/
+build/
+
+# Debug/test files
+*.tmp
