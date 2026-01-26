@@ -115,8 +115,11 @@ cargo build --release -p qwen3-mlx
 # Download model
 huggingface-cli download mlx-community/Qwen3-4B-bf16 --local-dir ./models/Qwen3-4B
 
-# Run example
-cargo run --release -p lm
+# Run text generation
+cargo run --release -p qwen3-mlx --example generate_qwen3 -- ./models/Qwen3-4B "Hello, how are you?"
+
+# Run interactive chat
+cargo run --release -p qwen3-mlx --example chat_qwen3 -- ./models/Qwen3-4B
 ```
 
 ```rust
