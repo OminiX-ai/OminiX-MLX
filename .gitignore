@@ -49,4 +49,4 @@ dist/
 build/
 
 # Debug/test files
-*.tmp
+*.tmp.claude/
