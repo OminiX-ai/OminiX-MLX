@@ -31,6 +31,113 @@ Built for production use with zero Python dependencies at inference time.
 | **Pure Rust** | No Python runtime required for inference |
 | **Modular Design** | Use only what you need |
 
+## Architecture
+
+```
+┌─────────────────────────────────────────────────────────────────────────────┐
+│                              User Application                                │
+│                    (OminiX-API / Custom Rust Application)                   │
+└───────────────────────────────────┬─────────────────────────────────────────┘
+                                    │
+        ┌───────────────────────────┼───────────────────────────┐
+        │                           │                           │
+        ▼                           ▼                           ▼
+┌───────────────┐         ┌─────────────────┐         ┌─────────────────┐
+│   LLM Crates  │         │   Audio Crates  │         │  Image Crates   │
+├───────────────┤         ├─────────────────┤         ├─────────────────┤
+│ qwen3-mlx     │         │ funasr-mlx      │         │ flux-klein-mlx  │
+│ glm4-mlx      │         │ funasr-nano-mlx │         │ zimage-mlx      │
+│ glm4-moe-mlx  │         │ gpt-sovits-mlx  │         │ qwen-image-mlx  │
+│ mixtral-mlx   │         │                 │         │                 │
+│ mistral-mlx   │         │                 │         │                 │
+└───────┬───────┘         └────────┬────────┘         └────────┬────────┘
+        │                          │                           │
+        └──────────────────────────┼───────────────────────────┘
+                                   │
+                                   ▼
+                    ┌──────────────────────────┐
+                    │       mlx-rs-core        │
+                    ├──────────────────────────┤
+                    │ • KV Cache Management    │
+                    │ • RoPE Embeddings        │
+                    │ • Attention (SDPA)       │
+                    │ • Audio Processing       │
+                    │ • Metal Kernels          │
+                    │ • Speculative Decoding   │
+                    └────────────┬─────────────┘
+                                 │
+                                 ▼
+                    ┌──────────────────────────┐
+                    │         mlx-rs           │
+                    ├──────────────────────────┤
+                    │ • Safe Rust API          │
+                    │ • Array Operations       │
+                    │ • Neural Network Layers  │
+                    │ • Transforms (eval, jit) │
+                    │ • Random/Ops/Indexing    │
+                    └────────────┬─────────────┘
+                                 │
+                                 ▼
+                    ┌──────────────────────────┐
+                    │         mlx-sys          │
+                    ├──────────────────────────┤
+                    │ • FFI Bindings (bindgen) │
+                    │ • mlx-c Submodule        │
+                    └────────────┬─────────────┘
+                                 │
+                                 ▼
+                    ┌──────────────────────────┐
+                    │      Apple MLX (C++)     │
+                    ├──────────────────────────┤
+                    │ • Metal GPU Backend      │
+                    │ • Accelerate Framework   │
+                    │ • Unified Memory         │
+                    │ • Lazy Evaluation        │
+                    └──────────────────────────┘
+```
+
+### Data Flow
+
+```
+                         ┌─────────────────────────────────────┐
+                         │            Input Data               │
+                         │  (Text / Audio / Image)             │
+                         └──────────────┬──────────────────────┘
+                                        │
+         ┌──────────────────────────────┼──────────────────────────────┐
+         │                              │                              │
+         ▼                              ▼                              ▼
+┌─────────────────┐          ┌─────────────────┐          ┌─────────────────┐
+│    Tokenizer    │          │  Audio Frontend │          │   VAE Encoder   │
+│  (tokenizers)   │          │  (Mel/STFT)     │          │  (img→latent)   │
+└────────┬────────┘          └────────┬────────┘          └────────┬────────┘
+         │                            │                            │
+         ▼                            ▼                            ▼
+┌─────────────────┐          ┌─────────────────┐          ┌─────────────────┐
+│   Transformer   │          │   Encoder       │          │   Transformer   │
+│   (Attention +  │          │   (SAN-M /      │          │   (DiT /        │
+│    MLP layers)  │          │    Whisper)     │          │    MMDiT)       │
+└────────┬────────┘          └────────┬────────┘          └────────┬────────┘
+         │                            │                            │
+         ▼                            ▼                            ▼
+┌─────────────────┐          ┌─────────────────┐          ┌─────────────────┐
+│   LM Head       │          │   CTC / CIF     │          │   VAE Decoder   │
+│  (logits→token) │          │   Decoder       │          │  (latent→img)   │
+└────────┬────────┘          └────────┬────────┘          └────────┬────────┘
+         │                            │                            │
+         ▼                            ▼                            ▼
+┌─────────────────┐          ┌─────────────────┐          ┌─────────────────┐
+│  Detokenizer    │          │  Vocabulary     │          │   PNG/JPEG      │
+│  (token→text)   │          │  (idx→text)     │          │   Encoder       │
+└────────┬────────┘          └────────┬────────┘          └────────┬────────┘
+         │                            │                            │
+         ▼                            ▼                            ▼
+┌─────────────────────────────────────────────────────────────────────────────┐
+│                              Output Data                                     │
+│                       (Generated Text / Transcript / Image)                  │
+└─────────────────────────────────────────────────────────────────────────────┘
+```
+
 ## Crate Structure
 
 ```
