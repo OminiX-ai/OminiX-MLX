@@ -53,3 +53,4 @@ build/
 
 # Debug/test files
 *.tmp
+.claude/
