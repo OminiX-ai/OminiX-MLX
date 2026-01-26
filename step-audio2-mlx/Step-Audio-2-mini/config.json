@@ -1,0 +1,38 @@
+{
+    "architectures": [
+      "StepAudio2ForCausalLM"
+    ],
+    "auto_map": {
+      "AutoConfig": "configuration_step_audio_2.StepAudio2Config",
+      "AutoModelForCausalLM": "modeling_step_audio_2.StepAudio2ForCausalLM"
+    },
+    "model_type": "step_audio_2",
+    "text_config": {
+      "hidden_size": 3584,
+      "intermediate_size": 18944,
+      "num_attention_heads": 28,
+      "num_attention_groups": 4,
+      "num_key_value_heads": 4,
+      "num_hidden_layers": 28,
+      "max_seq_len": 16384,
+      "vocab_size": 158720,
+      "rms_norm_eps": 1e-06,
+      "eos_token_id": 151643,
+      "pad_token_id": 151643,
+      "rope_theta": 1000000.0,
+      "max_position_embeddings": 16384,
+      "rope_scaling": null,
+      "torch_dtype": "bfloat16"
+    },
+    "audio_encoder_config": {
+      "n_mels": 128,
+      "n_audio_ctx": 1500,
+      "n_audio_state": 1280,
+      "n_audio_head": 20,
+      "n_audio_layer": 32,
+      "n_codebook_size": 4096,
+      "llm_dim": 3584,
+      "kernel_size": 3,
+      "adapter_stride": 2
+    }
+}

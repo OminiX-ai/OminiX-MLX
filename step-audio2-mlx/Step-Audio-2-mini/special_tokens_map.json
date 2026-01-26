@@ -1,0 +1,43 @@
+{
+  "additional_special_tokens": [
+    "<|EOT|>",
+    "<|BOT|>",
+    "<|CALL_START|>",
+    "<|CALL_END|>",
+    "<|THINK_START|>",
+    "<|THINK_END|>",
+    "<|IMG_START|>",
+    "<|IMG_END|>",
+    "<|META_START|>",
+    "<|META_END|>",
+    "<im_patch>",
+    "<im_start>",
+    "<im_end>",
+    "<dream>",
+    "<dream_start>",
+    "<dream_end>",
+    "<|MASK_1e69f|>",
+    "<|UNMASK_1e69f|>",
+    "<video_start>",
+    "<video_end>",
+    "<patch_start>",
+    "<patch_end>",
+    "<patch_newline>",
+    "<audio_start>",
+    "<audio_end>",
+    "<audio_patch>",
+    "<audio_patch_pad>",
+    "<|SC|>",
+    "<tts_start>",
+    "<tts_end>",
+    "<tts_pad>"
+  ],
+  "eos_token": "<|EOT|>",
+  "pad_token": {
+    "content": "<|endoftext|>",
+    "lstrip": false,
+    "normalized": false,
+    "rstrip": false,
+    "single_word": false
+  }
+}

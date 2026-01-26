@@ -1,0 +1,57 @@
+[package]
+name = "step-audio2-mlx"
+version = "0.1.0"
+edition = "2021"
+authors = ["OminiX-MLX Contributors"]
+description = "Step-Audio 2 mini implementation in MLX for Apple Silicon"
+license = "Apache-2.0"
+repository = "https://github.com/anthropics/OminiX-MLX"
+keywords = ["mlx", "audio", "speech", "asr", "tts", "llm"]
+categories = ["multimedia::audio", "science::machine-learning"]
+
+[dependencies]
+# MLX bindings
+mlx-rs = { path = "../mlx-rs" }
+mlx-rs-core = { path = "../mlx-rs-core" }
+
+# Tokenization
+tokenizers = "0.15"
+
+# Serialization
+serde = { version = "1.0", features = ["derive"] }
+serde_json = "1.0"
+serde_yaml = "0.9"
+
+# Audio processing
+rubato = "0.14"  # High-quality resampling
+
+# Error handling
+thiserror = "1.0"
+
+# ONNX Runtime for S3Tokenizer (optional)
+# ort = { version = "2.0", optional = true }
+
+[dev-dependencies]
+criterion = "0.5"
+
+[features]
+default = []
+# Enable TTS decoder (requires S3Tokenizer)
+tts = []
+
+# Examples
+[[example]]
+name = "asr"
+path = "examples/asr.rs"
+
+[[example]]
+name = "think"
+path = "examples/think.rs"
+
+[[example]]
+name = "conversation"
+path = "examples/conversation.rs"
+
+[[example]]
+name = "benchmark_asr"
+path = "examples/benchmark_asr.rs"
