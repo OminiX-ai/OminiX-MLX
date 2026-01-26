@@ -1,5 +1,3 @@
-[workspace]
-
 [package]
 name = "gpt-sovits-mlx"
 version = "0.1.0"

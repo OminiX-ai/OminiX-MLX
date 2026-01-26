@@ -37,6 +37,7 @@ members = [
     "mixtral-mlx",
     "mistral-mlx",
     "qwen-image-mlx",
+    "gpt-sovits-mlx",
 ]
 
 resolver = "2"
