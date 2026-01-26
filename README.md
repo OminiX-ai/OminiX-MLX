@@ -183,6 +183,22 @@ let audio = cloner.synthesize("Hello, world!")?;
 cloner.save_wav(&audio, "output.wav")?;
 ```
 
+### Image Generation
+
+```bash
+# Download Z-Image model
+huggingface-cli download uqer1244/MLX-z-image --local-dir ./models/zimage-turbo-mlx
+
+# Generate image with Z-Image
+cargo run --release -p zimage-mlx --example generate_zimage -- "a cat sitting on a couch"
+
+# Download FLUX.2-klein model
+huggingface-cli download black-forest-labs/FLUX.2-klein-4B --local-dir ./models/flux-klein
+
+# Generate image with FLUX.2-klein
+cargo run --release -p flux-klein-mlx --example generate_klein -- "a beautiful sunset over mountains"
+```
+
 ## Performance
 
 Benchmarks on Apple M3 Max (128GB):
@@ -194,6 +210,8 @@ Benchmarks on Apple M3 Max (128GB):
 | LLM | Mixtral-8x7B-4bit | 25 tok/s | 26GB |
 | ASR | Paraformer | 18x real-time | 500MB |
 | TTS | GPT-SoVITS | 4x real-time | 2GB |
+| Image | Z-Image | ~3s/image | 8GB |
+| Image | FLUX.2-klein | ~5s/image | 13GB |
 
 ## Documentation
 
