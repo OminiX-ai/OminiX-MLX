@@ -1,8 +1,0 @@
-[package]
-name = "mnist"
-version = "0.1.0"
-edition = "2021"
-
-[dependencies]
-mlx-rs.workspace = true
-mnist = "0.6"
