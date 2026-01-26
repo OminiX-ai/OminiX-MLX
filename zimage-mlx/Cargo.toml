@@ -10,7 +10,7 @@ categories = ["science", "multimedia::images"]
 
 [dependencies]
 mlx-rs = { path = "../mlx-rs" }
-mlx-macros = { path = "../mlx-macros" }
+mlx-macros = { path = "../mlx-rs/mlx-macros" }
 flux-klein-mlx = { path = "../flux-klein-mlx" }  # Shared components
 thiserror = { workspace = true }
 safetensors = { workspace = true }

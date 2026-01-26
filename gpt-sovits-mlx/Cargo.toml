@@ -15,8 +15,8 @@ license = "MIT"
 [dependencies]
 # MLX bindings (from parent workspace)
 mlx-rs = { path = "../mlx-rs" }
-mlx-sys = { path = "../mlx-sys" }
-mlx-lm-utils = { path = "../mlx-lm-utils" }
+mlx-sys = { path = "../mlx-rs/mlx-sys" }
+mlx-lm-utils = { path = "../mlx-rs/mlx-lm-utils" }
 
 # Shared infrastructure
 mlx-rs-core = { path = "../mlx-rs-core" }

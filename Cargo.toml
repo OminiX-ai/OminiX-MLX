@@ -17,13 +17,16 @@ rust-version = "1.85.0"
 
 [workspace]
 members = [
-    "mlx-macros",
-    "mlx-sys",
+    # Original mlx-rs components
     "mlx-rs",
-    "mlx-internal-macros",
-    "mlx-lm-utils",
+    "mlx-rs/mlx-sys",
+    "mlx-rs/mlx-macros",
+    "mlx-rs/mlx-internal-macros",
+    "mlx-rs/mlx-lm-utils",
+    "mlx-rs/mlx-tests",
+    # OminiX shared utilities
     "mlx-rs-core",
-    "mlx-tests",
+    # OminiX model crates
     "flux-klein-mlx",
     "zimage-mlx",
     "funasr-mlx",
@@ -34,7 +37,6 @@ members = [
     "mixtral-mlx",
     "mistral-mlx",
     "qwen-image-mlx",
-    "examples/*",
     "xtask",
 ]
 
@@ -42,11 +44,11 @@ resolver = "2"
 
 [workspace.dependencies]
 # workspace local dependencies
-mlx-sys = { version = "=0.2.0", path = "mlx-sys" }
-mlx-macros = { version = "0.25", path = "mlx-macros" }
-mlx-internal-macros = { version = "0.25", path = "mlx-internal-macros" }
+mlx-sys = { version = "=0.2.0", path = "mlx-rs/mlx-sys" }
+mlx-macros = { version = "0.25", path = "mlx-rs/mlx-macros" }
+mlx-internal-macros = { version = "0.25", path = "mlx-rs/mlx-internal-macros" }
 mlx-rs = { version = "0.25", path = "mlx-rs" }
-mlx-lm-utils = { version = "0.0.1", path = "mlx-lm-utils" }
+mlx-lm-utils = { version = "0.0.1", path = "mlx-rs/mlx-lm-utils" }
 mlx-rs-core = { version = "0.1.0", path = "mlx-rs-core" }
 
 # external dependencies

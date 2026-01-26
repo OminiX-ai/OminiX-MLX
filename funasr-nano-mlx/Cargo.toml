@@ -9,7 +9,7 @@ repository = "https://github.com/example/funasr-nano-mlx"
 [dependencies]
 # MLX framework
 mlx-rs = { path = "../mlx-rs", features = ["metal", "accelerate"] }
-mlx-sys = { path = "../mlx-sys" }
+mlx-sys = { path = "../mlx-rs/mlx-sys" }
 
 # Shared LLM infrastructure
 mlx-rs-core = { path = "../mlx-rs-core" }

@@ -10,7 +10,7 @@ description = "Qwen-Image-2512 implementation in Rust using MLX"
 
 [dependencies]
 mlx-rs = { path = "../mlx-rs", features = ["safetensors"] }
-mlx-macros = { path = "../mlx-macros" }
+mlx-macros = { path = "../mlx-rs/mlx-macros" }
 thiserror.workspace = true
 safetensors.workspace = true
 bytemuck.workspace = true

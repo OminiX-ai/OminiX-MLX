@@ -7,7 +7,7 @@ license = "MIT OR Apache-2.0"
 
 [dependencies]
 mlx-rs = { path = "../mlx-rs", features = ["metal", "accelerate"] }
-mlx-sys = { path = "../mlx-sys" }
+mlx-sys = { path = "../mlx-rs/mlx-sys" }
 mlx-rs-core = { path = "../mlx-rs-core" }
 thiserror = "2"
 serde = { version = "1", features = ["derive"] }

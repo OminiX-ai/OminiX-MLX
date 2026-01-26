@@ -10,7 +10,7 @@ categories = ["science", "multimedia::images"]
 
 [dependencies]
 mlx-rs = { path = "../mlx-rs", features = ["safetensors"] }
-mlx-macros = { path = "../mlx-macros" }
+mlx-macros = { path = "../mlx-rs/mlx-macros" }
 thiserror = { workspace = true }
 safetensors = { workspace = true }
 bytemuck = { workspace = true }
