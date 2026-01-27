@@ -53,6 +53,10 @@ struct Args {
     /// Use 8-bit quantization (requires /tmp/qwen_image_8bit.safetensors)
     #[arg(long)]
     use_8bit: bool,
+
+    /// Custom model path (overrides default HuggingFace cache location)
+    #[arg(long)]
+    model_path: Option<PathBuf>,
 }
 
 fn get_hf_cache_dirs() -> Vec<PathBuf> {
@@ -170,54 +174,56 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
     println!("Steps: {}", args.steps);
     println!();
 
-    let repo_id = "mlx-community/Qwen-Image-2512-4bit";
+    // Select model based on quantization bits or custom path
+    let model_dir = if let Some(custom_path) = &args.model_path {
+        println!("Using custom model path: {}", custom_path.display());
+        custom_path.clone()
+    } else {
+        let repo_id = if args.use_8bit {
+            "mlx-community/Qwen-Image-2512-8bit"
+        } else {
+            "mlx-community/Qwen-Image-2512-4bit"
+        };
 
-    // Find model directory
-    println!("Looking for model in HuggingFace cache...");
-    let model_dir = get_model_dir(repo_id)?;
-    println!("  Found: {}", model_dir.display());
+        // Find model directory
+        println!("Looking for model in HuggingFace cache...");
+        let dir = get_model_dir(repo_id)?;
+        println!("  Found: {}", dir.display());
+        dir
+    };
 
     // Load transformer weights (8-bit or 4-bit)
     use qwen_image_mlx::{QwenQuantizedTransformer, QwenConfig, load_transformer_weights};
 
-    let (transformer_weights, config) = if args.use_8bit {
-        // Use 8-bit quantized weights from /tmp
-        let path_8bit = std::path::Path::new("/tmp/qwen_image_8bit.safetensors");
-        if !path_8bit.exists() {
-            return Err(std::io::Error::new(
-                std::io::ErrorKind::NotFound,
-                "8-bit weights not found at /tmp/qwen_image_8bit.safetensors. Run the dequantization script first.",
-            ).into());
+    // Load transformer weights from HuggingFace model (4-bit or 8-bit)
+    let transformer_dir = model_dir.join("transformer");
+    let mut transformer_files: Vec<PathBuf> = Vec::new();
+    for i in 0..10 {  // Check up to 10 shards
+        let path = transformer_dir.join(format!("{}.safetensors", i));
+        if path.exists() {
+            transformer_files.push(path);
         }
-        println!("\nLoading 8-bit quantized weights from {}...", path_8bit.display());
-        let weights = load_safetensors(path_8bit)?;
-        println!("  Loaded {} tensors", weights.len());
+    }
+    println!("  Found {} transformer shards", transformer_files.len());
 
-        let config = QwenConfig::with_8bit();
-        (weights, config)
+    let bits = if args.use_8bit { 8 } else { 4 };
+    println!("\nLoading {}-bit transformer weights...", bits);
+    let transformer_weights = load_sharded_weights(&transformer_files)?;
+    println!("  Loaded {} tensors", transformer_weights.len());
+
+    let config = if args.use_8bit {
+        QwenConfig::with_8bit()
     } else {
-        // Use original 4-bit shards
-        let transformer_dir = model_dir.join("transformer");
-        let mut transformer_files: Vec<PathBuf> = Vec::new();
-        for i in 0..6 {
-            let path = transformer_dir.join(format!("{}.safetensors", i));
-            if path.exists() {
-                transformer_files.push(path);
-            }
-        }
-        println!("  Found {} transformer shards", transformer_files.len());
-
-        println!("\nLoading 4-bit transformer weights...");
-        let weights = load_sharded_weights(&transformer_files)?;
-        println!("  Loaded {} tensors", weights.len());
-
-        let config = QwenConfig::default();
-        (weights, config)
+        QwenConfig::default()
     };
 
     // Create quantized transformer model
     println!("\nCreating quantized transformer model ({}-bit)...", config.quantization_bits);
     println!("  Config: {:?}", config);
+
+    // Save quantization settings before moving config
+    let quant_bits = config.quantization_bits;
+    let quant_group_size = config.quantization_group_size;
 
     let mut transformer = QwenQuantizedTransformer::new(config)?;
     println!("  Model created successfully");
@@ -278,6 +284,23 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
     load_transformer_weights(&mut transformer, transformer_weights)?;
     println!("  Weights loaded successfully!");
 
+    // Debug: verify img_in weight shape (confirms correct bits)
+    {
+        let params = transformer.parameters().flatten();
+        for (name, param) in params.iter() {
+            if name.as_ref() == "img_in.inner.weight" {
+                let p: &mlx_rs::Array = param;
+                let expected_cols = 64 / (32 / quant_bits);  // 8 for 4-bit, 16 for 8-bit
+                println!("  [VERIFY] img_in.weight shape: {:?} (expected cols={} for {}-bit)",
+                    p.shape(), expected_cols, quant_bits);
+                if p.dim(1) != expected_cols {
+                    println!("  [WARNING] Weight shape mismatch! Model may produce incorrect output.");
+                }
+                break;
+            }
+        }
+    }
+
     // Debug: verify timestep embedder weights and dequantize
     {
         let params = transformer.parameters().flatten();
@@ -304,7 +327,7 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
 
         // Dequantize and check values
         if let (Some(w), Some(s), Some(b)) = (weight, scales, biases) {
-            if let Ok(dequant) = mlx_rs::ops::dequantize(&w, &s, &b, 64, 4, None::<&str>) {
+            if let Ok(dequant) = mlx_rs::ops::dequantize(&w, &s, &b, quant_group_size, quant_bits, None::<&str>) {
                 mlx_rs::transforms::eval([&dequant]).ok();
                 println!("  [DEQUANT] linear_2 weight: shape={:?}, min={:.4}, max={:.4}",
                     dequant.shape(),
@@ -681,8 +704,14 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
     let key = mlx_rs::random::key(seed)?;
     let mut latents = mlx_rs::random::normal::<f32>(&[1, num_patches, 64], None, None, Some(&key))?;
 
-    // Flow matching schedule (linear)
-    let sigmas: Vec<f32> = (0..=num_steps).map(|i| 1.0 - (i as f32 / num_steps as f32)).collect();
+    // Flow matching schedule with shift
+    // Formula: shifted_sigma = shift * sigma / (1 + (shift - 1) * sigma)
+    let shift = 1.0f32;  // No shift (linear)
+    let sigmas: Vec<f32> = (0..=num_steps).map(|i| {
+        let sigma = 1.0 - (i as f32 / num_steps as f32);
+        // Apply shift transformation
+        shift * sigma / (1.0 + (shift - 1.0) * sigma)
+    }).collect();
 
     println!("\nRunning diffusion loop...");
     let start = std::time::Instant::now();
@@ -766,7 +795,12 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
     let latents_reshaped = latents.reshape(&[1, latent_h, latent_w, out_channels, patch_size, patch_size])?;
     let latents_permuted = latents_reshaped.transpose_axes(&[0, 3, 1, 4, 2, 5])?;
     let vae_latents = latents_permuted.reshape(&[1, out_channels, vae_h, vae_w])?;
+    mlx_rs::transforms::eval([&vae_latents])?;
     println!("  VAE latent shape: {:?}", vae_latents.shape());
+    println!("  VAE latent range: [{:.3}, {:.3}], mean={:.4}",
+        vae_latents.min(None)?.item::<f32>(),
+        vae_latents.max(None)?.item::<f32>(),
+        vae_latents.mean(None)?.item::<f32>());
 
     // Load VAE decoder
     println!("\nLoading VAE decoder...");

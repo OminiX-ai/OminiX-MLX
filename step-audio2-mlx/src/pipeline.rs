@@ -498,7 +498,7 @@ impl StepAudio2Pipeline {
         let tts = self.tts.as_mut()
             .ok_or_else(|| Error::TTS("TTS decoder not loaded".to_string()))?;
 
-        tts.synthesize(audio_tokens, None)
+        tts.synthesize(audio_tokens)
     }
 
     /// Process audio with think mode

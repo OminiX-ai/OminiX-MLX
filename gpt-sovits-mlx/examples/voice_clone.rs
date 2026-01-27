@@ -73,6 +73,7 @@ struct Args {
     tokens_path: Option<String>,  // Pre-computed semantic tokens (for testing)
     output: Option<String>,
     interactive: bool,
+    greedy: bool,
 }
 
 fn parse_args() -> Args {
@@ -85,6 +86,7 @@ fn parse_args() -> Args {
     let mut tokens_path = None;
     let mut output = None;
     let mut interactive = false;
+    let mut greedy = false;
 
     let mut i = 0;
     while i < args.len() {
@@ -157,6 +159,9 @@ fn parse_args() -> Args {
             "--interactive" | "-i" => {
                 interactive = true;
             }
+            "--greedy" => {
+                greedy = true;
+            }
             arg if !arg.starts_with('-') => {
                 if text.is_none() {
                     text = Some(arg.to_string());
@@ -167,7 +172,7 @@ fn parse_args() -> Args {
         i += 1;
     }
 
-    Args { text, ref_audio, ref_text, codes_path, tokens_path, output, interactive }
+    Args { text, ref_audio, ref_text, codes_path, tokens_path, output, interactive, greedy }
 }
 
 fn synthesize_and_play(cloner: &mut VoiceCloner, text: &str, output: Option<&str>) -> Result<(), Box<dyn std::error::Error>> {
@@ -265,7 +270,15 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
     // Initialize voice cloner
     println!("🔧 Initializing VoiceCloner...");
     let start = Instant::now();
-    let config = VoiceClonerConfig::default();
+    let mut config = VoiceClonerConfig::default();
+    if args.greedy {
+        config.top_k = 1;
+        config.temperature = 0.001;
+        config.top_p = 1.0;
+        config.repetition_penalty = 1.0;
+        config.noise_scale = 0.0;  // Deterministic VITS too
+        println!("   Greedy mode: top_k=1, temperature=0.001, noise_scale=0.0");
+    }
     let mut cloner = VoiceCloner::new(config)?;
     println!("   Models loaded in {:.1}ms", start.elapsed().as_secs_f64() * 1000.0);
 

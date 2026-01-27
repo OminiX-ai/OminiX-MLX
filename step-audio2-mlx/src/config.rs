@@ -246,4 +246,23 @@ pub mod tokens {
     pub fn code_to_token(code: i32) -> i32 {
         code + AUDIO_TOKEN_START
     }
+
+    /// Separate a token sequence into text tokens and audio codes
+    ///
+    /// # Returns
+    /// (text_tokens, audio_codes) where audio_codes are already converted to codebook indices
+    pub fn separate_tokens(token_ids: &[i32]) -> (Vec<i32>, Vec<i32>) {
+        let mut text_tokens = Vec::new();
+        let mut audio_codes = Vec::new();
+
+        for &token_id in token_ids {
+            if is_audio_token(token_id) {
+                audio_codes.push(token_to_code(token_id));
+            } else {
+                text_tokens.push(token_id);
+            }
+        }
+
+        (text_tokens, audio_codes)
+    }
 }

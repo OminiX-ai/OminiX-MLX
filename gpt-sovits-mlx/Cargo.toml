@@ -36,6 +36,10 @@ regex = "1"
 lingua = { version = "1.6", default-features = false, features = ["chinese", "english", "japanese", "korean"] }
 num2en = "1.0.0"
 hanconv = "0.5"  # Traditional to simplified Chinese conversion
+lazy_static = "1.4"  # For global singletons (segmenter, etc.)
+
+# Optional: jieba word segmentation (provides much better Chinese segmentation)
+jieba-rs = { version = "0.7", optional = true }
 
 # G2PW (ONNX)
 ort = { version = "2.0.0-rc.11", default-features = false, features = ["std", "download-binaries", "tls-native", "coreml"] }
@@ -44,6 +48,7 @@ ort = { version = "2.0.0-rc.11", default-features = false, features = ["std", "d
 default = []
 debug-attn = []
 debug-logits = []
+jieba = ["jieba-rs"]  # Enable jieba word segmentation for better Chinese processing
 
 [[example]]
 name = "voice_clone"

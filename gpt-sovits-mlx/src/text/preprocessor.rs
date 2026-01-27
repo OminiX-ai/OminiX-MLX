@@ -9,11 +9,17 @@
 //! 4. Phoneme ID conversion
 
 use std::collections::HashMap;
+use std::path::Path;
+use std::sync::OnceLock;
 
 use pinyin::ToPinyin;
 
+use super::erhua::{merge_erhua, MUST_ERHUA, NOT_ERHUA};
 use super::g2pw::get_pinyin_with_g2pw;
 use super::symbols::{self, bos_id, eos_id, has_symbol, symbol_to_id};
+use super::tone_sandhi::{ToneSandhi, WordSegment, pre_merge_for_modify};
+use super::jieba_seg::{cut_with_pos, Segment};
+use super::text_normalizer::mix_text_normalize;
 
 /// Detected language
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -198,13 +204,16 @@ fn pinyin_to_phoneme_map() -> HashMap<&'static str, (&'static str, &'static str)
 
 /// Full-width to half-width punctuation mapping
 fn fullwidth_to_halfwidth() -> HashMap<char, char> {
+    // Matches Python's rep_map from chinese.py
     let mut map = HashMap::new();
     map.insert('，', ',');
-    map.insert('。', '.');
+    // Note: '。' → '.' is deferred until after number conversion
+    // to avoid '44.2011' being parsed as a decimal number
+    // map.insert('。', '.');
     map.insert('！', '!');
     map.insert('？', '?');
-    map.insert('；', ';');
-    map.insert('：', ':');
+    map.insert('；', ',');  // Python: "；" → "," (not ';')
+    map.insert('：', ',');  // Python: "：" → "," (not ':')
     map.insert('、', ',');
     map.insert('"', '"');
     map.insert('"', '"');
@@ -216,7 +225,12 @@ fn fullwidth_to_halfwidth() -> HashMap<char, char> {
     map.insert('】', ']');
     map.insert('《', '"');
     map.insert('》', '"');
-    map.insert('～', '~');
+    map.insert('～', '…');  // Python: "～" → "…"
+    map.insert('~', '…');   // Python: "~" → "…"
+    map.insert('·', ',');   // Python: "·" → ","
+    map.insert('—', '-');   // Python: "—" → "-"
+    map.insert('$', '.');   // Python: "$" → "."
+    map.insert('/', ',');   // Python: "/" → ","
     map
 }
 
@@ -261,19 +275,41 @@ pub fn normalize_chinese(text: &str) -> String {
     let text: String = text.chars()
         .map(|c| *map.get(&c).unwrap_or(&c))
         .collect();
-    // Remove citation references like [21], [22], etc.
-    let re_citation = regex::Regex::new(r"\[\d+\]").unwrap();
-    let text = re_citation.replace_all(&text, "").to_string();
+    // Convert measurement units to Chinese BEFORE removing English
+    // Python quantifier.py: "s" → "秒", "m" → "米", etc.
+    let text = replace_measure_units(&text);
 
-    // Remove quotes, parentheses, and other non-phonetic characters
-    // This prevents word2ph mismatch since G2P doesn't handle these characters
-    // Includes: quotes, brackets, colons, semicolons, middle dot (·), etc.
-    let text: String = text.chars()
-        .filter(|&c| !matches!(c, '"' | '\'' | '(' | ')' | '[' | ']' | ':' | ';' | '·' | '•' | '—' | '–' | '～'))
-        .collect();
-    // Convert numbers to Chinese spoken form (must happen BEFORE punctuation cleanup
-    // so that decimal points like "163.6" are converted to "一百六十三点六" first)
+    // CRITICAL: Remove ALL English letters (matching Python's re.sub("[a-zA-Z]+", ""))
+    let re_english = regex::Regex::new(r"[a-zA-Z]+").unwrap();
+    let text = re_english.replace_all(&text, "").to_string();
+
+    // Clean up excess whitespace left after English removal
+    let re_spaces = regex::Regex::new(r"\s+").unwrap();
+    let text = re_spaces.replace_all(&text, "").to_string();
+
+    // Convert numbers to Chinese BEFORE removing brackets/special chars
+    // Python's TextNormalizer converts numbers while [brackets] and ％ are still present,
+    // so they act as separators (e.g., "500％[47]" → "五零零％[四十七]", not "50047")
     let text = normalize_numbers_to_chinese(&text);
+
+    // Now remove brackets (numbers inside already converted to Chinese)
+    // e.g., [四十七] → 四十七
+    let re_bracket = regex::Regex::new(r"[\[\]]").unwrap();
+    let text = re_bracket.replace_all(&text, "").to_string();
+
+    // Remove special characters (matching Python's replace_punctuation)
+    let text: String = text.chars()
+        .filter(|&c| !matches!(c,
+            '"' | '\'' | '(' | ')' | ':' | ';' | '·' | '•' |
+            '—' | '–' | '～' | '-' |
+            '《' | '》' | '【' | '】' | '<' | '>' | '{' | '}' |
+            '（' | '）' | '#' | '&' | '@' | '^' | '_' | '|' | '\\' |
+            '％'  // Fullwidth percent sign - Python strips it
+        ))
+        .collect();
+
+    // Now convert 。→ . (deferred from fullwidth conversion to avoid decimal parsing issues)
+    let text = text.replace('。', ".");
     // Remove consecutive punctuation (matching Python's replace_consecutive_punctuation)
     replace_consecutive_punctuation(&text)
 }
@@ -369,8 +405,11 @@ fn normalize_numbers_to_chinese(text: &str) -> String {
 }
 
 /// Helper to flush number buffer with optional negative prefix
-/// When followed by 年 (year marker), 4-digit numbers are converted digit-by-digit
-/// to match Python's cn2an behavior (e.g., 2025 → 二零二五 not 二千零二十五)
+/// Matches Python's TextNormalizer number conversion rules:
+/// - 4-digit + 年: digit-by-digit with 一 (year mode)
+/// - followed by 万/亿: semantic (一千一百万)
+/// - standalone 3+ digits: digit-by-digit with 幺 (direct mode)
+/// - 1-2 digits: semantic (四十四)
 fn flush_number_buffer(result: &mut String, num_buffer: &mut String, is_negative: bool, next_char: Option<char>) {
     if num_buffer.ends_with('.') {
         num_buffer.pop();
@@ -383,12 +422,20 @@ fn flush_number_buffer(result: &mut String, num_buffer: &mut String, is_negative
         if is_negative {
             result.push_str("负");
         }
-        // Check if this is a year (4-digit number followed by 年)
-        // Python's cn2an converts years digit-by-digit: 2025 → 二零二五
-        let is_year = num_buffer.len() == 4 && next_char == Some('年');
+        let len = num_buffer.len();
+        let is_year = len == 4 && next_char == Some('年');
+        let is_unit = matches!(next_char, Some('万') | Some('亿'));
         if is_year {
+            // Year: digit-by-digit with 一
+            result.push_str(&number_to_chinese_digits_year(num_buffer));
+        } else if is_unit {
+            // Followed by 万/亿: semantic
+            result.push_str(&number_to_chinese(num_buffer));
+        } else if len >= 3 {
+            // Standalone 3+ digits: digit-by-digit with 幺
             result.push_str(&number_to_chinese_digits(num_buffer));
         } else {
+            // 1-2 digits: semantic
             result.push_str(&number_to_chinese_with_decimal(num_buffer));
         }
     }
@@ -503,6 +550,8 @@ fn pinyin_corrections() -> HashMap<char, &'static str> {
     map.insert('统', "tong3");  // 统 should be tone 3
     map.insert('说', "shuo1");  // 说 should be tone 1 (not tone 4)
     map.insert('合', "he2");    // 合 should be tone 2 (merge/combine)
+    // Fix 儿 - pinyin crate returns ren2 but should be er2
+    map.insert('儿', "er2");    // 儿 (child/erhua suffix) is er2, not ren2
     map
 }
 
@@ -576,13 +625,113 @@ fn polyphone_words() -> Vec<(&'static str, usize, &'static str)> {
         ("聯合", 1, "he2"),      // unite (traditional)
         ("結合", 1, "he2"),      // combine (traditional)
         ("綜合", 1, "he2"),      // comprehensive (traditional)
+        // 为: wèi (wei4) vs wéi (wei2)
+        ("改为", 1, "wei2"),     // change to
+        ("成为", 1, "wei2"),     // become
+        ("作为", 1, "wei2"),     // as/being
+        ("认为", 1, "wei2"),     // think/consider
+        ("以为", 1, "wei2"),     // think/believe
+        ("称为", 1, "wei2"),     // called as
+        ("因为", 1, "wei2"),     // because
+        ("为了", 0, "wei4"),     // for the purpose of
+        ("为什么", 0, "wei4"),   // why
+        ("行为", 1, "wei2"),     // behavior
+        ("人为", 1, "wei2"),     // man-made
+        ("视为", 1, "wei2"),     // regard as
     ]
+}
+
+/// Global polyphonic dictionary loaded from external files
+/// Format: word -> Vec<pinyin> (one pinyin per character)
+static POLYPHONIC_DICT: OnceLock<HashMap<String, Vec<String>>> = OnceLock::new();
+
+/// Load polyphonic dictionary from external files
+fn load_polyphonic_dict() -> HashMap<String, Vec<String>> {
+    let mut dict = HashMap::new();
+
+    // Try to load from common locations
+    let dict_paths = [
+        "/Users/yuechen/home/mofa-studio/node-hub/dora-primespeech/dora_primespeech/moyoyo_tts/text/g2pw/polyphonic.rep",
+        "/Users/yuechen/home/mofa-studio/node-hub/dora-primespeech/dora_primespeech/moyoyo_tts/text/g2pw/polyphonic-fix.rep",
+    ];
+
+    for path in dict_paths {
+        if Path::new(path).exists() {
+            if let Ok(content) = std::fs::read_to_string(path) {
+                for line in content.lines() {
+                    if let Some((word, pinyins_str)) = line.split_once(':') {
+                        // Parse format: word: ['pinyin1', 'pinyin2', ...]
+                        let word = word.trim().to_string();
+                        let pinyins_str = pinyins_str.trim();
+
+                        // Extract pinyin values from ['pinyin1', 'pinyin2'] format
+                        if pinyins_str.starts_with('[') && pinyins_str.ends_with(']') {
+                            let inner = &pinyins_str[1..pinyins_str.len()-1];
+                            let pinyins: Vec<String> = inner
+                                .split(',')
+                                .map(|s| s.trim().trim_matches('\'').trim_matches('"').to_string())
+                                .filter(|s| !s.is_empty())
+                                .collect();
+
+                            if !pinyins.is_empty() {
+                                dict.insert(word, pinyins);
+                            }
+                        }
+                    }
+                }
+            }
+        }
+    }
+
+    dict
+}
+
+/// Get the global polyphonic dictionary
+fn get_polyphonic_dict() -> &'static HashMap<String, Vec<String>> {
+    POLYPHONIC_DICT.get_or_init(|| {
+        let dict = load_polyphonic_dict();
+        if !dict.is_empty() {
+            eprintln!("Polyphonic dict: Loaded {} entries", dict.len());
+        }
+        dict
+    })
 }
 
 /// Apply polyphone corrections based on word context
 fn apply_polyphone_corrections(chars: &[char], pinyins: &mut [Option<String>]) {
     let text: String = chars.iter().collect();
 
+    // First, apply corrections from the external polyphonic dictionary
+    let poly_dict = get_polyphonic_dict();
+    for (word, word_pinyins) in poly_dict.iter() {
+        let word_chars: Vec<char> = word.chars().collect();
+        let word_len = word_chars.len();
+
+        // Only process if pinyin count matches character count
+        if word_pinyins.len() != word_len {
+            continue;
+        }
+
+        // Find all occurrences of this word in the text
+        for start_idx in 0..chars.len().saturating_sub(word_len - 1) {
+            let matches = chars[start_idx..start_idx + word_len]
+                .iter()
+                .zip(word_chars.iter())
+                .all(|(a, b)| a == b);
+
+            if matches {
+                // Apply all pinyin corrections for this word
+                for (i, pinyin) in word_pinyins.iter().enumerate() {
+                    let target_pos = start_idx + i;
+                    if target_pos < pinyins.len() && pinyins[target_pos].is_some() {
+                        pinyins[target_pos] = Some(pinyin.clone());
+                    }
+                }
+            }
+        }
+    }
+
+    // Then, apply corrections from the hardcoded polyphone_words list
     for (word, char_idx, correct_pinyin) in polyphone_words() {
         let word_chars: Vec<char> = word.chars().collect();
         let word_len = word_chars.len();
@@ -663,11 +812,21 @@ fn char_to_phonemes(c: char) -> Vec<String> {
     }
 }
 
-/// Convert a number to Chinese digit-by-digit
-/// e.g., 2025 -> "二零二五" (for year-style reading)
-/// This matches Python's cn2an behavior for years
-fn number_to_chinese_digits(num_str: &str) -> String {
+/// Convert a number to Chinese digit-by-digit for years
+/// e.g., 2025 -> "二零二五" (uses 一 for 1)
+fn number_to_chinese_digits_year(num_str: &str) -> String {
     let digits = ['零', '一', '二', '三', '四', '五', '六', '七', '八', '九'];
+    num_str.chars()
+        .filter_map(|c| c.to_digit(10))
+        .map(|d| digits[d as usize])
+        .collect()
+}
+
+/// Convert a number to Chinese digit-by-digit for standalone numbers
+/// e.g., 100 -> "幺零零", 500 -> "五零零"
+/// Matches Python's cn2an 'direct' mode: uses 幺 for 1
+fn number_to_chinese_digits(num_str: &str) -> String {
+    let digits = ['零', '幺', '二', '三', '四', '五', '六', '七', '八', '九'];
     num_str.chars()
         .filter_map(|c| c.to_digit(10))
         .map(|d| digits[d as usize])
@@ -883,6 +1042,7 @@ fn replace_temperature(text: &str) -> String {
 
 /// Convert measurement units to Chinese
 /// e.g., "10cm" → "10厘米", "5kg" → "5千克"
+#[allow(dead_code)]
 fn replace_units(text: &str) -> String {
     let replacements = [
         ("cm²", "平方厘米"),
@@ -900,6 +1060,41 @@ fn replace_units(text: &str) -> String {
         ("ml", "毫升"),
         ("db", "分贝"),
         ("dB", "分贝"),
+    ];
+
+    let mut result = text.to_string();
+    for (unit, chinese) in replacements {
+        result = result.replace(unit, chinese);
+    }
+    result
+}
+
+/// Convert measurement units to Chinese - Python-compatible version
+/// Matches Python's quantifier.py exactly, including single-letter conversions
+/// Note: This does simple string replacement, affecting English words too
+/// e.g., "Bankers" → "Banker秒", "mm" → "米米" (matches Python behavior)
+fn replace_measure_units(text: &str) -> String {
+    // CRITICAL: Order must match Python's dict iteration order exactly!
+    // Python processes 'm' before 'mm', so 'mm' becomes '米米' not '毫米'
+    // This is Python's measure_dict key order from quantifier.py
+    let replacements = [
+        ("cm2", "平方厘米"),
+        ("cm²", "平方厘米"),
+        ("cm3", "立方厘米"),
+        ("cm³", "立方厘米"),
+        ("cm", "厘米"),
+        ("db", "分贝"),
+        ("ds", "毫秒"),
+        ("kg", "千克"),
+        ("km", "千米"),
+        ("m2", "平方米"),
+        ("m²", "平方米"),
+        ("m³", "立方米"),
+        ("m3", "立方米"),
+        ("ml", "毫升"),
+        ("m", "米"),   // Before 'mm' - so 'mm' → '米米' not '毫米'
+        ("mm", "毫米"), // This will never match since 'm' is replaced first
+        ("s", "秒"),   // Single letter - affects English words like "Bankers" → "Banker秒"
     ];
 
     let mut result = text.to_string();
@@ -970,7 +1165,124 @@ fn replace_slash(text: &str) -> String {
     .to_string()
 }
 
-/// Apply tone sandhi rules to a list of pinyins and characters
+/// Apply word-level tone sandhi using jieba segmentation (Python-compatible)
+/// This is the preferred method as it matches the Python implementation
+fn apply_word_level_tone_sandhi(text: &str, pinyins: &mut [Option<String>]) {
+    let sandhi = ToneSandhi::new();
+
+    // 1. Use jieba segmentation to get words with POS tags
+    let segments = cut_with_pos(text);
+
+    // 2. Convert to WordSegment format and apply pre-merge
+    let word_segments: Vec<WordSegment> = segments
+        .into_iter()
+        .map(|seg| WordSegment::new(&seg.word, &seg.pos))
+        .collect();
+    let merged_segments = pre_merge_for_modify(word_segments);
+
+    // 3. Process each word
+    let mut char_idx = 0;
+    for segment in merged_segments {
+        let word = &segment.word;
+        let pos = &segment.pos;
+        let word_chars: Vec<char> = word.chars().collect();
+        let word_len = word_chars.len();
+
+        // Skip non-Chinese segments
+        if word_len == 0 || !word_chars.iter().any(|c| is_chinese_char(*c)) {
+            // Still advance char_idx for non-Chinese chars
+            for c in word.chars() {
+                if char_idx < pinyins.len() {
+                    char_idx += 1;
+                }
+            }
+            continue;
+        }
+
+        // 4. Extract finals from pinyins for this word
+        let mut word_finals: Vec<String> = Vec::with_capacity(word_len);
+        let start_idx = char_idx;
+
+        for _ in 0..word_len {
+            if char_idx < pinyins.len() {
+                if let Some(ref pinyin) = pinyins[char_idx] {
+                    // Extract final from pinyin (e.g., "ni3" -> "i3", "hao3" -> "ao3")
+                    let final_part = extract_final_from_pinyin(pinyin);
+                    word_finals.push(final_part);
+                } else {
+                    word_finals.push("5".to_string()); // neutral tone for non-pinyin
+                }
+                char_idx += 1;
+            }
+        }
+
+        // 5. Apply tone sandhi rules
+        if !word_finals.is_empty() {
+            sandhi.modified_tone(word, pos, &mut word_finals);
+
+            // 5.5 Apply erhua tone inheritance
+            // If word ends with 儿 and is in MUST_ERHUA or not in NOT_ERHUA,
+            // the 儿 inherits the tone from the previous syllable
+            if word.ends_with('儿') && word_len >= 2 {
+                let word_str: &str = word;
+                let should_merge = MUST_ERHUA.contains(word_str) ||
+                    (!NOT_ERHUA.contains(word_str) && !matches!(pos.as_str(), "a" | "j" | "nr"));
+
+                if should_merge {
+                    // Get the tone from the previous syllable
+                    if let Some(prev_final) = word_finals.get(word_len - 2) {
+                        if let Some(prev_tone) = prev_final.chars().last().filter(|c| c.is_ascii_digit()) {
+                            // Update the last position (儿) to inherit the tone
+                            if let Some(last_final) = word_finals.get_mut(word_len - 1) {
+                                // Replace tone in the final
+                                if last_final.chars().last().map(|c| c.is_ascii_digit()).unwrap_or(false) {
+                                    last_final.pop();
+                                }
+                                last_final.push(prev_tone);
+                            }
+                        }
+                    }
+                }
+            }
+
+            // 6. Update pinyins with modified tones
+            for (i, final_part) in word_finals.iter().enumerate() {
+                let pinyin_idx = start_idx + i;
+                if pinyin_idx < pinyins.len() {
+                    if let Some(ref mut pinyin) = pinyins[pinyin_idx] {
+                        // Update the tone in the pinyin
+                        if let Some(new_tone) = final_part.chars().last() {
+                            if new_tone.is_ascii_digit() {
+                                // Replace the tone digit
+                                if pinyin.chars().last().map(|c| c.is_ascii_digit()).unwrap_or(false) {
+                                    pinyin.pop();
+                                }
+                                pinyin.push(new_tone);
+                            }
+                        }
+                    }
+                }
+            }
+        }
+    }
+}
+
+/// Extract the final (vowel part + tone) from a pinyin string
+/// e.g., "ni3" -> "i3", "hao3" -> "ao3", "zhuang1" -> "uang1"
+fn extract_final_from_pinyin(pinyin: &str) -> String {
+    let vowels = ['a', 'e', 'i', 'o', 'u', 'ü', 'v'];
+    let chars: Vec<char> = pinyin.chars().collect();
+
+    // Find the first vowel
+    if let Some(vowel_pos) = chars.iter().position(|c| vowels.contains(&c.to_ascii_lowercase())) {
+        chars[vowel_pos..].iter().collect()
+    } else {
+        // No vowel found, return whole string (might be a tone number only)
+        pinyin.to_string()
+    }
+}
+
+/// Apply tone sandhi rules to a list of pinyins and characters (character-level fallback)
 /// Main rules:
 /// 1. Polyphonic character corrections (e.g., 回应 → huí yìng4)
 /// 2. 一 (yi) tone sandhi: yi2 before tone 4, yi4 before tone 1/2/3 (e.g., 一百 → yi4 bai3)
@@ -1050,6 +1362,12 @@ fn apply_tone_sandhi(chars: &[char], pinyins: &mut [Option<String>]) {
             };
 
             if let Some(ref mut pinyin) = pinyins[i] {
+                // Skip if already modified by word-level sandhi (not yi1 anymore)
+                // This prevents character-level sandhi from overriding word-level results
+                if *pinyin != "yi1" {
+                    continue;
+                }
+
                 // Skip if next char is punctuation
                 if let Some(nc) = next_char {
                     if punct_chars.contains(&nc) {
@@ -1167,10 +1485,23 @@ pub fn chinese_g2p(text: &str) -> (Vec<String>, Vec<i32>) {
         }
     }
 
+    // Apply hard corrections for characters where G2PW/pinyin crate is wrong
+    // These corrections take priority over G2PW
+    let corrections = pinyin_corrections();
+    for (i, &c) in chars.iter().enumerate() {
+        if let Some(&corrected) = corrections.get(&c) {
+            char_pinyins[i] = Some(corrected.to_string());
+        }
+    }
+
     // Apply polyphone corrections (word-context based) - fallback for chars G2PW doesn't cover
     apply_polyphone_corrections(&chars, &mut char_pinyins);
 
-    // Apply tone sandhi (including neutral tone for specific words)
+    // Apply tone sandhi using word-level processing (Python-compatible)
+    // This uses jieba segmentation and the full tone_sandhi module
+    apply_word_level_tone_sandhi(text, &mut char_pinyins);
+
+    // Also apply character-level sandhi as fallback for edge cases
     apply_tone_sandhi(&chars, &mut char_pinyins);
 
     // Second pass: convert to phonemes
@@ -1385,16 +1716,16 @@ fn number_to_english_phonemes(num_str: &str) -> Vec<(Vec<String>, i32)> {
 
 /// Language segment for mixed text processing
 #[derive(Debug, Clone)]
-struct LangSegment {
-    text: String,
-    is_english: bool,
+pub struct LangSegment {
+    pub text: String,
+    pub is_english: bool,
 }
 
 /// Segment text into Chinese and English chunks
 /// Digits are context-dependent:
 /// - In English context (after letters): treated as English (e.g., "Room 404")
 /// - Followed by Chinese units: treated as Chinese (e.g., "126.4亿斤")
-fn segment_by_language(text: &str) -> Vec<LangSegment> {
+pub fn segment_by_language(text: &str) -> Vec<LangSegment> {
     let mut segments = Vec::new();
     let mut current_text = String::new();
     let mut current_is_english: Option<bool> = None;
@@ -1479,6 +1810,8 @@ pub fn mixed_g2p(text: &str) -> (Vec<String>, Vec<i32>) {
 
     for segment in segments {
         let (phonemes, word2ph) = if segment.is_english {
+            // Word-level English G2P (matches Python's en_G2p which uses wordsegment
+            // to split concatenated words back into real words for CMU dict lookup)
             english_g2p(&segment.text)
         } else {
             chinese_g2p(&segment.text)
@@ -1488,6 +1821,35 @@ pub fn mixed_g2p(text: &str) -> (Vec<String>, Vec<i32>) {
     }
 
     (all_phonemes, all_word2ph)
+}
+
+/// Spell English text letter-by-letter, matching Python's LangSegment behavior
+/// where uppercase concatenated English is split into individual letters.
+/// Each letter gets its CMU dict pronunciation (the letter name, not the sound).
+/// Punctuation is kept as-is.
+fn english_letter_spell(text: &str) -> (Vec<String>, Vec<i32>) {
+    use super::g2p_en;
+
+    let mut phonemes = Vec::new();
+    let mut word2ph = Vec::new();
+
+    for c in text.chars() {
+        if c.is_ascii_alphabetic() {
+            // Each letter gets its CMU pronunciation (letter name)
+            let letter = c.to_ascii_uppercase().to_string();
+            let letter_phones = g2p_en::word_to_phonemes(&letter);
+            let count = letter_phones.len() as i32;
+            phonemes.extend(letter_phones);
+            word2ph.push(count);
+        } else if c == ',' || c == '.' || c == '!' || c == '?' {
+            // Punctuation
+            phonemes.push(c.to_string());
+            word2ph.push(1);
+        }
+        // Skip other characters (spaces etc.)
+    }
+
+    (phonemes, word2ph)
 }
 
 /// Text preprocessor configuration
@@ -1550,10 +1912,21 @@ impl TextPreprocessor {
         let language = language.unwrap_or_else(|| detect_language(text));
 
         // Normalize text
-        let text_normalized = match language {
-            Language::Chinese => normalize_chinese(text),
-            Language::English => normalize_english(text),
-            Language::Mixed => normalize_chinese(text),
+        // For mixed text: use mix_text_normalize to preserve English,
+        // matching Python's all_zh path which calls mix_text_normalize
+        // when English letters are detected.
+        let (text_normalized, language) = match language {
+            Language::Chinese => {
+                // Check if text contains English - if so, treat as Mixed
+                // This matches Python's all_zh path: if re.search(r'[A-Za-z]', text)
+                if text.chars().any(|c| c.is_ascii_alphabetic()) {
+                    (mix_text_normalize(text), Language::Mixed)
+                } else {
+                    (normalize_chinese(text), Language::Chinese)
+                }
+            }
+            Language::English => (normalize_english(text), Language::English),
+            Language::Mixed => (mix_text_normalize(text), Language::Mixed),
         };
 
         // Convert to phonemes
@@ -1631,7 +2004,8 @@ mod tests {
     #[test]
     fn test_normalize_chinese() {
         assert_eq!(normalize_chinese("你好，世界！"), "你好,世界!");
-        assert_eq!(normalize_chinese("（测试）"), "(测试)");
+        // Parentheses are removed as they are non-phonetic characters
+        assert_eq!(normalize_chinese("（测试）"), "测试");
     }
 
     #[test]
@@ -1666,9 +2040,12 @@ mod tests {
     fn test_english_g2p() {
         let (phonemes, word2ph) = english_g2p("hello world");
         assert!(!phonemes.is_empty());
-        // Each letter becomes a phoneme
-        assert!(phonemes.contains(&"H".to_string()));
-        assert!(phonemes.contains(&"E".to_string()));
+        // CMU dictionary uses ARPABET notation
+        // "hello" -> ["HH", "AH0", "L", "OW1"] or similar
+        // "world" -> ["W", "ER1", "L", "D"]
+        // Check that we have some phonemes and word2ph is reasonable
+        assert!(phonemes.len() >= 4); // At least a few phonemes
+        assert_eq!(word2ph.len(), 2); // Two words
     }
 
     #[test]
@@ -1701,6 +2078,123 @@ mod tests {
         let (phonemes, _) = chinese_g2p("一样");
         let yi_phoneme = phonemes.iter().find(|p| p.starts_with("i"));
         assert_eq!(yi_phoneme, Some(&"i2".to_string()), "一 before 样(yang4) should become yi2");
+    }
+
+    #[test]
+    fn test_polyphonic_wei() {
+        // 为 in 改为 should be wei2 (not wei4)
+        let (phonemes, _) = chinese_g2p("改为");
+        // 改 = g ai3, 为 = w ei2
+        // Phonemes should be: ["g", "ai3", "w", "ei2"]
+        println!("Rust 改为: {:?}", phonemes);
+        assert_eq!(phonemes, vec!["g", "ai3", "w", "ei2"],
+            "改为 phonemes should match Python exactly");
+
+        // Also verify 成为
+        let (phonemes, _) = chinese_g2p("成为");
+        println!("Rust 成为: {:?}", phonemes);
+        assert!(phonemes.contains(&"ei2".to_string()),
+            "为 in 成为 should be wei2, got phonemes: {:?}", phonemes);
+    }
+
+    #[test]
+    fn test_gaiwei_in_mixed_content() {
+        // Test the exact text that previously had the issue
+        // "刊名改为经济学人" should have 改为 = g ai3 w ei2
+        let text = "刊名改为经济学人";
+        let (phonemes, _) = chinese_g2p(text);
+        println!("Rust {}: {:?}", text, phonemes);
+
+        // Find position of 为 phoneme (should be ei2 not ei4)
+        // 刊 名 改 为 经 济 学 人
+        // 0  1  2  3  4  5  6  7
+        // Each character produces 2 phonemes (initial + final)
+        // 改 = g ai3 (positions 4, 5)
+        // 为 = w ei2 (positions 6, 7)
+        assert!(phonemes.len() >= 8, "Should have at least 8 phonemes");
+
+        // Check that we have ei2 for 为
+        assert!(phonemes.contains(&"ei2".to_string()),
+            "为 in 改为 should be wei2, got: {:?}", phonemes);
+
+        // Verify no ei4 which would be wrong
+        assert!(!phonemes.contains(&"ei4".to_string()),
+            "Should NOT have ei4 for 为, got: {:?}", phonemes);
+    }
+
+    #[test]
+    fn test_atlantic_mixed_content() {
+        // Test complex mixed Chinese/English content
+        let text = "2011年12月，TheAtlantic.com上开设了一个新的健康频道，内容涵盖食品以及与思想、身体、性爱、家庭和公共卫生有关的主题。";
+
+        let norm = normalize_chinese(text);
+        println!("Normalized ({} chars): {}", norm.chars().count(), norm);
+
+        let (phones, word2ph) = chinese_g2p(&norm);
+        println!("Phonemes ({}): {:?}", phones.len(), phones);
+        println!("Word2Ph ({}): {:?}", word2ph.len(), word2ph);
+
+        // Verify key properties
+        assert!(!phones.is_empty(), "Should have phonemes");
+        assert!(!word2ph.is_empty(), "Should have word2ph");
+        assert_eq!(phones.len(), word2ph.iter().sum::<i32>() as usize,
+            "Phoneme count should match sum of word2ph");
+
+        // Verify 作为 has wei2 (not wei4)
+        // The text contains "作为聚合器" so 为 should be wei2
+    }
+
+    #[test]
+    fn test_atlantic_complex() {
+        // Complex Atlantic text with names, dates, parentheses, etc.
+        let text = "2017年7月28日，《大西洋杂志》宣布，亿万富翁投资者和慈善家劳伦·鲍威尔·乔布斯（前苹果公司总裁兼CEO史提夫·乔布斯的遗孀），她透过自己的爱默生集团获得了大部分股权，而爱默生集团的工作人员彼得·拉特曼（Peter Lattman）即时被任命为《大西洋杂志》的副董事长。大卫·G·布拉德利及大西洋媒体在该次交易中保留了少数股份[35]。";
+
+        let norm = normalize_chinese(text);
+        println!("Normalized ({} chars): {}", norm.chars().count(), norm);
+
+        let (phones, word2ph) = chinese_g2p(&norm);
+        println!("Phonemes ({}): {:?}", phones.len(), phones);
+        println!("Word2Ph ({}): {:?}", word2ph.len(), word2ph);
+
+        // Verify basic properties
+        assert!(!phones.is_empty(), "Should have phonemes");
+        assert!(!word2ph.is_empty(), "Should have word2ph");
+        assert_eq!(phones.len(), word2ph.iter().sum::<i32>() as usize,
+            "Phoneme count should match sum of word2ph");
+    }
+
+    #[test]
+    fn test_yi_in_year_number() {
+        // Test "二零一一年" - first 一 should stay yi1 (in number sequence)
+        // second 一 should become yi4 (before 年 which is tone 2)
+        // Python: yi1 yi4
+        let (phones, _) = chinese_g2p("二零一一年");
+        println!("Phonemes for 二零一一年: {:?}", phones);
+
+        // 二 = EE er4 (0-1)
+        // 零 = l ing2 (2-3)
+        // 一 = y i? (4-5)
+        // 一 = y i? (6-7)
+        // 年 = n ian2 (8-9)
+
+        // Check first 一 is yi1 (position 5)
+        assert_eq!(phones[5], "i1",
+            "First 一 in 二零一一 should be yi1, got: {}", phones[5]);
+
+        // Check second 一 is yi4 (position 7)
+        assert_eq!(phones[7], "i4",
+            "Second 一 before 年 should be yi4, got: {}", phones[7]);
+    }
+
+    #[test]
+    fn test_yige_sandhi() {
+        // 一 before 个 (ge4) should become yi2
+        let (phones, _) = chinese_g2p("一个");
+
+        // 一 = y i2 (0-1) - yi sandhi: 一 before tone 4 → yi2
+        // 个 = g e5 (2-3) - neutral tone
+        assert_eq!(phones[1], "i2",
+            "一 before 个 should be yi2, got: {}", phones[1]);
     }
 
     #[test]
@@ -1810,5 +2304,153 @@ mod tests {
         assert_eq!(replace_consecutive_punctuation("你好!!世界"), "你好!世界");
         assert_eq!(replace_consecutive_punctuation("你好,,世界"), "你好,世界");
         assert_eq!(replace_consecutive_punctuation("你好!?世界"), "你好!世界");
+    }
+
+    /// Comparison test to output phonemes for Python comparison
+    /// Run with: cargo test --features jieba compare_with_python -- --nocapture
+    #[test]
+    fn compare_with_python() {
+        let preprocessor = TextPreprocessor::new(PreprocessorConfig {
+            add_bos: false,
+            add_eos: false,
+            ..Default::default()
+        });
+
+        let test_cases = vec![
+            "你好",
+            "你好世界",
+            "一百",
+            "一样",
+            "看一看",
+            "第一",
+            "一二三",
+            "一个",
+            "不对",
+            "不好",
+            "看不懂",
+            "老虎",
+            "展览馆",
+            "朋友",
+            "妈妈",
+            "东西",
+            "杂志",
+            "改为",
+            "成为",
+        ];
+
+        println!("\n{}", "=".repeat(60));
+        println!("Rust Preprocessing Test Results");
+        println!("{}", "=".repeat(60));
+
+        for text in test_cases {
+            let result = preprocessor.preprocess(text, Some(Language::Chinese));
+            println!("\nInput: {}", text);
+            println!("[Rust] Normalized: {}", result.text_normalized);
+            println!("[Rust] Phonemes ({}): {:?}", result.phonemes.len(), result.phonemes);
+            println!("[Rust] Word2Ph ({}): {:?}", result.word2ph.len(), result.word2ph);
+        }
+
+        println!("\n{}", "=".repeat(60));
+        println!("COMPARISON SUMMARY");
+        println!("{}", "=".repeat(60));
+
+        // Expected Python outputs for comparison
+        // These values are from real dora-primespeech Python (moyoyo_tts/text/chinese2.py)
+        // using opencpop-strict.txt phoneme mapping with ir/i0/v notation
+        let python_expected = vec![
+            // Basic greetings
+            ("你好", vec!["n", "i2", "h", "ao3"]),
+            ("你好世界", vec!["n", "i2", "h", "ao3", "sh", "ir4", "j", "ie4"]),
+
+            // Yi sandhi
+            ("一百", vec!["y", "i4", "b", "ai3"]),  // yi before tone 3 -> yi4
+            ("一样", vec!["y", "i2", "y", "ang4"]), // yi before tone 4 -> yi2
+            ("看一看", vec!["k", "an4", "y", "i5", "k", "an4"]), // yi in reduplication -> yi5
+            ("第一", vec!["d", "i4", "y", "i1"]),   // ordinal yi -> yi1
+            ("一二三", vec!["y", "i1", "EE", "er4", "s", "an1"]), // yi in number sequence -> yi1
+            ("一个", vec!["y", "i2", "g", "e5"]),   // yi ge -> yi2 (before tone 4)
+
+            // Bu sandhi
+            ("不对", vec!["b", "u2", "d", "ui4"]),  // bu before tone 4 -> bu2
+            ("不好", vec!["b", "u4", "h", "ao3"]),  // bu before tone 3 -> bu4
+            ("看不懂", vec!["k", "an4", "b", "u5", "d", "ong3"]), // bu in V不V -> bu5
+
+            // Three-tone sandhi
+            ("老虎", vec!["l", "ao2", "h", "u3"]),  // two tone-3 -> first becomes tone 2
+            ("展览馆", vec!["zh", "an2", "l", "an2", "g", "uan3"]), // three tone-3
+
+            // Neutral tone
+            ("朋友", vec!["p", "eng2", "y", "ou5"]), // 友 -> neutral tone
+            ("妈妈", vec!["m", "a1", "m", "a5"]),    // reduplication -> second neutral
+            ("东西", vec!["d", "ong1", "x", "i5"]),  // 西 -> neutral tone
+
+            // Polyphonic characters (verified from real dora-primespeech)
+            ("杂志", vec!["z", "a2", "zh", "ir4"]),  // 杂志 uses ir4 for retroflex
+            ("改为", vec!["g", "ai3", "w", "ei2"]),  // 为 as "change to" -> wei2
+            ("成为", vec!["ch", "eng2", "w", "ei2"]), // 为 as "become" -> wei2
+
+            // Complex phrases (verified from real dora-primespeech)
+            ("大西洋杂志宣布", vec!["d", "a4", "x", "i1", "y", "ang2", "z", "a2", "zh", "ir4", "x", "van1", "b", "u4"]),
+            ("亿万富翁投资者", vec!["y", "i4", "w", "an4", "f", "u4", "w", "eng1", "t", "ou2", "z", "i01", "zh", "e3"]),
+            ("前苹果公司总裁", vec!["q", "ian2", "p", "ing2", "g", "uo3", "g", "ong1", "s", "i01", "z", "ong3", "c", "ai2"]),
+            ("爱默生集团", vec!["AA", "ai4", "m", "o4", "sh", "eng1", "j", "i2", "t", "uan2"]), // 爱 uses AA initial
+        ];
+
+        let mut matches = 0;
+        let mut mismatches = 0;
+
+        for (text, expected_phones) in &python_expected {
+            let result = preprocessor.preprocess(text, Some(Language::Chinese));
+            let rust_phones: Vec<&str> = result.phonemes.iter().map(|s| s.as_str()).collect();
+
+            if rust_phones == *expected_phones {
+                println!("\n[MATCH] {}", text);
+                matches += 1;
+            } else {
+                println!("\n[MISMATCH] {}", text);
+                println!("  Python: {:?}", expected_phones);
+                println!("  Rust:   {:?}", rust_phones);
+                mismatches += 1;
+            }
+        }
+
+        println!("\n{}", "=".repeat(60));
+        println!("Results: {} matches, {} mismatches", matches, mismatches);
+        println!("{}", "=".repeat(60));
+    }
+
+    /// Test mixed Chinese/English/numbers text (user's test case)
+    /// Run with: cargo test --features jieba test_mixed_content -- --nocapture
+    #[test]
+    fn test_mixed_content() {
+        let preprocessor = TextPreprocessor::new(PreprocessorConfig {
+            add_bos: false,
+            add_eos: false,
+            ..Default::default()
+        });
+
+        let text = r#"1845年，在英国"铁路狂热"时期，该报一度与《银行公报》（Bankers' Gazette）及《铁路观察》（Railway Monitor）合并，并将刊名改为《经济学人：商业周报、银行公报及铁路观察——政治化和文学化的大众报纸》（The Economist, Weekly Commercial Times, Bankers' Gazette, and Railway Monitor. A Political, Literary and General Newspaper）。"#;
+
+        let result = preprocessor.preprocess(text, Some(Language::Chinese));
+
+        println!("\n{}", "=".repeat(60));
+        println!("Mixed Content Test");
+        println!("{}", "=".repeat(60));
+        println!("\nInput: {}...", &text[..80.min(text.len())]);
+        println!("\n[Rust] Normalized ({} chars):", result.text_normalized.len());
+        println!("  {}", result.text_normalized);
+        println!("\n[Rust] Phonemes ({}):", result.phonemes.len());
+        println!("  {:?}", result.phonemes);
+        println!("\n[Rust] Word2Ph ({}):", result.word2ph.len());
+        println!("  {:?}", result.word2ph);
+
+        // Basic sanity checks
+        assert!(!result.phonemes.is_empty(), "Should produce some phonemes");
+        assert!(!result.word2ph.is_empty(), "Should produce word2ph mappings");
+        assert_eq!(
+            result.phonemes.len(),
+            result.word2ph.iter().map(|&x| x as usize).sum::<usize>(),
+            "Phoneme count should match sum of word2ph"
+        );
     }
 }

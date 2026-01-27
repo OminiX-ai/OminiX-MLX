@@ -15,7 +15,7 @@ mlx-rs = { path = "../mlx-rs" }
 mlx-rs-core = { path = "../mlx-rs-core" }
 
 # Tokenization
-tokenizers = "0.15"
+tokenizers = "0.22"
 
 # Serialization
 serde = { version = "1.0", features = ["derive"] }
@@ -55,3 +55,26 @@ path = "examples/conversation.rs"
 [[example]]
 name = "benchmark_asr"
 path = "examples/benchmark_asr.rs"
+
+[[example]]
+name = "benchmark_audio_processing"
+path = "examples/benchmark_audio_processing.rs"
+
+[[example]]
+name = "benchmark_e2e"
+path = "examples/benchmark_e2e.rs"
+
+[[example]]
+name = "speech_to_speech"
+path = "examples/speech_to_speech.rs"
+required-features = ["tts"]
+
+[[example]]
+name = "test_s3tokenizer"
+path = "examples/test_s3tokenizer.rs"
+required-features = ["tts"]
+
+[[example]]
+name = "test_tts_pipeline"
+path = "examples/test_tts_pipeline.rs"
+required-features = ["tts"]

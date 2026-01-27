@@ -1,535 +1,501 @@
-//! Flow Matching Decoder for Step-Audio 2
+//! CosyVoice2 Flow Matching Decoder for Step-Audio 2
 //!
-//! Implements a CosyVoice2-style Conditional Flow Matching (CFM) decoder
-//! that converts semantic features to mel spectrograms.
+//! Weight-based implementation that directly uses loaded safetensors weights.
 //!
 //! Architecture:
-//! - Rectified Flow (linear interpolation)
-//! - UNet-like estimator with cross-attention
-//! - 10 denoising steps for inference
-//! - Output: 80-dim mel spectrogram
+//! - Codebook: 6561 × 512 embedding
+//! - Encoder: input_proj (Linear+LN) + 6 conformer layers
+//! - Flow encoder: up_embed + up_layer (conv) + 4 up_encoders + lookahead + norm + proj
+//! - DiT decoder: t_embedder + in_proj + 16 blocks (AdaLN + QKnorm attn + conv + MLP) + final_layer
+//! - Flow matching: 10-step rectified flow
 
-use mlx_rs::{
-    builder::Builder,
-    error::Exception,
-    macros::ModuleParameters,
-    module::Module,
-    nn,
-    Array,
-};
+use std::collections::HashMap;
+use std::path::Path;
 
-use crate::error::Result;
+use mlx_rs::{Array, error::Exception, ops, ops::indexing::IndexOp};
+
+use crate::error::{Error, Result};
 
 /// Flow decoder configuration
 #[derive(Debug, Clone)]
 pub struct FlowDecoderConfig {
-    /// Hidden dimension
+    pub vocab_size: i32,
     pub hidden_dim: i32,
-    /// Number of attention heads
-    pub num_heads: i32,
-    /// Number of encoder layers
-    pub num_encoder_layers: i32,
-    /// Number of decoder layers
-    pub num_decoder_layers: i32,
-    /// Mel spectrogram dimension (output)
     pub mel_dim: i32,
-    /// Semantic feature dimension (input)
-    pub semantic_dim: i32,
-    /// Number of denoising steps for inference
+    pub spk_embed_dim: i32,
+    pub num_encoder_blocks: i32,
+    pub num_up_blocks: i32,
+    pub num_heads: i32,
+    pub head_dim: i32,
+    pub dit_depth: i32,
     pub num_steps: i32,
-    /// Dropout rate
-    pub dropout: f32,
 }
 
 impl Default for FlowDecoderConfig {
     fn default() -> Self {
         Self {
+            vocab_size: 6561,
             hidden_dim: 512,
-            num_heads: 8,
-            num_encoder_layers: 4,
-            num_decoder_layers: 4,
             mel_dim: 80,
-            semantic_dim: 512,
+            spk_embed_dim: 192,
+            num_encoder_blocks: 6,
+            num_up_blocks: 4,
+            num_heads: 8,
+            head_dim: 64,
+            dit_depth: 16,
             num_steps: 10,
-            dropout: 0.0,
         }
     }
 }
 
-/// Timestep embedding using sinusoidal encoding
-#[derive(Debug, Clone, ModuleParameters)]
-pub struct TimestepEmbedding {
-    /// Linear projection
-    #[param]
-    pub linear1: nn::Linear,
-    /// Second projection
-    #[param]
-    pub linear2: nn::Linear,
-    /// Hidden dimension
-    pub dim: i32,
-}
+// =========================================================================
+// Helper functions
+// =========================================================================
 
-impl TimestepEmbedding {
-    /// Create a new timestep embedding
-    pub fn new(dim: i32) -> Result<Self> {
-        Ok(Self {
-            linear1: nn::LinearBuilder::new(dim, dim * 4).build()?,
-            linear2: nn::LinearBuilder::new(dim * 4, dim).build()?,
-            dim,
-        })
-    }
-
-    /// Create sinusoidal positional encoding for timestep
-    fn sinusoidal_encoding(&self, t: f32) -> Array {
-        let half_dim = self.dim / 2;
-        let mut embed = vec![0.0f32; self.dim as usize];
-
-        for i in 0..half_dim {
-            let freq = 10000.0f32.powf(-2.0 * i as f32 / self.dim as f32);
-            let angle = t * freq;
-            embed[i as usize] = angle.sin();
-            embed[(i + half_dim) as usize] = angle.cos();
-        }
-
-        Array::from_slice(&embed, &[1, self.dim])
+fn linear(x: &Array, w: &Array, b: Option<&Array>) -> std::result::Result<Array, Exception> {
+    let out = ops::matmul(x, w.t())?;
+    match b {
+        Some(bias) => out.add(bias),
+        None => Ok(out),
     }
 }
 
-impl Module<f32> for TimestepEmbedding {
-    type Output = Array;
-    type Error = Exception;
+fn layer_norm(x: &Array, w: &Array, b: &Array, eps: f32) -> std::result::Result<Array, Exception> {
+    mlx_rs::fast::layer_norm(x, Some(w), Some(b), eps)
+}
 
-    fn training_mode(&mut self, _mode: bool) {}
+fn gelu(x: &Array) -> std::result::Result<Array, Exception> {
+    mlx_rs::nn::gelu_approximate(x)
+}
 
-    fn forward(&mut self, t: f32) -> std::result::Result<Array, Self::Error> {
-        let embed = self.sinusoidal_encoding(t);
-        let h = self.linear1.forward(&embed)?;
-        let h = nn::silu(&h)?;
-        self.linear2.forward(&h)
+fn silu(x: &Array) -> std::result::Result<Array, Exception> {
+    let sigmoid = ops::sigmoid(x)?;
+    x.multiply(&sigmoid)
+}
+
+fn conv1d_same(x: &Array, w: &Array, b: Option<&Array>) -> std::result::Result<Array, Exception> {
+    // Weights from PyTorch are [out_ch, in_ch, kernel], MLX expects [out_ch, kernel, in_ch]
+    let w = w.transpose_axes(&[0, 2, 1])?;
+    let kernel_size = w.shape()[1];
+    let padding = kernel_size / 2;
+    let out = ops::conv1d_device(x, &w, None, Some(padding), None, None, mlx_rs::StreamOrDevice::default())?;
+    match b {
+        Some(bias) => out.add(bias),
+        None => Ok(out),
     }
 }
 
-/// Cross-attention layer for conditioning
-#[derive(Debug, Clone, ModuleParameters)]
-pub struct CrossAttention {
-    /// Query projection
-    #[param]
-    pub q_proj: nn::Linear,
-    /// Key projection
-    #[param]
-    pub k_proj: nn::Linear,
-    /// Value projection
-    #[param]
-    pub v_proj: nn::Linear,
-    /// Output projection
-    #[param]
-    pub out_proj: nn::Linear,
-    /// Number of heads
-    pub num_heads: i32,
-    /// Head dimension
-    pub head_dim: i32,
-    /// Scale factor
-    pub scale: f32,
+fn attention(
+    q: &Array, k: &Array, v: &Array,
+    num_heads: i32, head_dim: i32,
+) -> std::result::Result<Array, Exception> {
+    let shape = q.shape();
+    let batch = shape[0];
+    let seq_len = shape[1];
+    let scale = (head_dim as f32).powf(-0.5);
+
+    let q = q.reshape(&[batch, seq_len, num_heads, head_dim])?
+        .transpose_axes(&[0, 2, 1, 3])?;
+    let k = k.reshape(&[batch, seq_len, num_heads, head_dim])?
+        .transpose_axes(&[0, 2, 1, 3])?;
+    let v = v.reshape(&[batch, seq_len, num_heads, head_dim])?
+        .transpose_axes(&[0, 2, 1, 3])?;
+
+    let attn = mlx_rs::fast::scaled_dot_product_attention(q, k, v, scale, None)?;
+    attn.transpose_axes(&[0, 2, 1, 3])?
+        .reshape(&[batch, seq_len, num_heads * head_dim])
 }
 
-impl CrossAttention {
-    /// Create a new cross-attention layer
-    pub fn new(query_dim: i32, kv_dim: i32, num_heads: i32) -> Result<Self> {
-        let head_dim = query_dim / num_heads;
-
-        Ok(Self {
-            q_proj: nn::LinearBuilder::new(query_dim, query_dim).build()?,
-            k_proj: nn::LinearBuilder::new(kv_dim, query_dim).build()?,
-            v_proj: nn::LinearBuilder::new(kv_dim, query_dim).build()?,
-            out_proj: nn::LinearBuilder::new(query_dim, query_dim).build()?,
-            num_heads,
-            head_dim,
-            scale: (head_dim as f32).powf(-0.5),
-        })
+fn timestep_embedding(t: f32, dim: i32) -> Array {
+    let half_dim = dim / 2;
+    let mut embed = vec![0.0f32; dim as usize];
+    for i in 0..half_dim {
+        let freq = (-(i as f32) / half_dim as f32 * (10000.0f32).ln()).exp();
+        let angle = t * freq;
+        embed[i as usize] = angle.cos();
+        embed[(i + half_dim) as usize] = angle.sin();
     }
+    Array::from_slice(&embed, &[1, dim])
 }
 
-impl Module<(&Array, &Array)> for CrossAttention {
-    type Output = Array;
-    type Error = Exception;
+// =========================================================================
+// Flow Decoder
+// =========================================================================
 
-    fn training_mode(&mut self, _mode: bool) {}
-
-    fn forward(&mut self, input: (&Array, &Array)) -> std::result::Result<Array, Self::Error> {
-        let (query, context) = input;
-
-        let shape = query.shape();
-        let (batch, seq_len, _) = (shape[0], shape[1], shape[2]);
-
-        // Project Q, K, V
-        let q = self.q_proj.forward(query)?;
-        let k = self.k_proj.forward(context)?;
-        let v = self.v_proj.forward(context)?;
-
-        // Reshape to multi-head
-        let q = q
-            .reshape(&[batch, seq_len, self.num_heads, self.head_dim])?
-            .transpose_axes(&[0, 2, 1, 3])?;
-        let ctx_len = context.shape()[1];
-        let k = k
-            .reshape(&[batch, ctx_len, self.num_heads, self.head_dim])?
-            .transpose_axes(&[0, 2, 1, 3])?;
-        let v = v
-            .reshape(&[batch, ctx_len, self.num_heads, self.head_dim])?
-            .transpose_axes(&[0, 2, 1, 3])?;
-
-        // Scaled dot-product attention
-        let attn = mlx_rs::fast::scaled_dot_product_attention(q, k, v, self.scale, None)?;
-
-        // Reshape back
-        let attn = attn
-            .transpose_axes(&[0, 2, 1, 3])?
-            .reshape(&[batch, seq_len, self.num_heads * self.head_dim])?;
-
-        self.out_proj.forward(&attn)
-    }
-}
-
-/// Flow estimator block (transformer-like)
-#[derive(Debug, Clone, ModuleParameters)]
-pub struct FlowBlock {
-    /// Self-attention layer norm
-    #[param]
-    pub norm1: nn::LayerNorm,
-    /// Self-attention
-    #[param]
-    pub self_attn: CrossAttention,
-    /// Cross-attention layer norm
-    #[param]
-    pub norm2: nn::LayerNorm,
-    /// Cross-attention (for conditioning)
-    #[param]
-    pub cross_attn: CrossAttention,
-    /// FFN layer norm
-    #[param]
-    pub norm3: nn::LayerNorm,
-    /// FFN up projection
-    #[param]
-    pub ffn_up: nn::Linear,
-    /// FFN down projection
-    #[param]
-    pub ffn_down: nn::Linear,
-}
-
-impl FlowBlock {
-    /// Create a new flow block
-    pub fn new(hidden_dim: i32, num_heads: i32, semantic_dim: i32) -> Result<Self> {
-        let ffn_dim = hidden_dim * 4;
-
-        Ok(Self {
-            norm1: nn::LayerNormBuilder::new(hidden_dim).build()?,
-            self_attn: CrossAttention::new(hidden_dim, hidden_dim, num_heads)?,
-            norm2: nn::LayerNormBuilder::new(hidden_dim).build()?,
-            cross_attn: CrossAttention::new(hidden_dim, semantic_dim, num_heads)?,
-            norm3: nn::LayerNormBuilder::new(hidden_dim).build()?,
-            ffn_up: nn::LinearBuilder::new(hidden_dim, ffn_dim).build()?,
-            ffn_down: nn::LinearBuilder::new(ffn_dim, hidden_dim).build()?,
-        })
-    }
-}
-
-impl Module<(&Array, &Array)> for FlowBlock {
-    type Output = Array;
-    type Error = Exception;
-
-    fn training_mode(&mut self, _mode: bool) {}
-
-    fn forward(&mut self, input: (&Array, &Array)) -> std::result::Result<Array, Self::Error> {
-        let (x, context) = input;
-
-        // Self-attention with residual
-        let h = self.norm1.forward(x)?;
-        let h = self.self_attn.forward((&h, &h))?;
-        let x = x.add(&h)?;
-
-        // Cross-attention with residual
-        let h = self.norm2.forward(&x)?;
-        let h = self.cross_attn.forward((&h, context))?;
-        let x = x.add(&h)?;
-
-        // FFN with residual
-        let h = self.norm3.forward(&x)?;
-        let h = self.ffn_up.forward(&h)?;
-        let h = nn::gelu(&h)?;
-        let h = self.ffn_down.forward(&h)?;
-        x.add(&h)
-    }
-}
-
-/// Flow estimator network (UNet-like architecture)
-#[derive(Debug, Clone, ModuleParameters)]
-pub struct FlowEstimator {
-    /// Input projection (mel + noise → hidden)
-    #[param]
-    pub input_proj: nn::Linear,
-    /// Timestep embedding
-    #[param]
-    pub time_embed: TimestepEmbedding,
-    /// Semantic conditioning projection
-    #[param]
-    pub cond_proj: nn::Linear,
-    /// Transformer blocks
-    #[param]
-    pub blocks: Vec<FlowBlock>,
-    /// Output projection (hidden → mel)
-    #[param]
-    pub output_proj: nn::Linear,
-    /// Final layer norm
-    #[param]
-    pub final_norm: nn::LayerNorm,
-    /// Configuration
-    pub config: FlowDecoderConfig,
-}
-
-impl FlowEstimator {
-    /// Create a new flow estimator
-    pub fn new(config: FlowDecoderConfig) -> Result<Self> {
-        let num_blocks = config.num_encoder_layers + config.num_decoder_layers;
-
-        // Input projection: mel_dim → hidden_dim
-        let input_proj = nn::LinearBuilder::new(config.mel_dim, config.hidden_dim).build()?;
-
-        // Timestep embedding
-        let time_embed = TimestepEmbedding::new(config.hidden_dim)?;
-
-        // Semantic conditioning projection
-        let cond_proj = nn::LinearBuilder::new(config.semantic_dim, config.hidden_dim).build()?;
-
-        // Transformer blocks
-        let mut blocks = Vec::new();
-        for _ in 0..num_blocks {
-            blocks.push(FlowBlock::new(
-                config.hidden_dim,
-                config.num_heads,
-                config.hidden_dim, // After projection
-            )?);
-        }
-
-        // Output projection
-        let output_proj = nn::LinearBuilder::new(config.hidden_dim, config.mel_dim).build()?;
-
-        // Final layer norm
-        let final_norm = nn::LayerNormBuilder::new(config.hidden_dim).build()?;
-
-        Ok(Self {
-            input_proj,
-            time_embed,
-            cond_proj,
-            blocks,
-            output_proj,
-            final_norm,
-            config,
-        })
-    }
-
-    /// Forward pass for velocity estimation
-    ///
-    /// # Arguments
-    /// * `x` - Noisy mel spectrogram [B, mel_dim, T]
-    /// * `t` - Timestep (0.0 to 1.0)
-    /// * `cond` - Semantic conditioning [B, T', semantic_dim]
-    pub fn forward_with_time(
-        &mut self,
-        x: &Array,
-        t: f32,
-        cond: &Array,
-    ) -> std::result::Result<Array, Exception> {
-        // x: [B, mel_dim, T] → [B, T, mel_dim]
-        let x = x.transpose_axes(&[0, 2, 1])?;
-
-        // Project input
-        let h = self.input_proj.forward(&x)?;
-
-        // Add timestep embedding
-        // t_embed: [1, hidden_dim] -> expand to [B, T, hidden_dim]
-        let t_embed = self.time_embed.forward(t)?;
-        // Reshape to [1, 1, hidden_dim] for broadcasting
-        let t_embed = t_embed.reshape(&[1, 1, self.config.hidden_dim])?;
-        let h = h.add(&t_embed)?;
-
-        // Project conditioning
-        let cond = self.cond_proj.forward(cond)?;
-
-        // Apply transformer blocks
-        let mut h = h;
-        for block in &mut self.blocks {
-            h = block.forward((&h, &cond))?;
-        }
-
-        // Output projection
-        let h = self.final_norm.forward(&h)?;
-        let out = self.output_proj.forward(&h)?;
-
-        // [B, T, mel_dim] → [B, mel_dim, T]
-        out.transpose_axes(&[0, 2, 1])
-    }
-}
-
-/// Rectified Flow sampler
-///
-/// Implements the denoising loop using linear interpolation (rectified flow).
-#[derive(Debug, Clone)]
-pub struct FlowSampler {
-    /// Number of denoising steps
-    pub num_steps: i32,
-}
-
-impl FlowSampler {
-    /// Create a new flow sampler
-    pub fn new(num_steps: i32) -> Self {
-        Self { num_steps }
-    }
-
-    /// Sample from prior (Gaussian noise)
-    pub fn sample_prior(&self, shape: &[i32]) -> std::result::Result<Array, Exception> {
-        mlx_rs::random::normal::<f32>(shape, None, None, None)
-    }
-
-    /// Generate timestep schedule (linear from 1.0 to 0.0)
-    pub fn timestep_schedule(&self) -> Vec<f32> {
-        let n = self.num_steps as f32;
-        (0..=self.num_steps)
-            .map(|i| 1.0 - i as f32 / n)
-            .collect()
-    }
-
-    /// Single denoising step using rectified flow
-    ///
-    /// x_{t-dt} = x_t - dt * v(x_t, t)
-    pub fn step(
-        &self,
-        x: &Array,
-        velocity: &Array,
-        t: f32,
-        t_next: f32,
-    ) -> std::result::Result<Array, Exception> {
-        let dt = t - t_next;
-        let dt_array = Array::from_slice(&[dt], &[]);
-
-        // Euler step: x_{t-dt} = x_t - dt * v
-        let dx = velocity.multiply(&dt_array)?;
-        x.subtract(&dx)
-    }
-
-    /// Full denoising loop
-    ///
-    /// # Arguments
-    /// * `estimator` - Velocity estimator network
-    /// * `x_T` - Initial noise sample
-    /// * `cond` - Conditioning features
-    pub fn denoise<F>(
-        &self,
-        mut velocity_fn: F,
-        x_t: &Array,
-        cond: &Array,
-    ) -> std::result::Result<Array, Exception>
-    where
-        F: FnMut(&Array, f32, &Array) -> std::result::Result<Array, Exception>,
-    {
-        let schedule = self.timestep_schedule();
-        let mut x = x_t.clone();
-
-        for i in 0..self.num_steps as usize {
-            let t = schedule[i];
-            let t_next = schedule[i + 1];
-
-            // Estimate velocity
-            let v = velocity_fn(&x, t, cond)?;
-
-            // Euler step
-            x = self.step(&x, &v, t, t_next)?;
-        }
-
-        Ok(x)
-    }
-}
-
-/// Flow matching decoder
-#[derive(Debug, Clone, ModuleParameters)]
+/// CosyVoice2 Flow Decoder with direct weight access
 pub struct FlowDecoder {
-    /// Velocity estimator network
-    #[param]
-    pub estimator: FlowEstimator,
-    /// Flow sampler
-    pub sampler: FlowSampler,
-    /// Configuration
+    pub weights: HashMap<String, Array>,
     pub config: FlowDecoderConfig,
+    pub weights_loaded: bool,
 }
 
 impl FlowDecoder {
-    /// Create a new flow decoder
     pub fn new(config: FlowDecoderConfig) -> Result<Self> {
         Ok(Self {
-            estimator: FlowEstimator::new(config.clone())?,
-            sampler: FlowSampler::new(config.num_steps),
+            weights: HashMap::new(),
             config,
+            weights_loaded: false,
         })
     }
 
-    /// Load flow decoder from model directory
-    pub fn load(model_dir: impl AsRef<std::path::Path>) -> Result<Self> {
-        // TODO: Implement weight loading from safetensors
-        // For now, create with default config
-        Self::new(FlowDecoderConfig::default())
+    pub fn load(model_dir: impl AsRef<Path>) -> Result<Self> {
+        let model_dir = model_dir.as_ref();
+        let weights_path = model_dir.join("tts_mlx").join("flow.safetensors");
+
+        if !weights_path.exists() {
+            let alt_path = model_dir.join("flow.safetensors");
+            if alt_path.exists() {
+                return Self::load_from_file(&alt_path);
+            }
+            return Err(Error::ModelLoad(format!(
+                "Flow weights not found at {:?}", weights_path
+            )));
+        }
+        Self::load_from_file(&weights_path)
     }
 
-    /// Generate mel spectrogram from semantic features
-    ///
-    /// # Arguments
-    /// * `semantic_features` - Semantic features from S3Tokenizer [B, T, semantic_dim]
-    /// * `prompt_audio` - Optional reference mel for voice cloning [B, mel_dim, T']
-    /// * `num_steps` - Override number of denoising steps
-    pub fn generate(
-        &mut self,
-        semantic_features: &Array,
-        prompt_audio: Option<&Array>,
-        num_steps: Option<i32>,
-    ) -> Result<Array> {
-        let batch = semantic_features.shape()[0];
-        let seq_len = semantic_features.shape()[1];
+    fn load_from_file(weights_path: &Path) -> Result<Self> {
+        let config = FlowDecoderConfig::default();
+        let weights = Array::load_safetensors(weights_path)?;
+        println!("  Loaded {} flow weights", weights.len());
+        Ok(Self { weights, config, weights_loaded: true })
+    }
 
-        // Estimate output mel length (roughly 2x semantic length for 25Hz → 80Hz)
-        let mel_len = seq_len * 2;
+    fn w(&self, key: &str) -> &Array {
+        self.weights.get(key).unwrap_or_else(|| panic!("Missing weight: {}", key))
+    }
 
-        // Sample from prior
-        let x_t = self
-            .sampler
-            .sample_prior(&[batch, self.config.mel_dim, mel_len])
-            .map_err(|e| crate::error::Error::Inference(format!("Failed to sample prior: {}", e)))?;
+    // =====================================================================
+    // Encoder: codebook + input_proj + 6 conformer layers
+    // =====================================================================
 
-        // Prepare conditioning (optionally concatenate prompt)
-        let cond = if let Some(prompt) = prompt_audio {
-            // Concatenate prompt features with semantic features
-            // This is a simplified version; actual implementation may differ
-            semantic_features.clone()
-        } else {
-            semantic_features.clone()
-        };
+    pub fn encode(&self, codes: &[i32]) -> Result<Array> {
+        if codes.is_empty() {
+            return Err(Error::Inference("Empty codes".into()));
+        }
 
-        // Update sampler if num_steps specified
-        let sampler = if let Some(steps) = num_steps {
-            FlowSampler::new(steps)
-        } else {
-            self.sampler.clone()
-        };
+        let codes_array = Array::from_slice(codes, &[1, codes.len() as i32]);
+        let codebook_w = self.w("codebook.embeddings.weight");
+        let flat_codes = codes_array.reshape(&[-1])
+            .map_err(|e| Error::Inference(format!("Reshape codes: {}", e)))?;
+        let embeddings = codebook_w.take_axis(&flat_codes, 0)
+            .map_err(|e| Error::Inference(format!("Codebook lookup: {}", e)))?;
+        let embeddings = embeddings.reshape(&[1, codes.len() as i32, self.config.hidden_dim])
+            .map_err(|e| Error::Inference(format!("Reshape embeddings: {}", e)))?;
 
-        // Run denoising loop
-        let mel = sampler
-            .denoise(
-                |x, t, c| self.estimator.forward_with_time(x, t, c),
-                &x_t,
-                &cond,
-            )
-            .map_err(|e| crate::error::Error::Inference(format!("Denoising failed: {}", e)))?;
+        let h = linear(
+            &embeddings,
+            self.w("encoder.input_proj.out.0.weight"),
+            Some(self.w("encoder.input_proj.out.0.bias")),
+        ).map_err(|e| Error::Inference(format!("Input proj: {}", e)))?;
 
-        Ok(mel)
+        let h = layer_norm(
+            &h,
+            self.w("encoder.input_proj.out.1.weight"),
+            self.w("encoder.input_proj.out.1.bias"),
+            1e-5,
+        ).map_err(|e| Error::Inference(format!("Input proj norm: {}", e)))?;
+
+        let mut h = h;
+        for i in 0..self.config.num_encoder_blocks as usize {
+            h = self.conformer_block(&h, &format!("encoder.layers.{}", i))
+                .map_err(|e| Error::Inference(format!("Encoder block {}: {}", i, e)))?;
+        }
+
+        Ok(h)
+    }
+
+    fn conformer_block(&self, x: &Array, prefix: &str) -> std::result::Result<Array, Exception> {
+        let h = layer_norm(x,
+            self.w(&format!("{}.norm_mha.weight", prefix)),
+            self.w(&format!("{}.norm_mha.bias", prefix)), 1e-5)?;
+
+        let q = linear(&h, self.w(&format!("{}.self_attn.q_proj.weight", prefix)),
+                        Some(self.w(&format!("{}.self_attn.q_proj.bias", prefix))))?;
+        let k = linear(&h, self.w(&format!("{}.self_attn.k_proj.weight", prefix)),
+                        Some(self.w(&format!("{}.self_attn.k_proj.bias", prefix))))?;
+        let v = linear(&h, self.w(&format!("{}.self_attn.v_proj.weight", prefix)),
+                        Some(self.w(&format!("{}.self_attn.v_proj.bias", prefix))))?;
+
+        let attn_out = attention(&q, &k, &v, self.config.num_heads, self.config.head_dim)?;
+        let attn_out = linear(&attn_out,
+                              self.w(&format!("{}.self_attn.out_proj.weight", prefix)),
+                              Some(self.w(&format!("{}.self_attn.out_proj.bias", prefix))))?;
+
+        let x = x.add(&attn_out)?;
+
+        let h = layer_norm(&x,
+            self.w(&format!("{}.ffn_norm.weight", prefix)),
+            self.w(&format!("{}.ffn_norm.bias", prefix)), 1e-5)?;
+        let h = linear(&h, self.w(&format!("{}.ffn.up_proj.weight", prefix)),
+                        Some(self.w(&format!("{}.ffn.up_proj.bias", prefix))))?;
+        let h = gelu(&h)?;
+        let h = linear(&h, self.w(&format!("{}.ffn.down_proj.weight", prefix)),
+                        Some(self.w(&format!("{}.ffn.down_proj.bias", prefix))))?;
+
+        x.add(&h)
+    }
+
+    // =====================================================================
+    // Flow Encoder: upsample + conformer + lookahead + norm + proj
+    // =====================================================================
+
+    fn flow_encode(&self, h: &Array) -> std::result::Result<Array, Exception> {
+        let h = linear(h,
+            self.w("flow.encoder.up_embed.out.0.weight"),
+            Some(self.w("flow.encoder.up_embed.out.0.bias")))?;
+        let h = layer_norm(&h,
+            self.w("flow.encoder.up_embed.out.1.weight"),
+            self.w("flow.encoder.up_embed.out.1.bias"), 1e-5)?;
+
+        // Upsample 2x
+        let shape = h.shape();
+        let (batch, seq_len, dim) = (shape[0], shape[1], shape[2]);
+        let h_expanded = h.reshape(&[batch, seq_len, 1, dim])?;
+        let h_tiled = ops::tile(&h_expanded, &[1, 1, 2, 1])?;
+        let mut h = h_tiled.reshape(&[batch, seq_len * 2, dim])?;
+
+        h = conv1d_same(&h,
+            self.w("flow.encoder.up_layer.conv.weight"),
+            Some(self.w("flow.encoder.up_layer.conv.bias")))?;
+
+        for i in 0..self.config.num_up_blocks as usize {
+            h = self.flow_conformer_block(&h, &format!("flow.encoder.up_encoders.{}", i))?;
+        }
+
+        // Lookahead convolutions
+        let h = conv1d_same(&h,
+            self.w("flow.encoder.pre_lookahead_layer.conv1.weight"),
+            Some(self.w("flow.encoder.pre_lookahead_layer.conv1.bias")))?;
+        let h = gelu(&h)?;
+        let h = conv1d_same(&h,
+            self.w("flow.encoder.pre_lookahead_layer.conv2.weight"),
+            Some(self.w("flow.encoder.pre_lookahead_layer.conv2.bias")))?;
+        let h = gelu(&h)?;
+
+        let h = layer_norm(&h,
+            self.w("flow.encoder.after_norm.weight"),
+            self.w("flow.encoder.after_norm.bias"), 1e-5)?;
+
+        linear(&h,
+            self.w("flow.encoder_proj.weight"),
+            Some(self.w("flow.encoder_proj.bias")))
+    }
+
+    fn flow_conformer_block(&self, x: &Array, prefix: &str) -> std::result::Result<Array, Exception> {
+        let h = layer_norm(x,
+            self.w(&format!("{}.norm_mha.weight", prefix)),
+            self.w(&format!("{}.norm_mha.bias", prefix)), 1e-5)?;
+
+        let q = linear(&h, self.w(&format!("{}.self_attn.linear_q.weight", prefix)),
+                        Some(self.w(&format!("{}.self_attn.linear_q.bias", prefix))))?;
+        let k = linear(&h, self.w(&format!("{}.self_attn.linear_k.weight", prefix)),
+                        Some(self.w(&format!("{}.self_attn.linear_k.bias", prefix))))?;
+        let v = linear(&h, self.w(&format!("{}.self_attn.linear_v.weight", prefix)),
+                        Some(self.w(&format!("{}.self_attn.linear_v.bias", prefix))))?;
+
+        let attn_out = attention(&q, &k, &v, self.config.num_heads, self.config.head_dim)?;
+        let attn_out = linear(&attn_out,
+                              self.w(&format!("{}.self_attn.linear_out.weight", prefix)),
+                              Some(self.w(&format!("{}.self_attn.linear_out.bias", prefix))))?;
+
+        let x = x.add(&attn_out)?;
+
+        let h = layer_norm(&x,
+            self.w(&format!("{}.norm_ff.weight", prefix)),
+            self.w(&format!("{}.norm_ff.bias", prefix)), 1e-5)?;
+        let h = linear(&h, self.w(&format!("{}.feed_forward.w_1.weight", prefix)),
+                        Some(self.w(&format!("{}.feed_forward.w_1.bias", prefix))))?;
+        let h = gelu(&h)?;
+        let h = linear(&h, self.w(&format!("{}.feed_forward.w_2.weight", prefix)),
+                        Some(self.w(&format!("{}.feed_forward.w_2.bias", prefix))))?;
+
+        x.add(&h)
+    }
+
+    // =====================================================================
+    // DiT Decoder
+    // =====================================================================
+
+    fn dit_forward(&self, x_mel: &Array, mu: &Array, t: f32) -> std::result::Result<Array, Exception> {
+        let dim = self.config.hidden_dim;
+
+        // Timestep embedding
+        let t_emb = timestep_embedding(t * 1000.0, 256);
+        let t_emb = linear(&t_emb,
+            self.w("flow.decoder.estimator.t_embedder.mlp.0.weight"),
+            Some(self.w("flow.decoder.estimator.t_embedder.mlp.0.bias")))?;
+        let t_emb = silu(&t_emb)?;
+        let t_emb = linear(&t_emb,
+            self.w("flow.decoder.estimator.t_embedder.mlp.2.weight"),
+            Some(self.w("flow.decoder.estimator.t_embedder.mlp.2.bias")))?;
+
+        // Input: concat x_mel(80) + mu(80) + (x_mel - mu)(80) + spk(80) = 320
+        let shape = x_mel.shape();
+        let (batch, seq_len) = (shape[0], shape[1]);
+        let diff = x_mel.subtract(mu)?;
+        let spk = Array::zeros::<f32>(&[batch, seq_len, 80])?; // No speaker embedding for now
+        let full_input = ops::concatenate_axis(&[x_mel, mu, &diff, &spk], 2)?;
+
+        let mut h = linear(&full_input,
+            self.w("flow.decoder.estimator.in_proj.weight"),
+            Some(self.w("flow.decoder.estimator.in_proj.bias")))?;
+
+        // 16 DiT blocks
+        for i in 0..self.config.dit_depth as usize {
+            h = self.dit_block(&h, &t_emb, i)?;
+        }
+
+        // Final layer
+        let t_emb_expanded = t_emb.reshape(&[batch, 1, dim])?;
+        let adaln = silu(&t_emb_expanded)?;
+        let adaln = linear(&adaln,
+            self.w("flow.decoder.estimator.final_layer.adaLN_modulation.1.weight"),
+            Some(self.w("flow.decoder.estimator.final_layer.adaLN_modulation.1.bias")))?;
+
+        let shift = adaln.index((.., .., 0..dim));
+        let scale = adaln.index((.., .., dim..dim*2));
+
+        let h_normed = mlx_rs::fast::layer_norm(&h, None::<&Array>, None::<&Array>, 1e-5)?;
+        let one = Array::from_slice(&[1.0f32], &[]);
+        let h = h_normed.multiply(&scale.add(&one)?)?.add(&shift)?;
+
+        linear(&h,
+            self.w("flow.decoder.estimator.final_layer.linear.weight"),
+            Some(self.w("flow.decoder.estimator.final_layer.linear.bias")))
+    }
+
+    fn dit_block(&self, x: &Array, t_emb: &Array, block_idx: usize) -> std::result::Result<Array, Exception> {
+        let prefix = format!("flow.decoder.estimator.blocks.{}", block_idx);
+        let dim = self.config.hidden_dim;
+        let shape = x.shape();
+        let batch = shape[0];
+
+        // AdaLN modulation
+        let t_emb_expanded = t_emb.reshape(&[batch, 1, dim])?;
+        let adaln_input = silu(&t_emb_expanded)?;
+        let adaln = linear(&adaln_input,
+            self.w(&format!("{}.adaLN_modulation.1.weight", prefix)),
+            Some(self.w(&format!("{}.adaLN_modulation.1.bias", prefix))))?;
+
+        // Split into 9 chunks of dim
+        let shift_attn = adaln.index((.., .., 0..dim));
+        let scale_attn = adaln.index((.., .., dim..dim*2));
+        let gate_attn = adaln.index((.., .., dim*2..dim*3));
+        let shift_conv = adaln.index((.., .., dim*3..dim*4));
+        let scale_conv = adaln.index((.., .., dim*4..dim*5));
+        let gate_conv = adaln.index((.., .., dim*5..dim*6));
+        let shift_mlp = adaln.index((.., .., dim*6..dim*7));
+        let scale_mlp = adaln.index((.., .., dim*7..dim*8));
+        let gate_mlp = adaln.index((.., .., dim*8..dim*9));
+
+        let one = Array::from_slice(&[1.0f32], &[]);
+
+        // 1. Self-attention with AdaLN
+        let h_normed = mlx_rs::fast::layer_norm(x, None::<&Array>, None::<&Array>, 1e-5)?;
+        let h = h_normed.multiply(&scale_attn.add(&one)?)?.add(&shift_attn)?;
+
+        let q = linear(&h, self.w(&format!("{}.attn.to_q.weight", prefix)),
+                        Some(self.w(&format!("{}.attn.to_q.bias", prefix))))?;
+        let k = linear(&h, self.w(&format!("{}.attn.to_k.weight", prefix)),
+                        Some(self.w(&format!("{}.attn.to_k.bias", prefix))))?;
+        let v = linear(&h, self.w(&format!("{}.attn.to_v.weight", prefix)),
+                        Some(self.w(&format!("{}.attn.to_v.bias", prefix))))?;
+
+        let q = self.per_head_norm(&q, &format!("{}.attn.q_norm", prefix))?;
+        let k = self.per_head_norm(&k, &format!("{}.attn.k_norm", prefix))?;
+
+        let attn_out = attention(&q, &k, &v, self.config.num_heads, self.config.head_dim)?;
+        let attn_out = linear(&attn_out,
+                              self.w(&format!("{}.attn.proj.weight", prefix)),
+                              Some(self.w(&format!("{}.attn.proj.bias", prefix))))?;
+
+        let x = x.add(&attn_out.multiply(&gate_attn)?)?;
+
+        // 2. Conv block with AdaLN
+        let h_normed = mlx_rs::fast::layer_norm(&x, None::<&Array>, None::<&Array>, 1e-5)?;
+        let h = h_normed.multiply(&scale_conv.add(&one)?)?.add(&shift_conv)?;
+
+        // conv.block: [0]=SiLU, [1]=Conv1d, [2]=SiLU, [3]=LayerNorm, [4]=Dropout, [5]=SiLU, [6]=Conv1d
+        let h = silu(&h)?;
+        let h = conv1d_same(&h,
+            self.w(&format!("{}.conv.block.1.weight", prefix)),
+            Some(self.w(&format!("{}.conv.block.1.bias", prefix))))?;
+        let h = layer_norm(&h,
+            self.w(&format!("{}.conv.block.3.weight", prefix)),
+            self.w(&format!("{}.conv.block.3.bias", prefix)), 1e-5)?;
+        let h = silu(&h)?;
+        let h = conv1d_same(&h,
+            self.w(&format!("{}.conv.block.6.weight", prefix)),
+            Some(self.w(&format!("{}.conv.block.6.bias", prefix))))?;
+
+        let x = x.add(&h.multiply(&gate_conv)?)?;
+
+        // 3. MLP with AdaLN
+        let h_normed = mlx_rs::fast::layer_norm(&x, None::<&Array>, None::<&Array>, 1e-5)?;
+        let h = h_normed.multiply(&scale_mlp.add(&one)?)?.add(&shift_mlp)?;
+
+        let h = linear(&h, self.w(&format!("{}.mlp.fc1.weight", prefix)),
+                        Some(self.w(&format!("{}.mlp.fc1.bias", prefix))))?;
+        let h = gelu(&h)?;
+        let h = linear(&h, self.w(&format!("{}.mlp.fc2.weight", prefix)),
+                        Some(self.w(&format!("{}.mlp.fc2.bias", prefix))))?;
+
+        x.add(&h.multiply(&gate_mlp)?)
+    }
+
+    fn per_head_norm(&self, x: &Array, prefix: &str) -> std::result::Result<Array, Exception> {
+        let shape = x.shape();
+        let (batch, seq_len) = (shape[0], shape[1]);
+        let h = x.reshape(&[batch * seq_len, self.config.num_heads, self.config.head_dim])?;
+        let w = self.w(&format!("{}.weight", prefix));
+        let b = self.w(&format!("{}.bias", prefix));
+        let h = mlx_rs::fast::layer_norm(&h, Some(w), Some(b), 1e-5)?;
+        h.reshape(&[batch, seq_len, self.config.hidden_dim])
+    }
+
+    // =====================================================================
+    // Flow matching generation
+    // =====================================================================
+
+    pub fn generate(&self, codes: &[i32]) -> Result<Array> {
+        let encoder_out = self.encode(codes)?;
+
+        let mu = self.flow_encode(&encoder_out)
+            .map_err(|e| Error::Inference(format!("Flow encode: {}", e)))?;
+
+        let shape = mu.shape();
+        let (batch, mel_len, mel_dim) = (shape[0], shape[1], shape[2]);
+
+        let mut x = mlx_rs::random::normal::<f32>(&[batch, mel_len, mel_dim], None, None, None)
+            .map_err(|e| Error::Inference(format!("Sample prior: {}", e)))?;
+
+        let num_steps = self.config.num_steps;
+        let schedule: Vec<f32> = (0..=num_steps)
+            .map(|i| 1.0 - i as f32 / num_steps as f32)
+            .collect();
+
+        for i in 0..num_steps as usize {
+            let t = schedule[i];
+            let t_next = schedule[i + 1];
+
+            let v = self.dit_forward(&x, &mu, t)
+                .map_err(|e| Error::Inference(format!("DiT step {}: {}", i, e)))?;
+
+            let dt = Array::from_slice(&[t - t_next], &[]);
+            let dx = v.multiply(&dt)
+                .map_err(|e| Error::Inference(format!("Flow step: {}", e)))?;
+            x = x.subtract(&dx)
+                .map_err(|e| Error::Inference(format!("Flow update: {}", e)))?;
+        }
+
+        x.transpose_axes(&[0, 2, 1])
+            .map_err(|e| Error::Inference(format!("Final transpose: {}", e)))
     }
 }
+
+/// Empty Codebook struct kept for backward compatibility
+pub struct Codebook;
 
 #[cfg(test)]
 mod tests {
@@ -538,61 +504,14 @@ mod tests {
     #[test]
     fn test_flow_decoder_config() {
         let config = FlowDecoderConfig::default();
+        assert_eq!(config.vocab_size, 6561);
+        assert_eq!(config.hidden_dim, 512);
         assert_eq!(config.mel_dim, 80);
-        assert_eq!(config.num_steps, 10);
     }
 
     #[test]
     fn test_timestep_embedding() {
-        let embed = TimestepEmbedding::new(64);
-        assert!(embed.is_ok());
-    }
-
-    #[test]
-    fn test_flow_sampler_schedule() {
-        let sampler = FlowSampler::new(10);
-        let schedule = sampler.timestep_schedule();
-
-        assert_eq!(schedule.len(), 11); // 10 steps + 1 endpoint
-        assert!((schedule[0] - 1.0).abs() < 1e-6);
-        assert!((schedule[10] - 0.0).abs() < 1e-6);
-    }
-
-    #[test]
-    fn test_cross_attention_creation() {
-        let attn = CrossAttention::new(256, 512, 8);
-        assert!(attn.is_ok());
-    }
-
-    #[test]
-    fn test_flow_block_creation() {
-        let block = FlowBlock::new(256, 8, 512);
-        assert!(block.is_ok());
-    }
-
-    #[test]
-    fn test_flow_estimator_creation() {
-        let config = FlowDecoderConfig {
-            hidden_dim: 128,
-            num_heads: 4,
-            num_encoder_layers: 2,
-            num_decoder_layers: 2,
-            ..Default::default()
-        };
-        let estimator = FlowEstimator::new(config);
-        assert!(estimator.is_ok());
-    }
-
-    #[test]
-    fn test_flow_decoder_creation() {
-        let config = FlowDecoderConfig {
-            hidden_dim: 128,
-            num_heads: 4,
-            num_encoder_layers: 2,
-            num_decoder_layers: 2,
-            ..Default::default()
-        };
-        let decoder = FlowDecoder::new(config);
-        assert!(decoder.is_ok());
+        let emb = timestep_embedding(0.5, 256);
+        assert_eq!(emb.shape(), &[1, 256]);
     }
 }

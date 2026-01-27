@@ -437,6 +437,42 @@ pub fn sample(logits: &Array, temperature: f32) -> std::result::Result<Array, Ex
     }
 }
 
+/// Apply frequency-based repetition penalty to logits.
+/// For tokens that appear in `generated`, divide positive logits by `penalty`
+/// and multiply negative logits by `penalty`.
+pub fn apply_repetition_penalty(
+    logits: &Array,
+    generated: &[i32],
+    penalty: f32,
+) -> std::result::Result<Array, Exception> {
+    if penalty == 1.0 || generated.is_empty() {
+        return Ok(logits.clone());
+    }
+
+    // Collect unique token IDs that were generated
+    let unique_ids: std::collections::HashSet<i32> = generated.iter().copied().collect();
+
+    // Get logits as flat slice — shape is [1, vocab] or [vocab]
+    let flat = logits.flatten(None, None)?;
+    mlx_rs::transforms::eval([&flat])?;
+    let data: Vec<f32> = flat.as_slice::<f32>().to_vec();
+
+    let mut penalized = data.clone();
+    for &id in &unique_ids {
+        if (id as usize) < penalized.len() {
+            let val = penalized[id as usize];
+            if val > 0.0 {
+                penalized[id as usize] = val / penalty;
+            } else {
+                penalized[id as usize] = val * penalty;
+            }
+        }
+    }
+
+    let result = Array::from_slice(&penalized, logits.shape());
+    Ok(result)
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;

@@ -67,7 +67,7 @@ use crate::{
     audio::{AudioConfig, load_reference_mel, load_audio_for_hubert},
     cache::ConcatKeyValueCache,
     error::Error,
-    inference::preprocess_text,
+    inference::{preprocess_text, preprocess_text_with_lang},
     models::{
         hubert::{HuBertEncoder, load_hubert_model},
         t2s::{T2SConfig, T2SInput, T2SModel, load_t2s_model},
@@ -115,10 +115,10 @@ impl Default for VoiceClonerConfig {
             vits_weights: "/tmp/gpt-sovits-mlx/doubao_mixed_sovits_new.safetensors".to_string(),
             hubert_weights: "/tmp/gpt-sovits-mlx/hubert.safetensors".to_string(),
             sample_rate: 32000,
-            top_k: 3,  // Match Python SynthesisConfig default
-            top_p: 0.95,  // Match Python SynthesisConfig default (nucleus sampling)
-            temperature: 0.8,  // Match Python SynthesisConfig default
-            repetition_penalty: 1.0,  // Match Python SynthesisConfig default
+            top_k: 5,  // Match Python TTS.py default
+            top_p: 1.0,  // Match Python TTS.py default (no nucleus sampling)
+            temperature: 1.0,  // Match Python TTS.py default
+            repetition_penalty: 1.35,  // Match Python TTS.py default
             noise_scale: 0.5,
             speed: 1.0,
         }
@@ -520,13 +520,9 @@ impl VoiceCloner {
         let ref_mel = self.reference_mel.clone()
             .ok_or_else(|| Error::Message("No reference audio set. Call set_reference_audio() first.".to_string()))?;
 
-        // Split text by language like Python's LangSegment
-        // Keeps English phrases together, only splits at language boundaries
-        let segments = split_text_by_language(text);
-
-        // Further chunk long segments to prevent T2S attention degradation
-        // Max ~50 phonemes per chunk (generates ~125 tokens, ~5s audio)
-        let chunks = chunk_segments_by_length(&segments, 50);
+        // Split text using Python-compatible cut5 method:
+        // Split at every punctuation mark, merge short segments (< 5 chars)
+        let chunks = cut5_split(text);
 
         // Debug: print chunks
         eprintln!("📦 Chunks ({}):", chunks.len());
@@ -602,12 +598,8 @@ impl VoiceCloner {
 
     /// Zero-shot synthesis (no reference text, only reference audio for style)
     fn synthesize_zero_shot(&mut self, text: &str, ref_mel: &Array, is_first_chunk: bool) -> Result<AudioOutput, Error> {
-        // Strip only TRAILING punctuation - keep leading punctuation for proper audio alignment
-        // Python's TextPreprocessor actually ADDS initial punctuation for short text
-        let text = text.trim_end_matches(|c: char| {
-            matches!(c, ',' | '.' | '!' | '?' | '，' | '。' | '！' | '？' | '、' | '；' | '：' | ' ' |
-                       '(' | ')' | '（' | '）' | '《' | '》' | '【' | '】' | '"' | '"' | '\'' | '"')
-        });
+        // Python keeps trailing punctuation as part of the phoneme sequence.
+        // Do NOT strip it - it becomes the sentence delimiter phoneme.
 
         // Python's pre_seg_text: prepend punctuation if text doesn't start with one
         // and first segment is short (< 4 chars). This helps T2S model alignment.
@@ -640,7 +632,7 @@ impl VoiceCloner {
         };
 
         // 1. Text preprocessing (word2ph comes from preprocessor for correct handling of mixed text)
-        let (phoneme_ids, phonemes, word2ph, text_normalized) = preprocess_text(&text);
+        let (phoneme_ids, phonemes, word2ph, text_normalized) = preprocess_text_with_lang(&text, Some(crate::text::Language::Chinese));
         eprintln!("   Phonemes: {:?}", &phonemes[..phonemes.len().min(30)]);
         eprintln!("   Normalized: \"{}\"", text_normalized);
 
@@ -648,34 +640,6 @@ impl VoiceCloner {
         let text_chars = text_normalized.chars().count();
         let word2ph_for_bert = &word2ph[..text_chars.min(word2ph.len())];
         let mut bert_features = self.extract_bert_features(&text_normalized, word2ph_for_bert, phonemes.len())?;
-
-        // Zero out BERT features for punctuation phonemes (SP, comma, period, etc.)
-        // This prevents punctuation BERT context from confusing the T2S model
-        let punct_phonemes = [",", ".", "!", "?", "-", "…", "SP", "SP2", "SP3"];
-        for (i, ph) in phonemes.iter().enumerate() {
-            if punct_phonemes.contains(&ph.as_str()) {
-                let zeros = Array::zeros::<f32>(&[1, 1, 1024])
-                    .map_err(|e| Error::Message(e.to_string()))?;
-                let i32_i = i as i32;
-                let before = if i > 0 {
-                    Some(bert_features.index((.., ..i32_i, ..)))
-                } else {
-                    None
-                };
-                let after = if i < phonemes.len() - 1 {
-                    Some(bert_features.index((.., (i32_i + 1).., ..)))
-                } else {
-                    None
-                };
-                let parts: Vec<&Array> = [before.as_ref(), Some(&zeros), after.as_ref()]
-                    .into_iter()
-                    .flatten()
-                    .collect();
-                bert_features = mlx_rs::ops::concatenate_axis(&parts, 1)
-                    .map_err(|e| Error::Message(format!("Failed to zero BERT at punct: {}", e)))?;
-                eval([&bert_features]).map_err(|e| Error::Message(e.to_string()))?;
-            }
-        }
 
         // DEBUG: Print BERT features info
         eval([&bert_features]).map_err(|e| Error::Message(e.to_string()))?;
@@ -722,11 +686,8 @@ impl VoiceCloner {
         let prompt_semantic = self.prompt_semantic.clone()
             .ok_or_else(|| Error::Message("Prompt semantic not set".to_string()))?;
 
-        // Strip only TRAILING punctuation - keep leading punctuation for proper audio alignment
-        let text = text.trim_end_matches(|c: char| {
-            matches!(c, ',' | '.' | '!' | '?' | '，' | '。' | '！' | '？' | '、' | '；' | '：' | ' ' |
-                       '(' | ')' | '（' | '）' | '《' | '》' | '【' | '】' | '"' | '"' | '\'' | '"')
-        });
+        // Python keeps trailing punctuation as part of the phoneme sequence.
+        // Do NOT strip it - it becomes the sentence delimiter phoneme.
 
         // Python's pre_seg_text: prepend punctuation if text doesn't start with one
         // and first segment is short (< 4 chars). This helps T2S model alignment.
@@ -764,7 +725,7 @@ impl VoiceCloner {
 
         // 1. Preprocess reference text
         // Note: preprocess_text produces the same phoneme sequence as Python (no special markers)
-        let (ref_phoneme_ids, ref_phonemes, ref_word2ph, ref_text_normalized) = preprocess_text(&ref_text);
+        let (ref_phoneme_ids, ref_phonemes, ref_word2ph, ref_text_normalized) = preprocess_text_with_lang(&ref_text, Some(crate::text::Language::Chinese));
 
         // Trim whitespace from normalized text for BERT alignment
         let ref_text_trimmed = ref_text_normalized.trim();
@@ -773,7 +734,7 @@ impl VoiceCloner {
         let ref_bert_features = self.extract_bert_features(ref_text_trimmed, ref_word2ph_for_bert, ref_phonemes.len())?;
 
         // 2. Preprocess target text - use normalized text for BERT
-        let (target_phoneme_ids, target_phonemes, target_word2ph, target_text_normalized) = preprocess_text(&text);
+        let (target_phoneme_ids, target_phonemes, target_word2ph, target_text_normalized) = preprocess_text_with_lang(&text, Some(crate::text::Language::Chinese));
         eprintln!("   [few-shot] Target phonemes ({}):", target_phonemes.len());
         eprintln!("      {:?}", &target_phonemes[..target_phonemes.len().min(20)]);
         eprintln!("   [few-shot] Target normalized: '{}'", target_text_normalized);
@@ -783,39 +744,6 @@ impl VoiceCloner {
         let target_text_chars = target_text_trimmed.chars().count();
         let target_word2ph_for_bert = &target_word2ph[..target_text_chars.min(target_word2ph.len())];
         let mut target_bert_features = self.extract_bert_features(target_text_trimmed, target_word2ph_for_bert, target_phonemes.len())?;
-
-        // Zero out BERT features for punctuation phonemes (comma, period, etc.)
-        // This prevents punctuation BERT features from acting as "boundary markers"
-        // that cause the T2S model to skip beginning phonemes
-        // IMPORTANT: Chinese punctuation generates "SP" phonemes, not "," or "."
-        let punct_phonemes = [",", ".", "!", "?", "-", "…", "SP", "SP2", "SP3"];
-        for (i, ph) in target_phonemes.iter().enumerate() {
-            if punct_phonemes.contains(&ph.as_str()) {
-                // Zero out the BERT feature at this position
-                let zeros = Array::zeros::<f32>(&[1, 1, 1024])
-                    .map_err(|e| Error::Message(e.to_string()))?;
-                // Replace the slice at position i
-                let i32_i = i as i32;
-                let before = if i > 0 {
-                    Some(target_bert_features.index((.., ..i32_i, ..)))
-                } else {
-                    None
-                };
-                let after = if i < target_phonemes.len() - 1 {
-                    Some(target_bert_features.index((.., (i32_i + 1).., ..)))
-                } else {
-                    None
-                };
-                // Rebuild features with zeros at position i
-                let parts: Vec<&Array> = [before.as_ref(), Some(&zeros), after.as_ref()]
-                    .into_iter()
-                    .flatten()
-                    .collect();
-                target_bert_features = mlx_rs::ops::concatenate_axis(&parts, 1)
-                    .map_err(|e| Error::Message(format!("Failed to zero BERT at punct: {}", e)))?;
-                eval([&target_bert_features]).map_err(|e| Error::Message(e.to_string()))?;
-            }
-        }
 
         // 3. Combine: ref_phones + target_phones + period
         let period_token = Array::from_slice(&[3i32], &[1, 1]);
@@ -877,23 +805,114 @@ impl VoiceCloner {
     }
 
     /// Extract BERT features with proper alignment
+    /// Extract BERT features for text.
     ///
-    /// For mixed Chinese/English text:
-    /// - Uses zero features (Chinese BERT can't process English)
-    /// - For pure Chinese text, extracts actual BERT features
+    /// For mixed Chinese/English text (matching Python's all_zh path):
+    /// - Segments text by language
+    /// - Chinese sub-segments get real BERT features
+    /// - English sub-segments get zero features
+    /// - All concatenated in order
     fn extract_bert_features(&mut self, text: &str, word2ph: &[i32], phoneme_count: usize) -> Result<Array, Error> {
         use crate::text::{is_chinese_char, detect_language, Language};
 
         let language = detect_language(text);
         eprintln!("   [BERT] text='{}', detected={:?}", text, language);
 
-        // For mixed or English text, use zeros since Chinese BERT can't process English
-        if matches!(language, Language::Mixed | Language::English) {
+        // Pure English: all zeros
+        if matches!(language, Language::English) {
             eprintln!("   [BERT] Using zeros (non-Chinese)");
             let bert_features = Array::zeros::<f32>(&[1, phoneme_count as i32, 1024])
                 .map_err(|e| Error::Message(e.to_string()))?;
             eval([&bert_features]).map_err(|e| Error::Message(e.to_string()))?;
             return Ok(bert_features);
+        }
+
+        // Mixed text: segment by language, BERT for Chinese only, zeros for English
+        // This matches Python's all_zh path which uses LangSegment to split,
+        // then get_bert_inf returns real features for zh and zeros for en.
+        if matches!(language, Language::Mixed) {
+            eprintln!("   [BERT] Mixed text - segmenting by language");
+            use crate::text::preprocessor::segment_by_language;
+
+            let segments = segment_by_language(text);
+            let mut all_parts: Vec<Array> = Vec::new();
+            let mut w2p_idx = 0; // Track position in word2ph (NOT char position)
+
+            for seg in &segments {
+                // Compute how many word2ph entries this segment uses:
+                // - Chinese: one entry per character
+                // - English: one entry per word/number/punctuation token
+                let seg_w2p_count = if seg.is_english {
+                    count_english_word2ph_entries(&seg.text)
+                } else {
+                    seg.text.chars().count()
+                };
+
+                let end_idx = (w2p_idx + seg_w2p_count).min(word2ph.len());
+                let seg_word2ph = &word2ph[w2p_idx..end_idx];
+                let seg_phoneme_count: i32 = seg_word2ph.iter().sum();
+
+                if seg_phoneme_count <= 0 {
+                    w2p_idx = end_idx;
+                    continue;
+                }
+
+                if seg.is_english {
+                    // English: zero features
+                    let zeros = Array::zeros::<f32>(&[1, seg_phoneme_count, 1024])
+                        .map_err(|e| Error::Message(e.to_string()))?;
+                    all_parts.push(zeros);
+                    eprintln!("   [BERT] English segment '{}': {} phonemes (zeros)",
+                             &seg.text.chars().take(20).collect::<String>(), seg_phoneme_count);
+                } else {
+                    // Chinese: real BERT
+                    let bert_raw = self.bert.extract_features(&seg.text, seg_word2ph)?;
+                    eval([&bert_raw]).map_err(|e| Error::Message(e.to_string()))?;
+                    let bert_len = bert_raw.shape()[1] as i32;
+                    let bert = if bert_len < seg_phoneme_count {
+                        let pad = Array::zeros::<f32>(&[1, seg_phoneme_count - bert_len, 1024])
+                            .map_err(|e| Error::Message(e.to_string()))?;
+                        mlx_rs::ops::concatenate_axis(&[&bert_raw, &pad], 1)
+                            .map_err(|e| Error::Message(e.to_string()))?
+                    } else if bert_len > seg_phoneme_count {
+                        bert_raw.index((.., ..seg_phoneme_count, ..))
+                    } else {
+                        bert_raw
+                    };
+                    all_parts.push(bert);
+                    eprintln!("   [BERT] Chinese segment '{}': {} phonemes (real BERT)",
+                             &seg.text.chars().take(20).collect::<String>(), seg_phoneme_count);
+                }
+                w2p_idx = end_idx;
+            }
+
+            // Handle any remaining phonemes (e.g., trailing punctuation)
+            let total_bert: i32 = all_parts.iter().map(|a| a.shape()[1] as i32).sum();
+            let phoneme_count_i32 = phoneme_count as i32;
+            if total_bert < phoneme_count_i32 {
+                let pad = Array::zeros::<f32>(&[1, phoneme_count_i32 - total_bert, 1024])
+                    .map_err(|e| Error::Message(e.to_string()))?;
+                all_parts.push(pad);
+            }
+
+            if all_parts.is_empty() {
+                let zeros = Array::zeros::<f32>(&[1, phoneme_count_i32, 1024])
+                    .map_err(|e| Error::Message(e.to_string()))?;
+                eval([&zeros]).map_err(|e| Error::Message(e.to_string()))?;
+                return Ok(zeros);
+            }
+
+            let parts_refs: Vec<&Array> = all_parts.iter().collect();
+            let combined = mlx_rs::ops::concatenate_axis(&parts_refs, 1)
+                .map_err(|e| Error::Message(format!("Failed to concat mixed BERT: {}", e)))?;
+            // Trim or pad to exact phoneme count
+            let combined = if combined.shape()[1] as i32 > phoneme_count_i32 {
+                combined.index((.., ..phoneme_count_i32, ..))
+            } else {
+                combined
+            };
+            eval([&combined]).map_err(|e| Error::Message(e.to_string()))?;
+            return Ok(combined);
         }
 
         // Pure Chinese: extract actual BERT features
@@ -1442,6 +1461,89 @@ fn is_cjk_char(c: char) -> bool {
         '\u{AC00}'..='\u{D7AF}' |  // Korean Hangul
         '\u{1100}'..='\u{11FF}'    // Korean Jamo
     )
+}
+
+/// Python-compatible `cut5` text segmentation: split at every punctuation mark,
+/// then merge short segments (< threshold chars) with the next segment.
+/// This matches the dora-primespeech `cut5` method + `merge_short_text_in_array(5)`.
+/// Count word2ph entries for an English text segment in mixed G2P mode.
+/// Must match `english_letter_spell`: one entry per letter + one per punctuation.
+fn count_english_word2ph_entries(text: &str) -> usize {
+    text.chars().filter(|c| c.is_ascii_alphabetic() || matches!(c, ',' | '.' | '!' | '?')).count()
+}
+
+fn cut5_split(text: &str) -> Vec<String> {
+    let text = text.trim_matches('\n');
+    if text.is_empty() {
+        return vec![];
+    }
+
+    let puncts: &[char] = &[',', '.', ';', '?', '!', '、', '，', '。', '？', '！', '；', '：', '…'];
+    let chars: Vec<char> = text.chars().collect();
+    let mut merge_items: Vec<String> = Vec::new();
+    let mut current = String::new();
+
+    for (i, &ch) in chars.iter().enumerate() {
+        if puncts.contains(&ch) {
+            // Special case: decimal point (digit.digit) — don't split
+            if ch == '.' && i > 0 && i < chars.len() - 1
+                && chars[i - 1].is_ascii_digit() && chars[i + 1].is_ascii_digit()
+            {
+                current.push(ch);
+            } else {
+                current.push(ch);
+                merge_items.push(current.clone());
+                current.clear();
+            }
+        } else {
+            current.push(ch);
+        }
+    }
+    if !current.is_empty() {
+        merge_items.push(current);
+    }
+
+    // Filter out pure-punctuation segments
+    let filtered: Vec<String> = merge_items
+        .into_iter()
+        .filter(|item| !item.chars().all(|c| puncts.contains(&c) || c.is_whitespace()))
+        .collect();
+
+    // merge_short_text_in_array(texts, 5)
+    let threshold = 5;
+    if filtered.len() < 2 {
+        return filtered;
+    }
+    let mut result: Vec<String> = Vec::new();
+    let mut acc = String::new();
+    for ele in &filtered {
+        acc.push_str(ele);
+        if acc.len() >= threshold {
+            result.push(acc.clone());
+            acc.clear();
+        }
+    }
+    if !acc.is_empty() {
+        if result.is_empty() {
+            result.push(acc);
+        } else {
+            let last = result.last_mut().unwrap();
+            last.push_str(&acc);
+        }
+    }
+
+    // Python also: filter empty/whitespace, append "。" if not ending with punct, split >510
+    let splits_set: &[char] = &['，', '。', '？', '！', ',', '.', '?', '!', '~', ':', '：', '—', '…', '、', '；'];
+    result.into_iter()
+        .filter(|t| !t.trim().is_empty())
+        .filter(|t| t.chars().any(|c| c.is_alphanumeric() || is_cjk_char(c)))
+        .map(|mut t| {
+            if !t.ends_with(splits_set) {
+                t.push('。');
+            }
+            t
+        })
+        .collect()
 }
 
 /// Language-aware text segmentation (like Python's LangSegment)

@@ -1,42 +1,29 @@
-//! HiFi-GAN Vocoder for Step-Audio 2
+//! HiFT (HiFi-GAN with source modeling) Vocoder for Step-Audio 2
 //!
-//! Converts mel spectrograms to waveforms using a GAN-based approach.
-//! Architecture follows the CosyVoice2 HiFi-GAN implementation:
-//!
-//! - Upsampling rates: [8, 8, 2, 2] = 256x total
-//! - Upsampling kernels: [16, 16, 4, 4]
-//! - ResBlock kernels: [3, 7, 11]
-//! - Input: 80-dim mel spectrogram
-//! - Output: 24kHz waveform
+//! Weight-based implementation. Architecture:
+//! - conv_pre: 80 → 512 (kernel=7)
+//! - 3 upsample stages: 512→256 (8x), 256→128 (4x), 128→64 (8x) = 256x total
+//! - 9 resblocks: 3 per level, 3 layers each, with Snake activation
+//! - conv_post: 64 → 18 (kernel=7), then sum to mono
 
-use mlx_rs::{
-    builder::Builder,
-    error::Exception,
-    macros::ModuleParameters,
-    module::{Module, Param},
-    nn,
-    Array,
-};
+use std::collections::HashMap;
+use std::path::Path;
 
-use crate::error::Result;
+use mlx_rs::{Array, error::Exception, ops};
+
+use crate::error::{Error, Result};
 
 /// HiFi-GAN configuration
 #[derive(Debug, Clone)]
 pub struct HiFiGANConfig {
-    /// Number of mel channels (input)
     pub num_mels: i32,
-    /// Initial channel size after conv_pre
     pub initial_channel: i32,
-    /// Upsampling rates (multiply together for total upsample factor)
     pub upsample_rates: Vec<i32>,
-    /// Kernel sizes for upsampling convolutions
-    pub upsample_kernel_sizes: Vec<i32>,
-    /// ResBlock kernel sizes
     pub resblock_kernel_sizes: Vec<i32>,
-    /// ResBlock dilation sizes for each kernel
-    pub resblock_dilation_sizes: Vec<Vec<i32>>,
-    /// Leaky ReLU negative slope
-    pub leaky_relu_slope: f32,
+    pub num_resblocks_per_level: i32,
+    pub num_layers_per_resblock: i32,
+    pub num_output_channels: i32,
+    pub sample_rate: i32,
 }
 
 impl Default for HiFiGANConfig {
@@ -44,387 +31,202 @@ impl Default for HiFiGANConfig {
         Self {
             num_mels: 80,
             initial_channel: 512,
-            upsample_rates: vec![8, 8, 2, 2],
-            upsample_kernel_sizes: vec![16, 16, 4, 4],
-            resblock_kernel_sizes: vec![3, 7, 11],
-            resblock_dilation_sizes: vec![
-                vec![1, 3, 5],
-                vec![1, 3, 5],
-                vec![1, 3, 5],
-            ],
-            leaky_relu_slope: 0.1,
+            upsample_rates: vec![8, 4, 8], // Total: 256x
+            resblock_kernel_sizes: vec![3, 3, 3, 3, 3, 3, 3, 3, 3], // All use kernel 3
+            num_resblocks_per_level: 3,
+            num_layers_per_resblock: 3,
+            num_output_channels: 18,
+            sample_rate: 24000,
         }
     }
 }
 
-impl HiFiGANConfig {
-    /// Get total upsampling factor
-    pub fn total_upsample_factor(&self) -> i32 {
-        self.upsample_rates.iter().product()
+// =========================================================================
+// Helper functions
+// =========================================================================
+
+/// Conv1d with same-padding, transposing PyTorch weights [out, in, K] -> MLX [out, K, in]
+fn conv1d_same(x: &Array, w: &Array, b: Option<&Array>) -> std::result::Result<Array, Exception> {
+    let w = w.transpose_axes(&[0, 2, 1])?;
+    let kernel_size = w.shape()[1];
+    let padding = kernel_size / 2;
+    let out = ops::conv1d_device(x, &w, None, Some(padding), None, None, mlx_rs::StreamOrDevice::default())?;
+    match b {
+        Some(bias) => out.add(bias),
+        None => Ok(out),
     }
 }
 
-/// Residual block with dilated convolutions
-///
-/// Each ResBlock has multiple dilated convolutions with residual connections.
-#[derive(Debug, Clone, ModuleParameters)]
-pub struct ResBlock {
-    /// Dilated convolutions for this block
-    #[param]
-    pub convs1: Vec<nn::Conv1d>,
-    /// Second set of dilated convolutions
-    #[param]
-    pub convs2: Vec<nn::Conv1d>,
-    /// Leaky ReLU slope
-    pub leaky_slope: f32,
+/// Transposed conv1d: PyTorch ConvTranspose1d weight [in, out, K] -> MLX [out, K, in]
+fn conv_transpose1d(x: &Array, w: &Array, b: Option<&Array>, stride: i32) -> std::result::Result<Array, Exception> {
+    // MLX conv_transpose1d expects weight [C_out, K, C_in]
+    // PyTorch ConvTranspose1d stores [C_in, C_out, K]
+    let w = w.transpose_axes(&[1, 2, 0])?;
+    let kernel_size = w.shape()[1] as i32;
+    let padding = (kernel_size - stride) / 2;
+    let out = ops::conv_transpose1d_device(x, &w, Some(stride), Some(padding), None, None, None, mlx_rs::StreamOrDevice::default())?;
+    match b {
+        Some(bias) => out.add(bias),
+        None => Ok(out),
+    }
 }
 
-impl ResBlock {
-    /// Create a new ResBlock
-    pub fn new(
-        channels: i32,
-        kernel_size: i32,
-        dilations: &[i32],
-        leaky_slope: f32,
-    ) -> Result<Self> {
-        let padding = kernel_size / 2;
+/// Snake activation: x + (1/alpha) * sin^2(alpha * x)
+fn snake(x: &Array, alpha: &Array) -> std::result::Result<Array, Exception> {
+    let ax = x.multiply(alpha)?;
+    let sin_ax = ops::sin(&ax)?;
+    let sin2 = sin_ax.square()?;
+    let inv_alpha = ops::divide(&Array::from_slice(&[1.0f32], &[]), alpha)?;
+    let term = sin2.multiply(&inv_alpha)?;
+    x.add(&term)
+}
 
-        let mut convs1 = Vec::new();
-        let mut convs2 = Vec::new();
+// =========================================================================
+// HiFi-GAN
+// =========================================================================
 
-        for &dilation in dilations {
-            // First conv: dilated
-            let dilation_padding = (kernel_size - 1) * dilation / 2;
-            convs1.push(
-                nn::Conv1dBuilder::new(channels, channels, kernel_size)
-                    .padding(dilation_padding)
-                    .dilation(dilation)
-                    .build()?,
-            );
+pub struct HiFiGAN {
+    pub weights: HashMap<String, Array>,
+    pub config: HiFiGANConfig,
+    pub weights_loaded: bool,
+}
 
-            // Second conv: no dilation
-            convs2.push(
-                nn::Conv1dBuilder::new(channels, channels, kernel_size)
-                    .padding(padding)
-                    .build()?,
-            );
-        }
-
+impl HiFiGAN {
+    pub fn new(config: HiFiGANConfig) -> Result<Self> {
         Ok(Self {
-            convs1,
-            convs2,
-            leaky_slope,
+            weights: HashMap::new(),
+            config,
+            weights_loaded: false,
         })
     }
-}
 
-impl Module<&Array> for ResBlock {
-    type Output = Array;
-    type Error = Exception;
+    pub fn load(model_dir: impl AsRef<Path>) -> Result<Self> {
+        let model_dir = model_dir.as_ref();
+        let weights_path = model_dir.join("tts_mlx").join("hifigan.safetensors");
 
-    fn training_mode(&mut self, _mode: bool) {}
+        if !weights_path.exists() {
+            return Err(Error::ModelLoad(format!(
+                "HiFiGAN weights not found at {:?}", weights_path
+            )));
+        }
 
-    fn forward(&mut self, x: &Array) -> std::result::Result<Array, Self::Error> {
+        let config = HiFiGANConfig::default();
+        let weights = Array::load_safetensors(&weights_path)?;
+        println!("  Loaded {} hifigan weights", weights.len());
+
+        Ok(Self { weights, config, weights_loaded: true })
+    }
+
+    fn w(&self, key: &str) -> &Array {
+        self.weights.get(key).unwrap_or_else(|| panic!("Missing HiFiGAN weight: {}", key))
+    }
+
+    fn w_opt(&self, key: &str) -> Option<&Array> {
+        self.weights.get(key)
+    }
+
+    /// Resblock: 3 layers of (snake→conv1→snake→conv2→residual)
+    fn resblock(&self, x: &Array, prefix: &str) -> std::result::Result<Array, Exception> {
         let mut out = x.clone();
+        let num_layers = self.config.num_layers_per_resblock as usize;
 
-        for (conv1, conv2) in self.convs1.iter_mut().zip(self.convs2.iter_mut()) {
+        for i in 0..num_layers {
             let residual = out.clone();
 
-            // LeakyReLU -> Conv1 -> LeakyReLU -> Conv2 -> Residual
-            let h = nn::leaky_relu(&out, self.leaky_slope)?;
-            let h = conv1.forward(&h)?;
-            let h = nn::leaky_relu(&h, self.leaky_slope)?;
-            let h = conv2.forward(&h)?;
+            // Snake activation 1
+            let alpha1 = self.w(&format!("{}.activations1.{}.alpha", prefix, i));
+            out = snake(&out, alpha1)?;
 
-            out = residual.add(&h)?;
+            // Conv1
+            out = conv1d_same(
+                &out,
+                self.w(&format!("{}.convs1.{}.weight", prefix, i)),
+                Some(self.w(&format!("{}.convs1.{}.bias", prefix, i))),
+            )?;
+
+            // Snake activation 2
+            let alpha2 = self.w(&format!("{}.activations2.{}.alpha", prefix, i));
+            out = snake(&out, alpha2)?;
+
+            // Conv2
+            out = conv1d_same(
+                &out,
+                self.w(&format!("{}.convs2.{}.weight", prefix, i)),
+                Some(self.w(&format!("{}.convs2.{}.bias", prefix, i))),
+            )?;
+
+            out = residual.add(&out)?;
         }
 
         Ok(out)
     }
-}
 
-/// Multi-Receptive Field Fusion (MRF) module
-///
-/// Combines outputs from multiple ResBlocks with different kernel sizes.
-#[derive(Debug, Clone, ModuleParameters)]
-pub struct MRF {
-    /// ResBlocks with different kernel sizes
-    #[param]
-    pub resblocks: Vec<ResBlock>,
-}
+    /// Synthesize audio from mel spectrogram
+    pub fn synthesize(&self, mel: &Array) -> Result<Array> {
+        // mel: [B, mel_dim, T] from flow decoder
+        // Transpose to [B, T, mel_dim] for MLX conv1d
+        let mel = mel.transpose_axes(&[0, 2, 1])
+            .map_err(|e| Error::Inference(format!("Transpose mel: {}", e)))?;
 
-impl MRF {
-    /// Create a new MRF module
-    pub fn new(
-        channels: i32,
-        kernel_sizes: &[i32],
-        dilation_sizes: &[Vec<i32>],
-        leaky_slope: f32,
-    ) -> Result<Self> {
-        let mut resblocks = Vec::new();
+        // conv_pre: [B, T, 80] -> [B, T, 512]
+        let mut x = conv1d_same(
+            &mel,
+            self.w("hifigan.conv_pre.weight"),
+            Some(self.w("hifigan.conv_pre.bias")),
+        ).map_err(|e| Error::Inference(format!("conv_pre: {}", e)))?;
+        // 3 upsample stages
+        let resblocks_per_level = self.config.num_resblocks_per_level as usize;
 
-        for (ks, dilations) in kernel_sizes.iter().zip(dilation_sizes.iter()) {
-            resblocks.push(ResBlock::new(channels, *ks, dilations, leaky_slope)?);
+        for (level, &up_rate) in self.config.upsample_rates.iter().enumerate() {
+            // LeakyReLU before upsample
+            x = mlx_rs::nn::leaky_relu(&x, 0.1)
+                .map_err(|e| Error::Inference(format!("leaky_relu: {}", e)))?;
+
+            // Transposed convolution (upsample)
+            x = conv_transpose1d(
+                &x,
+                self.w(&format!("hifigan.ups.{}.weight", level)),
+                Some(self.w(&format!("hifigan.ups.{}.bias", level))),
+                up_rate,
+            ).map_err(|e| Error::Inference(format!("ups.{}: {}", level, e)))?;
+            // Multi-Receptive Field Fusion: sum resblock outputs and average
+            let resblock_start = level * resblocks_per_level;
+            let mut xs: Option<Array> = None;
+            for j in 0..resblocks_per_level {
+                let rb_idx = resblock_start + j;
+                let rb_out = self.resblock(&x, &format!("hifigan.resblocks.{}", rb_idx))
+                    .map_err(|e| Error::Inference(format!("resblock.{}: {}", rb_idx, e)))?;
+                xs = Some(match xs {
+                    Some(acc) => acc.add(&rb_out)?,
+                    None => rb_out,
+                });
+            }
+            let num_rb = Array::from_slice(&[resblocks_per_level as f32], &[]);
+            x = xs.unwrap().divide(&num_rb)
+                .map_err(|e| Error::Inference(format!("resblock avg {}: {}", level, e)))?;
         }
 
-        Ok(Self { resblocks })
-    }
-}
+        // conv_post: [B, T, 64] -> [B, T, 18]
+        x = mlx_rs::nn::leaky_relu(&x, 0.1)
+            .map_err(|e| Error::Inference(format!("final leaky_relu: {}", e)))?;
+        x = conv1d_same(
+            &x,
+            self.w("hifigan.conv_post.weight"),
+            Some(self.w("hifigan.conv_post.bias")),
+        ).map_err(|e| Error::Inference(format!("conv_post: {}", e)))?;
 
-impl Module<&Array> for MRF {
-    type Output = Array;
-    type Error = Exception;
+        // Tanh
+        x = ops::tanh(&x)
+            .map_err(|e| Error::Inference(format!("tanh: {}", e)))?;
 
-    fn training_mode(&mut self, _mode: bool) {}
+        // Sum across output channels: [B, T, 18] -> [B, T]
+        let x = x.sum_axis(2, false)
+            .map_err(|e| Error::Inference(format!("sum channels: {}", e)))?;
 
-    fn forward(&mut self, x: &Array) -> std::result::Result<Array, Self::Error> {
-        // Sum outputs from all resblocks
-        let mut out: Option<Array> = None;
-
-        for resblock in &mut self.resblocks {
-            let h = resblock.forward(x)?;
-            out = Some(match out {
-                None => h,
-                Some(acc) => acc.add(&h)?,
-            });
-        }
-
-        // Average
-        let out = out.unwrap();
-        let n = self.resblocks.len() as f32;
-        out.divide(&Array::from_slice(&[n], &[]))
-    }
-}
-
-/// Transposed convolution for upsampling
-///
-/// MLX doesn't have ConvTranspose1d, so we implement it using
-/// Conv1d with appropriate reshaping or unfold operations.
-#[derive(Debug, Clone, ModuleParameters)]
-pub struct ConvTranspose1d {
-    /// Weight tensor [out_channels, in_channels, kernel_size]
-    #[param]
-    pub weight: Param<Array>,
-    /// Bias tensor [out_channels]
-    #[param]
-    pub bias: Param<Array>,
-    /// Stride (upsampling factor)
-    pub stride: i32,
-    /// Padding
-    pub padding: i32,
-    /// Output padding
-    pub output_padding: i32,
-    /// Output channels
-    pub out_channels: i32,
-}
-
-impl ConvTranspose1d {
-    /// Create a new transposed convolution
-    pub fn new(
-        in_channels: i32,
-        out_channels: i32,
-        kernel_size: i32,
-        stride: i32,
-    ) -> Result<Self> {
-        // Initialize weights with small random values
-        // Weight shape: [out_channels, in_channels, kernel_size]
-        let scale = (2.0 / (in_channels * kernel_size) as f32).sqrt();
-        let weight_data: Vec<f32> = (0..(out_channels * in_channels * kernel_size))
-            .map(|i| (i as f32 * 0.1234).sin() * scale)
-            .collect();
-
-        let weight = Array::from_slice(
-            &weight_data,
-            &[out_channels, in_channels, kernel_size],
-        );
-
-        // Bias initialized to zeros
-        let bias_data = vec![0.0f32; out_channels as usize];
-        let bias = Array::from_slice(&bias_data, &[out_channels]);
-
-        Ok(Self {
-            weight: Param::new(weight),
-            bias: Param::new(bias),
-            stride,
-            padding: (kernel_size - stride) / 2,
-            output_padding: 0,
-            out_channels,
-        })
-    }
-
-    /// Create with explicit padding
-    pub fn with_padding(
-        in_channels: i32,
-        out_channels: i32,
-        kernel_size: i32,
-        stride: i32,
-        padding: i32,
-    ) -> Result<Self> {
-        let mut layer = Self::new(in_channels, out_channels, kernel_size, stride)?;
-        layer.padding = padding;
-        Ok(layer)
-    }
-}
-
-impl Module<&Array> for ConvTranspose1d {
-    type Output = Array;
-    type Error = Exception;
-
-    fn training_mode(&mut self, _mode: bool) {}
-
-    fn forward(&mut self, x: &Array) -> std::result::Result<Array, Self::Error> {
-        // x: [B, C_in, T]
-        // Simplified upsampling: use repeat + conv to approximate transposed conv
-        // This is a common approximation that works well for upsampling
-
-        let shape = x.shape();
-        let batch = shape[0];
-        let in_channels = shape[1];
-        let in_length = shape[2];
-
-        // Upsample by repeating each element `stride` times
-        // [B, C, T] -> [B, C, T*stride]
-        let upsampled_len = in_length * self.stride;
-
-        // Use reshape + tile to upsample
-        // [B, C, T] -> [B, C, T, 1] -> [B, C, T, stride] -> [B, C, T*stride]
-        let x_expanded = x.reshape(&[batch, in_channels, in_length, 1])?;
-
-        // Create upsample pattern using tile
-        let ones = Array::ones::<f32>(&[1, 1, 1, self.stride])?;
-        let x_tiled = x_expanded.multiply(&ones)?;
-        let x_upsampled = x_tiled.reshape(&[batch, in_channels, upsampled_len])?;
-
-        // Apply convolution with weight
-        let weight = self.weight.as_ref();
-        let kernel_size = weight.shape()[2];
-
-        // Calculate padding to maintain output size
-        let out_padding = (kernel_size - 1) / 2;
-
-        let out = mlx_rs::ops::conv1d(
-            &x_upsampled,
-            weight,
-            1, // stride 1
-            out_padding,
-            1, // dilation
-            1, // groups
-        )?;
-
-        // Add bias: [out_channels] -> [1, out_channels, 1]
-        let bias_expanded = self.bias.as_ref().reshape(&[1, self.out_channels, 1])?;
-        out.add(&bias_expanded)
-    }
-}
-
-/// HiFi-GAN Generator
-///
-/// Converts mel spectrograms to audio waveforms.
-#[derive(Debug, Clone, ModuleParameters)]
-pub struct HiFiGAN {
-    /// Pre-processing convolution
-    #[param]
-    pub conv_pre: nn::Conv1d,
-    /// Upsampling layers
-    #[param]
-    pub ups: Vec<ConvTranspose1d>,
-    /// Multi-Receptive Field Fusion modules
-    #[param]
-    pub mrfs: Vec<MRF>,
-    /// Post-processing convolution
-    #[param]
-    pub conv_post: nn::Conv1d,
-    /// Configuration
-    pub config: HiFiGANConfig,
-}
-
-impl HiFiGAN {
-    /// Create a new HiFi-GAN vocoder
-    pub fn new(config: HiFiGANConfig) -> Result<Self> {
-        let num_ups = config.upsample_rates.len();
-        let leaky_slope = config.leaky_relu_slope;
-
-        // Pre-conv: mel_channels -> initial_channel
-        let conv_pre = nn::Conv1dBuilder::new(config.num_mels, config.initial_channel, 7)
-            .padding(3)
-            .build()?;
-
-        // Upsampling layers and MRF modules
-        let mut ups = Vec::new();
-        let mut mrfs = Vec::new();
-
-        let mut channels = config.initial_channel;
-        for i in 0..num_ups {
-            let upsample_rate = config.upsample_rates[i];
-            let kernel_size = config.upsample_kernel_sizes[i];
-            let out_channels = channels / 2;
-
-            ups.push(ConvTranspose1d::with_padding(
-                channels,
-                out_channels,
-                kernel_size,
-                upsample_rate,
-                (kernel_size - upsample_rate) / 2,
-            )?);
-
-            mrfs.push(MRF::new(
-                out_channels,
-                &config.resblock_kernel_sizes,
-                &config.resblock_dilation_sizes,
-                leaky_slope,
-            )?);
-
-            channels = out_channels;
-        }
-
-        // Post-conv: channels -> 1 (mono audio)
-        let conv_post = nn::Conv1dBuilder::new(channels, 1, 7)
-            .padding(3)
-            .build()?;
-
-        Ok(Self {
-            conv_pre,
-            ups,
-            mrfs,
-            conv_post,
-            config,
-        })
-    }
-
-    /// Load HiFi-GAN from model directory
-    pub fn load(model_dir: impl AsRef<std::path::Path>) -> Result<Self> {
-        // TODO: Implement weight loading from safetensors
-        // For now, create with default config
-        Self::new(HiFiGANConfig::default())
-    }
-}
-
-impl Module<&Array> for HiFiGAN {
-    type Output = Array;
-    type Error = Exception;
-
-    fn training_mode(&mut self, _mode: bool) {}
-
-    fn forward(&mut self, mel: &Array) -> std::result::Result<Array, Self::Error> {
-        // mel: [B, num_mels, T]
-        let leaky_slope = self.config.leaky_relu_slope;
-
-        // Pre-conv
-        let mut x = self.conv_pre.forward(mel)?;
-
-        // Upsampling blocks
-        for (up, mrf) in self.ups.iter_mut().zip(self.mrfs.iter_mut()) {
-            x = nn::leaky_relu(&x, leaky_slope)?;
-            x = up.forward(&x)?;
-            x = mrf.forward(&x)?;
-        }
-
-        // Post-conv
-        x = nn::leaky_relu(&x, leaky_slope)?;
-        x = self.conv_post.forward(&x)?;
-
-        // Tanh activation for waveform [-1, 1]
-        mlx_rs::ops::tanh(&x)
+        // Normalize
+        let norm = Array::from_slice(&[self.config.num_output_channels as f32], &[]);
+        x.divide(&norm)
+            .map_err(|e| Error::Inference(format!("normalize: {}", e)))
     }
 }
 
@@ -436,29 +238,6 @@ mod tests {
     fn test_hifigan_config() {
         let config = HiFiGANConfig::default();
         assert_eq!(config.num_mels, 80);
-        assert_eq!(config.total_upsample_factor(), 256);
-    }
-
-    #[test]
-    fn test_resblock_creation() {
-        let resblock = ResBlock::new(64, 3, &[1, 3, 5], 0.1);
-        assert!(resblock.is_ok());
-    }
-
-    #[test]
-    fn test_mrf_creation() {
-        let mrf = MRF::new(
-            64,
-            &[3, 7, 11],
-            &[vec![1, 3, 5], vec![1, 3, 5], vec![1, 3, 5]],
-            0.1,
-        );
-        assert!(mrf.is_ok());
-    }
-
-    #[test]
-    fn test_hifigan_creation() {
-        let hifigan = HiFiGAN::new(HiFiGANConfig::default());
-        assert!(hifigan.is_ok());
+        assert_eq!(config.initial_channel, 512);
     }
 }

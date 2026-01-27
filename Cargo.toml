@@ -38,6 +38,7 @@ members = [
     "mistral-mlx",
     "qwen-image-mlx",
     "gpt-sovits-mlx",
+    "step-audio2-mlx",
     "xtask",
 ]
 

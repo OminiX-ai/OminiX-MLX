@@ -100,6 +100,11 @@ pub struct GenerationOutput {
 ///
 /// Returns (phoneme_ids, phoneme_strings, word2ph, text_normalized)
 pub fn preprocess_text(text: &str) -> (Array, Vec<String>, Vec<i32>, String) {
+    preprocess_text_with_lang(text, None)
+}
+
+/// Preprocess text with explicit language override
+pub fn preprocess_text_with_lang(text: &str, language: Option<crate::text::Language>) -> (Array, Vec<String>, Vec<i32>, String) {
     // GPT-SoVITS format: no BOS/EOS, punctuation at end serves as sentence delimiter
     let config = PreprocessorConfig {
         add_bos: false,
@@ -109,7 +114,7 @@ pub fn preprocess_text(text: &str) -> (Array, Vec<String>, Vec<i32>, String) {
     let preprocessor = TextPreprocessor::new(config);
 
     // Convert text to phonemes
-    let output = preprocessor.preprocess(text, None);
+    let output = preprocessor.preprocess(text, language);
 
     // Use phonemes directly - Python doesn't add any end marker,
     // the trailing punctuation (comma, period, etc.) is the sentence delimiter
@@ -279,7 +284,7 @@ mod tests {
 
     #[test]
     fn test_preprocess_text() {
-        let (ids, phonemes, word2ph) = preprocess_text("你好");
+        let (ids, phonemes, word2ph, _norm_text) = preprocess_text("你好");
         assert!(!phonemes.is_empty());
         // GPT-SoVITS format: just phonemes, no extra markers (matches Python's cut0)
         // "你好" -> 4 phonemes: n, i3, h, ao3

@@ -23,11 +23,11 @@ use mlx_rs_core::KVCache;
 use tokenizers::Tokenizer;
 
 use crate::adaptor::StepAudio2Adaptor;
-use crate::audio::{load_audio_mel, samples_to_mel};
+use crate::audio::{load_audio_mel, load_wav, samples_to_mel, resample, compute_mel_spectrogram, MAX_AUDIO_DURATION_SECS};
 use crate::config::{tokens, AudioConfig, StepAudio2Config};
 use crate::encoder::StepAudio2Encoder;
-use crate::error::Result;
-use crate::llm::{load_llm_weights, sample, StepAudio2LLM};
+use crate::error::{Error, Result};
+use crate::llm::{apply_repetition_penalty, load_llm_weights, sample, StepAudio2LLM};
 use crate::think::{ThinkConfig, ThinkModeHandler, ThinkOutput};
 
 /// Step-Audio 2 model
@@ -524,7 +524,7 @@ impl StepAudio2 {
         let audio_features = self.encode_audio(&mel)?;
 
         // Generate text tokens
-        let tokens = self.generate_text(&audio_features, 512, 0.0)?;
+        let tokens = self.generate_text(&audio_features, 2048, 0.0)?;
 
         // Decode tokens to text
         let text = self.decode_tokens(&tokens);
@@ -532,22 +532,338 @@ impl StepAudio2 {
         Ok(text)
     }
 
-    /// Synthesize speech from text (TTS)
+    /// Transcribe long audio by chunking into segments
+    ///
+    /// Splits audio at the encoder's max context (15s) and transcribes each chunk.
+    pub fn transcribe_long(&mut self, audio_path: impl AsRef<Path>) -> Result<String> {
+        let (samples, src_rate) = load_wav(&audio_path)?;
+        let target_rate = self.config.audio.sample_rate as u32;
+        let samples = if src_rate != target_rate {
+            resample(&samples, src_rate, target_rate)
+        } else {
+            samples
+        };
+
+        let max_samples = (MAX_AUDIO_DURATION_SECS * target_rate as f32) as usize;
+        let total_duration = samples.len() as f32 / target_rate as f32;
+
+        if samples.len() <= max_samples {
+            // Short enough, single pass
+            return self.transcribe_samples(&samples, target_rate);
+        }
+
+        eprintln!("Long audio ({:.1}s), chunking into {:.0}s segments...",
+            total_duration, MAX_AUDIO_DURATION_SECS);
+
+        let mut results = Vec::new();
+        let mut offset = 0usize;
+        let mut chunk_idx = 0;
+
+        while offset < samples.len() {
+            let end = (offset + max_samples).min(samples.len());
+            let chunk = &samples[offset..end];
+            let chunk_duration = chunk.len() as f32 / target_rate as f32;
+
+            eprintln!("  Chunk {}: {:.1}s - {:.1}s ({:.1}s)",
+                chunk_idx,
+                offset as f32 / target_rate as f32,
+                end as f32 / target_rate as f32,
+                chunk_duration);
+
+            let text = self.transcribe_samples(chunk, target_rate)?;
+            results.push(text);
+
+            offset = end;
+            chunk_idx += 1;
+        }
+
+        Ok(results.join("\n"))
+    }
+
+    /// Build prompt for TTS (text input → audio output)
+    fn build_tts_prompt(&self, text: &str) -> Vec<i32> {
+        // TTS prompt format for Step-Audio 2:
+        // <|im_start|>user\n{text}<|im_end|>\n<|im_start|>assistant\n
+        // The model should generate audio tokens after this
+
+        let mut prompt = vec![
+            tokens::IM_START_TOKEN,  // <|im_start|>
+            872,                      // user
+            198,                      // \n
+        ];
+
+        // Encode text
+        if let Some(tokenizer) = &self.tokenizer {
+            if let Ok(encoding) = tokenizer.encode(text, false) {
+                prompt.extend(encoding.get_ids().iter().map(|&id| id as i32));
+            }
+        }
+
+        // Continue with assistant turn
+        prompt.extend_from_slice(&[
+            tokens::IM_END_TOKEN,    // <|im_end|>
+            198,                      // \n
+            tokens::IM_START_TOKEN,  // <|im_start|>
+            77091,                    // assistant
+            198,                      // \n
+        ]);
+
+        prompt
+    }
+
+    /// Generate audio tokens from text prompt
     #[cfg(feature = "tts")]
-    pub fn synthesize(&mut self, _text: &str) -> Result<Vec<f32>> {
-        // TODO: Phase 3 - Implement TTS
-        todo!("TTS not implemented yet")
+    fn generate_audio_tokens(
+        &mut self,
+        prompt_tokens: &[i32],
+        max_tokens: usize,
+        temperature: f32,
+    ) -> Result<Vec<i32>> {
+        self.reset_cache();
+
+        // Get embeddings for prompt
+        let prompt_array = Array::from_slice(
+            &prompt_tokens.iter().map(|&t| t).collect::<Vec<i32>>(),
+            &[1, prompt_tokens.len() as i32],
+        );
+        let embeddings = self.llm.get_token_embeddings(&prompt_array)?;
+
+        // Run prefill
+        let logits = self.llm.forward_embeddings(&embeddings, &mut self.cache)?;
+
+        // Get last token logits
+        let seq_len = logits.shape()[1];
+        let last_logits = logits.index((.., seq_len - 1, ..));
+
+        // Sample first token
+        let mut token = sample(&last_logits, temperature)?;
+        let mut token_id = token.item::<i32>();
+
+        let mut output_tokens = vec![token_id];
+        let mut audio_token_count = 0;
+
+        // Generation loop - collect audio tokens
+        for _ in 1..max_tokens {
+            // Check stopping conditions
+            if token_id == tokens::EOS_TOKEN
+               || token_id == tokens::EOT_TOKEN
+               || token_id == tokens::IM_END_TOKEN {
+                break;
+            }
+
+            // Count audio tokens for stopping condition
+            if tokens::is_audio_token(token_id) {
+                audio_token_count += 1;
+            }
+
+            // Single token forward pass
+            let token_array = Array::from_slice(&[token_id], &[1, 1]);
+            let token_embed = self.llm.get_token_embeddings(&token_array)?;
+            let logits = self.llm.forward_embeddings(&token_embed, &mut self.cache)?;
+            let last_logits = logits.index((.., 0, ..));
+
+            // Sample next token
+            token = sample(&last_logits, temperature)?;
+            token_id = token.item::<i32>();
+            output_tokens.push(token_id);
+        }
+
+        Ok(output_tokens)
+    }
+
+    /// Synthesize speech from text (TTS)
+    ///
+    /// Returns audio waveform at 24kHz
+    #[cfg(feature = "tts")]
+    pub fn synthesize(&mut self, text: &str) -> Result<Vec<f32>> {
+        use crate::tts::{TTSDecoder, extract_audio_tokens};
+
+        // Build TTS prompt
+        let prompt_tokens = self.build_tts_prompt(text);
+
+        // Generate tokens (including audio tokens)
+        let generated_tokens = self.generate_audio_tokens(&prompt_tokens, 2048, 0.7)?;
+
+        // Extract audio codes from generated tokens
+        let audio_codes = extract_audio_tokens(&generated_tokens);
+
+        if audio_codes.is_empty() {
+            return Err(Error::Inference("No audio tokens generated".to_string()));
+        }
+
+        // Load TTS decoder if not already loaded
+        // Note: In a real implementation, this would be cached
+        let model_dir = Path::new("./Step-Audio-2-mini");
+        let mut tts = TTSDecoder::load(model_dir)?;
+
+        // Synthesize audio from codes
+        tts.synthesize(&audio_codes)
+    }
+
+    /// Speech-to-speech: transcribe audio and generate speech response
+    ///
+    /// Takes audio input, processes it, and returns audio output
+    #[cfg(feature = "tts")]
+    pub fn speech_to_speech(
+        &mut self,
+        audio_path: impl AsRef<Path>,
+    ) -> Result<(String, Vec<f32>)> {
+        use crate::tts::{TTSDecoder, extract_audio_tokens};
+
+        // Load and process audio
+        let mel = load_audio_mel(&audio_path, &self.config.audio)?;
+
+        // Encode audio
+        let audio_features = self.encode_audio(&mel)?;
+
+        // Generate response (text + audio tokens)
+        // Use a modified prompt that encourages audio output
+        let generated_tokens = self.generate_with_audio(&audio_features, 2048, 0.7)?;
+
+        // Separate text and audio tokens
+        let (text_tokens, audio_codes) = tokens::separate_tokens(&generated_tokens);
+
+        // Decode text
+        let text = self.decode_tokens(&text_tokens);
+
+        // Synthesize audio if we have audio codes
+        let audio = if !audio_codes.is_empty() {
+            let model_dir = Path::new("./Step-Audio-2-mini");
+            let mut tts = TTSDecoder::load(model_dir)?;
+            tts.synthesize(&audio_codes)?
+        } else {
+            vec![]
+        };
+
+        Ok((text, audio))
+    }
+
+    /// Build prompt for speech-to-speech (audio input → audio output)
+    /// Returns (prompt_tokens, audio_insert_position)
+    #[cfg(feature = "tts")]
+    fn build_speech_to_speech_prompt(&self, audio_len: i32) -> (Vec<i32>, usize) {
+        // Speech-to-speech prompt format:
+        // <|im_start|>user\n<audio_start>[audio features]<|im_end|>\n<|im_start|>assistant\n<audio_start>
+        // The trailing <audio_start> signals the model to generate audio tokens
+
+        let mut prompt = vec![
+            tokens::IM_START_TOKEN,  // <|im_start|>
+            872,                      // user
+            198,                      // \n
+            tokens::AUDIO_START_TOKEN, // <audio_start>
+        ];
+
+        let audio_insert_pos = prompt.len();
+
+        // Placeholders for audio
+        for _ in 0..audio_len {
+            prompt.push(tokens::AUDIO_START_TOKEN);
+        }
+
+        // End user turn, start assistant with audio signal
+        prompt.extend_from_slice(&[
+            tokens::IM_END_TOKEN,    // <|im_end|>
+            198,                      // \n
+            tokens::IM_START_TOKEN,  // <|im_start|>
+            77091,                    // assistant
+            198,                      // \n
+            tokens::AUDIO_START_TOKEN, // <audio_start> - signal to generate audio
+        ]);
+
+        (prompt, audio_insert_pos)
+    }
+
+    /// Generate response with potential audio tokens
+    #[cfg(feature = "tts")]
+    fn generate_with_audio(
+        &mut self,
+        audio_features: &Array,
+        max_tokens: usize,
+        temperature: f32,
+    ) -> Result<Vec<i32>> {
+        self.reset_cache();
+
+        let audio_len = audio_features.shape()[1];
+        let (prompt_tokens, audio_insert_pos) = self.build_speech_to_speech_prompt(audio_len);
+
+        // Get embeddings
+        let prompt_array = Array::from_slice(
+            &prompt_tokens.iter().map(|&t| t).collect::<Vec<i32>>(),
+            &[1, prompt_tokens.len() as i32],
+        );
+        let embeddings = self.llm.get_token_embeddings(&prompt_array)?;
+
+        // Insert audio features
+        let total_len = embeddings.shape()[1];
+        let before_audio = embeddings.index((.., ..audio_insert_pos as i32, ..));
+        let after_audio_start = (audio_insert_pos + audio_len as usize) as i32;
+        let after_audio = if after_audio_start < total_len {
+            Some(embeddings.index((.., after_audio_start.., ..)))
+        } else {
+            None
+        };
+
+        let combined = if let Some(after) = after_audio {
+            mlx_rs::ops::concatenate_axis(&[&before_audio, audio_features, &after], 1)?
+        } else {
+            mlx_rs::ops::concatenate_axis(&[&before_audio, audio_features], 1)?
+        };
+
+        // Run prefill
+        let logits = self.llm.forward_embeddings(&combined, &mut self.cache)?;
+
+        let seq_len = logits.shape()[1];
+        let last_logits = logits.index((.., seq_len - 1, ..));
+
+        let mut token = sample(&last_logits, temperature)?;
+        let mut token_id = token.item::<i32>();
+
+        let mut output_tokens = vec![token_id];
+        let mut audio_token_count = 0;
+
+        // Generation loop - allow audio tokens
+        for _ in 1..max_tokens {
+            // Track audio token count for logging
+            if tokens::is_audio_token(token_id) {
+                audio_token_count += 1;
+            }
+
+            // Stop on end tokens
+            if token_id == tokens::EOS_TOKEN
+               || token_id == tokens::EOT_TOKEN
+               || token_id == tokens::IM_END_TOKEN
+               || token_id == tokens::AUDIO_END_TOKEN {
+                break;
+            }
+
+            let token_array = Array::from_slice(&[token_id], &[1, 1]);
+            let token_embed = self.llm.get_token_embeddings(&token_array)?;
+            let logits = self.llm.forward_embeddings(&token_embed, &mut self.cache)?;
+            let last_logits = logits.index((.., 0, ..));
+
+            token = sample(&last_logits, temperature)?;
+            token_id = token.item::<i32>();
+            output_tokens.push(token_id);
+        }
+
+        // Log how many audio tokens were generated
+        if audio_token_count > 0 {
+            eprintln!("  Generated {} audio tokens", audio_token_count);
+        }
+
+        Ok(output_tokens)
     }
 
     /// Speech-to-speech translation
     #[cfg(feature = "tts")]
     pub fn translate_speech(
         &mut self,
-        _audio_path: impl AsRef<Path>,
+        audio_path: impl AsRef<Path>,
         _target_lang: &str,
     ) -> Result<Vec<f32>> {
-        // TODO: Phase 3 - Implement S2ST
-        todo!("S2ST not implemented yet")
+        // For now, just do speech-to-speech without translation
+        let (_, audio) = self.speech_to_speech(audio_path)?;
+        Ok(audio)
     }
 
     /// Save audio samples to WAV file

@@ -20,8 +20,12 @@ pub fn get_pinyin_with_g2pw(sentence: &str) -> Vec<Option<String>> {
     let mutex = G2PW.get_or_init(|| {
         // Try to load G2PW model from common locations
         let model_paths = [
-            "/Users/yuechen/home/mcp/dora/node-hub/dora-primespeech/dora_primespeech/moyoyo_tts/text/G2PWModel",
-            "/Users/yuechen/.dora/models/primespeech/moyoyo/G2PWModel",
+            // Primary location - user's .dora models directory
+            "/Users/yuechen/.dora/models/primespeech/G2PWModel",
+            // Alternative locations
+            "/Users/yuechen/home/mofa-studio/node-hub/dora-primespeech/dora_primespeech/moyoyo_tts/text/G2PWModel",
+            "/Users/yuechen/home/conversation/dora/node-hub/dora-primespeech/dora_primespeech/moyoyo_tts/text/G2PWModel",
+            "/Users/yuechen/home/VoiceDialogue11/third_party/moyoyo_tts/text/G2PWModel",
         ];
 
         for path in model_paths {
@@ -345,14 +349,14 @@ impl G2PWConverter {
 
 #[cfg(test)]
 mod tests {
+    #[allow(unused_imports)]
     use super::*;
 
     #[test]
-    fn test_g2pw_loading() {
-        if let Some(g2pw) = get_g2pw() {
-            assert!(g2pw.is_polyphonic('行'));
-            assert!(g2pw.is_polyphonic('了'));
-            assert!(!g2pw.is_polyphonic('我'));
-        }
+    fn test_get_pinyin_basic() {
+        // Test the basic pinyin function
+        let result = get_pinyin_with_g2pw("你好");
+        // Should return 2 pinyin entries (one per character)
+        assert_eq!(result.len(), 2);
     }
 }

@@ -65,7 +65,7 @@ fn main() -> Result<()> {
     // Transcribe audio
     println!("Transcribing...");
     let start = Instant::now();
-    let text = model.transcribe(&audio_path)?;
+    let text = model.transcribe_long(&audio_path)?;
     let duration = start.elapsed();
     println!("");
 
