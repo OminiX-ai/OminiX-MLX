@@ -114,15 +114,46 @@ impl HiFiGAN {
         let weights = Array::load_safetensors(&weights_path)?;
         println!("  Loaded {} hifigan weights", weights.len());
 
-        Ok(Self { weights, config, weights_loaded: true })
+        let model = Self { weights, config, weights_loaded: true };
+        model.validate_weights()?;
+        Ok(model)
     }
 
     fn w(&self, key: &str) -> &Array {
         self.weights.get(key).unwrap_or_else(|| panic!("Missing HiFiGAN weight: {}", key))
     }
 
-    fn w_opt(&self, key: &str) -> Option<&Array> {
-        self.weights.get(key)
+    /// Validate critical weights exist at load time so w() won't panic during inference
+    fn validate_weights(&self) -> Result<()> {
+        let mut missing = Vec::new();
+        for key in ["hifigan.conv_pre.weight", "hifigan.conv_pre.bias",
+                     "hifigan.conv_post.weight", "hifigan.conv_post.bias"] {
+            if !self.weights.contains_key(key) {
+                missing.push(key.to_string());
+            }
+        }
+        for i in 0..self.config.upsample_rates.len() {
+            for suffix in ["weight", "bias"] {
+                let key = format!("hifigan.ups.{}.{}", i, suffix);
+                if !self.weights.contains_key(&key) {
+                    missing.push(key);
+                }
+            }
+        }
+        let total_resblocks = self.config.upsample_rates.len() * self.config.num_resblocks_per_level as usize;
+        for i in 0..total_resblocks {
+            let key = format!("hifigan.resblocks.{}.convs1.0.weight", i);
+            if !self.weights.contains_key(&key) {
+                missing.push(key);
+            }
+        }
+        if !missing.is_empty() {
+            return Err(Error::ModelLoad(format!(
+                "HiFiGAN missing {} critical weights: {}",
+                missing.len(), missing[..missing.len().min(5)].join(", ")
+            )));
+        }
+        Ok(())
     }
 
     /// Resblock: 3 layers of (snake→conv1→snake→conv2→residual)

@@ -23,7 +23,7 @@ use mlx_rs_core::KVCache;
 use tokenizers::Tokenizer;
 
 use crate::adaptor::StepAudio2Adaptor;
-use crate::audio::{load_audio_mel, load_wav, samples_to_mel, resample, compute_mel_spectrogram, MAX_AUDIO_DURATION_SECS};
+use crate::audio::{load_audio_mel, load_wav, samples_to_mel, resample, MAX_AUDIO_DURATION_SECS};
 use crate::config::{tokens, AudioConfig, StepAudio2Config};
 use crate::encoder::StepAudio2Encoder;
 use crate::error::{Error, Result};
@@ -442,8 +442,10 @@ impl StepAudio2 {
         let seq_len = logits.shape()[1];
         let last_logits = logits.index((.., seq_len - 1, ..));
 
-        // Sample first token - item() forces evaluation
-        let mut token = sample(&last_logits, temperature)?;
+        // Apply repetition penalty and sample first token
+        let rep_penalty = 1.3;
+        let penalized = apply_repetition_penalty(&last_logits, &[], rep_penalty)?;
+        let mut token = sample(&penalized, temperature)?;
         let mut token_id = token.item::<i32>();
 
         let mut output_tokens = vec![token_id];
@@ -470,8 +472,9 @@ impl StepAudio2 {
             let logits = self.llm.forward_embeddings(&token_embed, &mut self.cache)?;
             let last_logits = logits.index((.., 0, ..));
 
-            // Sample next token - item() is the synchronization point
-            token = sample(&last_logits, temperature)?;
+            // Apply repetition penalty and sample
+            let penalized = apply_repetition_penalty(&last_logits, &output_tokens, rep_penalty)?;
+            token = sample(&penalized, temperature)?;
             token_id = token.item::<i32>();
             output_tokens.push(token_id);
         }
@@ -499,37 +502,18 @@ impl StepAudio2 {
     }
 
     /// Transcribe audio file (ASR)
+    ///
+    /// Automatically chunks audio longer than 15s.
     pub fn transcribe(&mut self, audio_path: impl AsRef<Path>) -> Result<String> {
-        // Load and process audio
-        let mel = load_audio_mel(&audio_path, &self.config.audio)?;
-
-        // Encode audio
-        let audio_features = self.encode_audio(&mel)?;
-
-        // Generate text tokens
-        let tokens = self.generate_text(&audio_features, 512, 0.0)?;
-
-        // Decode tokens to text
-        let text = self.decode_tokens(&tokens);
-
-        Ok(text)
+        self.transcribe_long(audio_path)
     }
 
-    /// Transcribe audio samples (ASR)
+    /// Transcribe audio samples (single chunk, max 15s)
     pub fn transcribe_samples(&mut self, samples: &[f32], sample_rate: u32) -> Result<String> {
-        // Convert samples to mel spectrogram
         let mel = samples_to_mel(samples, sample_rate, &self.config.audio)?;
-
-        // Encode audio
         let audio_features = self.encode_audio(&mel)?;
-
-        // Generate text tokens
         let tokens = self.generate_text(&audio_features, 2048, 0.0)?;
-
-        // Decode tokens to text
-        let text = self.decode_tokens(&tokens);
-
-        Ok(text)
+        Ok(self.decode_tokens(&tokens))
     }
 
     /// Transcribe long audio by chunking into segments
@@ -636,11 +620,12 @@ impl StepAudio2 {
         let last_logits = logits.index((.., seq_len - 1, ..));
 
         // Sample first token
-        let mut token = sample(&last_logits, temperature)?;
+        let rep_penalty = 1.3;
+        let penalized = apply_repetition_penalty(&last_logits, &[], rep_penalty)?;
+        let mut token = sample(&penalized, temperature)?;
         let mut token_id = token.item::<i32>();
 
         let mut output_tokens = vec![token_id];
-        let mut audio_token_count = 0;
 
         // Generation loop - collect audio tokens
         for _ in 1..max_tokens {
@@ -651,19 +636,15 @@ impl StepAudio2 {
                 break;
             }
 
-            // Count audio tokens for stopping condition
-            if tokens::is_audio_token(token_id) {
-                audio_token_count += 1;
-            }
-
             // Single token forward pass
             let token_array = Array::from_slice(&[token_id], &[1, 1]);
             let token_embed = self.llm.get_token_embeddings(&token_array)?;
             let logits = self.llm.forward_embeddings(&token_embed, &mut self.cache)?;
             let last_logits = logits.index((.., 0, ..));
 
-            // Sample next token
-            token = sample(&last_logits, temperature)?;
+            // Apply repetition penalty and sample
+            let penalized = apply_repetition_penalty(&last_logits, &output_tokens, rep_penalty)?;
+            token = sample(&penalized, temperature)?;
             token_id = token.item::<i32>();
             output_tokens.push(token_id);
         }
@@ -815,7 +796,9 @@ impl StepAudio2 {
         let seq_len = logits.shape()[1];
         let last_logits = logits.index((.., seq_len - 1, ..));
 
-        let mut token = sample(&last_logits, temperature)?;
+        let rep_penalty = 1.3;
+        let penalized = apply_repetition_penalty(&last_logits, &[], rep_penalty)?;
+        let mut token = sample(&penalized, temperature)?;
         let mut token_id = token.item::<i32>();
 
         let mut output_tokens = vec![token_id];
@@ -841,7 +824,9 @@ impl StepAudio2 {
             let logits = self.llm.forward_embeddings(&token_embed, &mut self.cache)?;
             let last_logits = logits.index((.., 0, ..));
 
-            token = sample(&last_logits, temperature)?;
+            // Apply repetition penalty and sample
+            let penalized = apply_repetition_penalty(&last_logits, &output_tokens, rep_penalty)?;
+            token = sample(&penalized, temperature)?;
             token_id = token.item::<i32>();
             output_tokens.push(token_id);
         }

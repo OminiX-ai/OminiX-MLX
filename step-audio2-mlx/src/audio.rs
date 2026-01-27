@@ -374,7 +374,9 @@ fn stft_power_spectrum_gpu(samples: &[f32], n_fft: i32, hop_length: i32) -> std:
     };
 
     if n_frames == 0 {
-        return Array::zeros::<f32>(&[n_freqs, 1]);
+        return Err(Exception::from(
+            "Audio too short for STFT: fewer samples than n_fft window size"
+        ));
     }
 
     // Python does [:-1] which removes the last frame
@@ -565,6 +567,15 @@ pub fn load_audio_mel(path: impl AsRef<Path>, config: &AudioConfig) -> Result<Ar
     } else {
         samples
     };
+
+    // Minimum duration check
+    let min_samples = (config.n_fft as usize) * 2; // need at least 2 STFT frames
+    if samples.len() < min_samples {
+        return Err(Error::Audio(format!(
+            "Audio too short ({} samples, need at least {})",
+            samples.len(), min_samples
+        )));
+    }
 
     // Truncate to max duration (Step-Audio 2 has 1500 frame max context)
     let max_samples = (MAX_AUDIO_DURATION_SECS * config.sample_rate as f32) as usize;

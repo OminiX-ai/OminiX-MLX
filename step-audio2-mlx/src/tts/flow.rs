@@ -158,11 +158,53 @@ impl FlowDecoder {
         let config = FlowDecoderConfig::default();
         let weights = Array::load_safetensors(weights_path)?;
         println!("  Loaded {} flow weights", weights.len());
-        Ok(Self { weights, config, weights_loaded: true })
+        let model = Self { weights, config, weights_loaded: true };
+        model.validate_weights()?;
+        Ok(model)
     }
 
     fn w(&self, key: &str) -> &Array {
-        self.weights.get(key).unwrap_or_else(|| panic!("Missing weight: {}", key))
+        self.weights.get(key).unwrap_or_else(|| panic!("Missing flow weight: {}", key))
+    }
+
+    /// Validate that all critical weights exist at load time so w() won't panic at inference time
+    fn validate_weights(&self) -> Result<()> {
+        let required_prefixes = [
+            "codebook.embeddings.weight",
+            "encoder.input_proj.out.0.weight",
+            "flow.encoder.up_embed.out.0.weight",
+            "flow.encoder_proj.weight",
+            "flow.decoder.estimator.t_embedder.mlp.0.weight",
+            "flow.decoder.estimator.in_proj.weight",
+            "flow.decoder.estimator.final_layer.linear.weight",
+        ];
+        let mut missing = Vec::new();
+        for key in &required_prefixes {
+            if !self.weights.contains_key(*key) {
+                missing.push(key.to_string());
+            }
+        }
+        if !missing.is_empty() {
+            return Err(Error::ModelLoad(format!(
+                "Flow decoder missing {} critical weights: {}",
+                missing.len(),
+                missing.join(", ")
+            )));
+        }
+        // Check block counts
+        for i in 0..self.config.num_encoder_blocks as usize {
+            let key = format!("encoder.layers.{}.norm_mha.weight", i);
+            if !self.weights.contains_key(&key) {
+                return Err(Error::ModelLoad(format!("Missing encoder block {}", i)));
+            }
+        }
+        for i in 0..self.config.dit_depth as usize {
+            let key = format!("flow.decoder.estimator.blocks.{}.adaLN_modulation.1.weight", i);
+            if !self.weights.contains_key(&key) {
+                return Err(Error::ModelLoad(format!("Missing DiT block {}", i)));
+            }
+        }
+        Ok(())
     }
 
     // =====================================================================
