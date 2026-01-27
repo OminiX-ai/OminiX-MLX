@@ -1,6 +1,13 @@
 //! Step-Audio 2 model
 //!
 //! Main model struct integrating encoder, adaptor, and LLM.
+//!
+//! # Performance Optimization
+//!
+//! MLX automatically caches compiled Metal kernels internally. For best performance:
+//! 1. Call `warmup()` before benchmarking to trigger JIT compilation
+//! 2. Use consistent input shapes to maximize kernel cache hits
+//! 3. Audio preprocessing is GPU-accelerated (see `audio.rs`)
 
 use std::collections::HashSet;
 use std::path::Path;
@@ -19,7 +26,7 @@ use crate::adaptor::StepAudio2Adaptor;
 use crate::audio::{load_audio_mel, samples_to_mel};
 use crate::config::{tokens, AudioConfig, StepAudio2Config};
 use crate::encoder::StepAudio2Encoder;
-use crate::error::{Error, Result};
+use crate::error::Result;
 use crate::llm::{load_llm_weights, sample, StepAudio2LLM};
 use crate::think::{ThinkConfig, ThinkModeHandler, ThinkOutput};
 
@@ -37,6 +44,8 @@ pub struct StepAudio2 {
     cache: Vec<Option<KVCache>>,
     /// Tokenizer for text encoding/decoding
     tokenizer: Option<Arc<Tokenizer>>,
+    /// Whether model has been warmed up (JIT compiled)
+    warmed_up: bool,
 }
 
 impl StepAudio2 {
@@ -53,7 +62,46 @@ impl StepAudio2 {
             config,
             cache: Vec::new(),
             tokenizer: None,
+            warmed_up: false,
         })
+    }
+
+    /// Warmup the model by running a forward pass with dummy input.
+    ///
+    /// This triggers MLX's JIT compilation of Metal kernels, so subsequent
+    /// inference calls will be faster. Call this once before benchmarking
+    /// or when latency of the first call matters.
+    ///
+    /// Returns the estimated audio duration (in seconds) used for warmup.
+    pub fn warmup(&mut self) -> Result<f32> {
+        if self.warmed_up {
+            return Ok(0.0);
+        }
+
+        // Create dummy mel spectrogram (~1 second of audio)
+        // Shape: [1, n_mels, n_frames] where n_frames ≈ sample_rate / hop_length
+        let n_mels = self.config.audio.n_mels;
+        let n_frames = 100; // ~1 second at 16kHz with hop_length=160
+
+        let dummy_mel = Array::zeros::<f32>(&[1, n_mels, n_frames])?;
+
+        // Run encoder + adaptor (triggers JIT for 32 encoder layers + adaptor)
+        let _ = self.encode_audio(&dummy_mel)?;
+
+        // Run a few LLM forward steps (triggers JIT for transformer layers)
+        self.reset_cache();
+        let dummy_embed = Array::zeros::<f32>(&[1, 10, self.config.llm.hidden_size])?;
+        let _ = self.llm.forward_embeddings(&dummy_embed, &mut self.cache)?;
+
+        self.warmed_up = true;
+        self.reset_cache();
+
+        Ok(1.0) // ~1 second equivalent
+    }
+
+    /// Check if model has been warmed up
+    pub fn is_warmed_up(&self) -> bool {
+        self.warmed_up
     }
 
     /// Load model from directory
@@ -281,6 +329,9 @@ impl StepAudio2 {
     }
 
     /// Process audio through encoder and adaptor
+    ///
+    /// MLX automatically caches compiled kernels, so repeated calls with
+    /// the same shapes will benefit from kernel caching.
     fn encode_audio(&mut self, mel: &Array) -> std::result::Result<Array, Exception> {
         // mel: [B, n_mels, T]
         let encoded = self.encoder.forward(mel)?;

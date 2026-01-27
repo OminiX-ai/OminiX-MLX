@@ -73,12 +73,19 @@ fn main() -> Result<()> {
     println!("Model loaded in {:.2}s", load_time);
     println!();
 
-    // Warmup run
-    println!("Warmup run...");
+    // Explicit warmup (triggers MLX JIT compilation)
+    println!("Explicit warmup (JIT compilation)...");
     let warmup_start = Instant::now();
+    let _ = model.warmup()?;
+    let jit_time = warmup_start.elapsed().as_secs_f64() * 1000.0;
+    println!("JIT warmup completed in {:.1}ms", jit_time);
+
+    // First inference (should be fast after warmup)
+    println!("First inference run...");
+    let first_start = Instant::now();
     let warmup_result = model.transcribe_samples(&samples_16k, 16000)?;
-    let warmup_time = warmup_start.elapsed().as_secs_f64() * 1000.0;
-    println!("Warmup completed in {:.1}ms", warmup_time);
+    let first_time = first_start.elapsed().as_secs_f64() * 1000.0;
+    println!("First inference completed in {:.1}ms", first_time);
     println!("Output: {}", warmup_result);
     println!();
 
