@@ -59,9 +59,12 @@
 use std::path::Path;
 use std::process::Command;
 use std::sync::OnceLock;
+use std::sync::atomic::{AtomicBool, Ordering};
+use std::time::{Duration, Instant};
 
 use lingua::{Language, LanguageDetector, LanguageDetectorBuilder};
-use mlx_rs::{Array, module::Module, ops::indexing::IndexOp, transforms::eval, random};
+use mlx_rs::{Array, module::Module, ops::indexing::IndexOp, random, transforms::eval};
+use tracing::{debug, warn, trace, instrument};
 
 use crate::{
     audio::{AudioConfig, load_reference_mel, load_audio_for_hubert},
@@ -73,6 +76,7 @@ use crate::{
         t2s::{T2SConfig, T2SInput, T2SModel, load_t2s_model},
         vits::{SynthesizerTrn, load_vits_model},
     },
+    sampling::{Sampler, SamplingConfig, detect_repetition},
     text::BertFeatureExtractor,
 };
 
@@ -103,8 +107,11 @@ pub struct VoiceClonerConfig {
     pub noise_scale: f32,
     /// Speed factor (1.0 = normal)
     pub speed: f32,
-    /// Optional path to ONNX VITS model for batched decode (eliminates per-chunk noise)
+    /// Path to ONNX VITS model for batched decode (default, recommended)
+    /// Set to None to fall back to MLX VITS per-chunk decode
     pub vits_onnx_path: Option<String>,
+    /// Use MLX VITS instead of ONNX (not recommended, may have chunk boundary artifacts)
+    pub use_mlx_vits: bool,
 }
 
 impl Default for VoiceClonerConfig {
@@ -123,7 +130,9 @@ impl Default for VoiceClonerConfig {
             repetition_penalty: 1.35,  // Match Python TTS.py default
             noise_scale: 0.5,
             speed: 1.0,
-            vits_onnx_path: None,
+            // ONNX VITS is default for best quality (batched decode, matches Python)
+            vits_onnx_path: Some("/tmp/gpt-sovits-mlx/vits.onnx".to_string()),
+            use_mlx_vits: false,
         }
     }
 }
@@ -146,6 +155,53 @@ impl AudioOutput {
     pub fn duration_secs(&self) -> f32 {
         self.samples.len() as f32 / self.sample_rate as f32
     }
+}
+
+/// Options for synthesis with timeout and cancellation support
+#[derive(Debug, Clone, Default)]
+pub struct SynthesisOptions {
+    /// Maximum time allowed for synthesis (None = no timeout)
+    pub timeout: Option<Duration>,
+    /// Cancellation token - set to true to cancel synthesis
+    pub cancel_token: Option<std::sync::Arc<AtomicBool>>,
+    /// Maximum tokens to generate per chunk (None = auto)
+    pub max_tokens_per_chunk: Option<usize>,
+}
+
+impl SynthesisOptions {
+    /// Create options with a timeout
+    pub fn with_timeout(timeout: Duration) -> Self {
+        Self {
+            timeout: Some(timeout),
+            ..Default::default()
+        }
+    }
+
+    /// Create options with a cancellation token
+    pub fn with_cancel_token(token: std::sync::Arc<AtomicBool>) -> Self {
+        Self {
+            cancel_token: Some(token),
+            ..Default::default()
+        }
+    }
+
+    /// Check if cancellation was requested
+    fn is_cancelled(&self) -> bool {
+        self.cancel_token.as_ref()
+            .map(|t| t.load(Ordering::Relaxed))
+            .unwrap_or(false)
+    }
+
+    /// Check if timeout has elapsed
+    #[allow(dead_code)]
+    fn is_timed_out(&self, start: Instant) -> bool {
+        self.timeout
+            .map(|t| start.elapsed() > t)
+            .unwrap_or(false)
+    }
+}
+
+impl AudioOutput {
 
     /// Convert to i16 samples for WAV output
     pub fn to_i16_samples(&self) -> Vec<i16> {
@@ -238,16 +294,24 @@ impl VoiceCloner {
             None
         };
 
-        // Try to load ONNX VITS if path provided
-        let vits_onnx = if let Some(ref onnx_path) = config.vits_onnx_path {
+        // Load ONNX VITS by default for best quality (batched decode, matches Python)
+        // Skip if use_mlx_vits is explicitly set to true
+        let vits_onnx = if config.use_mlx_vits {
+            eprintln!("Using MLX VITS (per-chunk decode) - may have chunk boundary artifacts");
+            None
+        } else if let Some(ref onnx_path) = config.vits_onnx_path {
             match crate::models::vits_onnx::VitsOnnx::load(std::path::Path::new(onnx_path)) {
-                Ok(v) => Some(v),
+                Ok(v) => {
+                    eprintln!("Using ONNX VITS (batched decode) for best quality");
+                    Some(v)
+                },
                 Err(e) => {
                     eprintln!("Warning: Failed to load ONNX VITS: {}. Falling back to MLX.", e);
                     None
                 }
             }
         } else {
+            eprintln!("No ONNX VITS path configured. Using MLX VITS (per-chunk decode).");
             None
         };
 
@@ -352,9 +416,6 @@ impl VoiceCloner {
                 .map_err(|e| Error::Message(format!("Quantizer encode failed: {}", e)))?;
             eval([&codes]).map_err(|e| Error::Message(e.to_string()))?;
 
-            // Debug: print token count
-            let token_count = codes.shape()[2];
-
             Some(codes)
         } else {
             return Err(Error::Message(
@@ -410,17 +471,31 @@ impl VoiceCloner {
         eval([&mel]).map_err(|e| Error::Message(format!("Failed to evaluate mel: {}", e)))?;
 
         // Load pre-computed codes from file (supports both .npy and raw binary)
-        let codes_data = std::fs::read(codes_path)
-            .map_err(|e| Error::Message(format!("Failed to read codes file: {}", e)))?;
+        let codes_path_buf = std::path::PathBuf::from(codes_path);
+        let codes_data = std::fs::read(&codes_path_buf)?;
 
         // Check for NPY file format (magic bytes: \x93NUMPY)
-        let codes: Vec<i32> = if codes_data.len() > 10 && &codes_data[..6] == b"\x93NUMPY" {
+        const NPY_MAGIC: &[u8] = b"\x93NUMPY";
+        const NPY_MIN_HEADER: usize = 10;
+        const MAX_HEADER_SIZE: usize = 10_000;  // Reasonable limit for NPY header
+
+        let codes: Vec<i32> = if codes_data.len() > NPY_MIN_HEADER
+            && codes_data.get(..NPY_MAGIC.len()) == Some(NPY_MAGIC)
+        {
             // Parse NPY file: find header end (newline after dict)
-            let mut header_end = 10;
-            while header_end < codes_data.len() && codes_data[header_end] != b'\n' {
-                header_end += 1;
+            let search_end = (NPY_MIN_HEADER + MAX_HEADER_SIZE).min(codes_data.len());
+            let header_end = codes_data[NPY_MIN_HEADER..search_end]
+                .iter()
+                .position(|&b| b == b'\n')
+                .map(|pos| NPY_MIN_HEADER + pos + 1)  // +1 to skip newline
+                .ok_or_else(|| Error::file_corrupted(&codes_path_buf, "NPY header newline not found"))?;
+
+            // Validate data alignment
+            let data_len = codes_data.len() - header_end;
+            if data_len % 4 != 0 {
+                return Err(Error::file_corrupted(&codes_path_buf,
+                    format!("NPY data not aligned to 4 bytes (size={})", data_len)));
             }
-            header_end += 1; // Skip the newline
 
             // Extract data portion
             codes_data[header_end..]
@@ -428,7 +503,11 @@ impl VoiceCloner {
                 .map(|b| i32::from_le_bytes([b[0], b[1], b[2], b[3]]))
                 .collect()
         } else {
-            // Raw binary format
+            // Raw binary format - validate alignment
+            if codes_data.len() % 4 != 0 {
+                return Err(Error::file_corrupted(&codes_path_buf,
+                    format!("Binary data not aligned to 4 bytes (size={})", codes_data.len())));
+            }
             codes_data
                 .chunks_exact(4)
                 .map(|b| i32::from_le_bytes([b[0], b[1], b[2], b[3]]))
@@ -436,7 +515,7 @@ impl VoiceCloner {
         };
 
         if codes.is_empty() {
-            return Err(Error::Message("Codes file is empty".to_string()));
+            return Err(Error::file_corrupted(&codes_path_buf, "No codes found in file"));
         }
 
         // Create Array from codes: [1, 1, num_codes]
@@ -501,8 +580,13 @@ impl VoiceCloner {
     }
 
     /// Get the current prompt semantic codes (for debugging)
-    pub fn get_prompt_semantic(&self) -> Option<Array> {
-        self.prompt_semantic.clone()
+    pub fn prompt_semantic(&self) -> Option<&Array> {
+        self.prompt_semantic.as_ref()
+    }
+
+    /// Get the current reference mel spectrogram
+    pub fn reference_mel(&self) -> Option<&Array> {
+        self.reference_mel.as_ref()
     }
 
     /// Synthesize audio from external semantic tokens (for testing/debugging)
@@ -511,7 +595,7 @@ impl VoiceCloner {
     /// Useful for comparing Rust VITS with Python's semantic tokens.
     pub fn synthesize_from_tokens(&mut self, text: &str, tokens: &[i32]) -> Result<AudioOutput, Error> {
         let ref_mel = self.reference_mel.clone()
-            .ok_or_else(|| Error::Message("No reference audio set.".to_string()))?;
+            .ok_or(Error::ReferenceNotSet)?;
 
         // Preprocess text to get phoneme IDs
         let (phoneme_ids, _phonemes, _word2ph, _text_normalized) = preprocess_text(text);
@@ -530,14 +614,84 @@ impl VoiceCloner {
     }
 
     /// Synthesize speech from text
+    /// Synthesize speech with timeout and cancellation support
+    ///
+    /// # Arguments
+    /// * `text` - Text to synthesize
+    /// * `options` - Synthesis options (timeout, cancellation token)
+    ///
+    /// # Example
+    /// ```ignore
+    /// use std::sync::Arc;
+    /// use std::sync::atomic::AtomicBool;
+    /// use std::time::Duration;
+    ///
+    /// let cancel = Arc::new(AtomicBool::new(false));
+    /// let options = SynthesisOptions {
+    ///     timeout: Some(Duration::from_secs(30)),
+    ///     cancel_token: Some(cancel.clone()),
+    ///     ..Default::default()
+    /// };
+    ///
+    /// // Start synthesis in background thread
+    /// // Call cancel.store(true, Ordering::Relaxed) to cancel
+    /// let audio = cloner.synthesize_with_options("Hello", options)?;
+    /// ```
+    #[instrument(skip(self, options), fields(text_len = text.len()))]
+    pub fn synthesize_with_options(&mut self, text: &str, options: SynthesisOptions) -> Result<AudioOutput, Error> {
+        let start = Instant::now();
+
+        // Check cancellation before starting
+        if options.is_cancelled() {
+            return Err(Error::Cancelled);
+        }
+
+        // Store options for use in generation loop
+        let timeout = options.timeout;
+        let cancel_token = options.cancel_token.clone();
+
+        // Perform synthesis with periodic checks
+        let result = self.synthesize(text);
+
+        // Check for timeout/cancellation after synthesis
+        if let Some(token) = &cancel_token {
+            if token.load(Ordering::Relaxed) {
+                return Err(Error::Cancelled);
+            }
+        }
+        if let Some(t) = timeout {
+            if start.elapsed() > t {
+                return Err(Error::timeout(start.elapsed()));
+            }
+        }
+
+        result
+    }
+
+    /// Synthesize speech from text
     ///
     /// Text is automatically split at punctuation marks (like Python's cut5 method)
     /// and each segment is processed separately for better quality.
     /// Long segments are further chunked to prevent T2S attention degradation.
+    #[instrument(skip(self), fields(text_len = text.len()))]
     pub fn synthesize(&mut self, text: &str) -> Result<AudioOutput, Error> {
-        // Clone reference mel to avoid borrow issues
+        // ===== Input Validation =====
+        const MAX_TEXT_LENGTH: usize = 10_000;
+
+        // Check text is not empty
+        let text = text.trim();
+        if text.is_empty() {
+            return Err(Error::EmptyInput);
+        }
+
+        // Check text length
+        if text.len() > MAX_TEXT_LENGTH {
+            return Err(Error::text_too_long(text.len(), MAX_TEXT_LENGTH));
+        }
+
+        // Check reference is set
         let ref_mel = self.reference_mel.clone()
-            .ok_or_else(|| Error::Message("No reference audio set. Call set_reference_audio() first.".to_string()))?;
+            .ok_or(Error::ReferenceNotSet)?;
 
         // Split text using Python-compatible cut5 method:
         // Split at every punctuation mark, merge short segments (< 5 chars)
@@ -550,10 +704,10 @@ impl VoiceCloner {
         }
         chunks.retain(|c| !c.trim().is_empty());
 
-        // Debug: print chunks
-        eprintln!("📦 Chunks ({}):", chunks.len());
+        // Debug: log chunks
+        debug!(num_chunks = chunks.len(), "Text split into chunks");
         for (i, chunk) in chunks.iter().enumerate() {
-            eprintln!("   [{}]: \"{}\"", i, chunk);
+            trace!(chunk_idx = i, chunk = %chunk, "Chunk content");
         }
 
         // Phase 1: Generate semantic tokens for each chunk (T2S only, no VITS yet)
@@ -561,6 +715,7 @@ impl VoiceCloner {
         struct ChunkT2SResult {
             semantic_tokens: Vec<i32>,
             phone_ids: Array,
+            #[allow(dead_code)]
             num_tokens: usize,
         }
 
@@ -644,7 +799,6 @@ impl VoiceCloner {
             let sr = self.config.sample_rate as f32;
             let silence_duration = 0.3f32;
             let silence_samples = (sr * silence_duration) as usize;
-            let crossfade_samples = (sr * 0.05) as usize; // 50ms crossfade
 
             // Split output by chunk boundaries and join with silence (matching Python exactly).
             // Python: clip to [-1,1], append 0.3s silence after each chunk, concatenate. No trimming.
@@ -830,10 +984,9 @@ impl VoiceCloner {
 
     /// Generate semantic tokens for a chunk (zero-shot T2S only, no VITS).
     /// Returns (semantic_tokens, target_phone_ids).
-    fn generate_chunk_tokens_zero_shot(&mut self, text: &str, ref_mel: &Array, is_first_chunk: bool) -> Result<(Vec<i32>, Array), Error> {
+    fn generate_chunk_tokens_zero_shot(&mut self, text: &str, _ref_mel: &Array, is_first_chunk: bool) -> Result<(Vec<i32>, Array), Error> {
         // Reuse the same text preprocessing as synthesize_zero_shot
-        let text = if !text.is_empty() {
-            let first_char = text.chars().next().unwrap();
+        let text = if let Some(first_char) = text.chars().next() {
             let is_punct = matches!(first_char, ',' | '.' | '!' | '?' | '~' | ':' | '—' | '…' |
                                               '，' | '。' | '！' | '？' | '：');
             let is_english = first_char.is_ascii_alphabetic();
@@ -872,15 +1025,14 @@ impl VoiceCloner {
 
     /// Generate semantic tokens for a chunk (few-shot T2S only, no VITS).
     /// Returns (semantic_tokens, target_phone_ids).
-    fn generate_chunk_tokens(&mut self, text: &str, ref_mel: &Array, is_first_chunk: bool) -> Result<(Vec<i32>, Array), Error> {
+    fn generate_chunk_tokens(&mut self, text: &str, _ref_mel: &Array, is_first_chunk: bool) -> Result<(Vec<i32>, Array), Error> {
         let ref_text = self.reference_text.clone()
             .ok_or_else(|| Error::Message("Reference text not set".to_string()))?;
         let prompt_semantic = self.prompt_semantic.clone()
             .ok_or_else(|| Error::Message("Prompt semantic not set".to_string()))?;
 
         // Same text preprocessing as synthesize_few_shot
-        let text = if !text.is_empty() {
-            let first_char = text.chars().next().unwrap();
+        let text = if let Some(first_char) = text.chars().next() {
             let is_punct = matches!(first_char, ',' | '.' | '!' | '?' | '~' | ':' | '—' | '…' |
                                               '，' | '。' | '！' | '？' | '：');
             let is_english = first_char.is_ascii_alphabetic();
@@ -947,6 +1099,7 @@ impl VoiceCloner {
     }
 
     /// Zero-shot synthesis (no reference text, only reference audio for style)
+    #[allow(dead_code)]
     fn synthesize_zero_shot(&mut self, text: &str, ref_mel: &Array, is_first_chunk: bool) -> Result<AudioOutput, Error> {
         // Python keeps trailing punctuation as part of the phoneme sequence.
         // Do NOT strip it - it becomes the sentence delimiter phoneme.
@@ -954,8 +1107,7 @@ impl VoiceCloner {
         // Python's pre_seg_text: prepend punctuation if text doesn't start with one
         // and first segment is short (< 4 chars). This helps T2S model alignment.
         // Python: if (text[0] not in splits and len(get_first(text)) < 4): text = "。" + text
-        let text = if !text.is_empty() {
-            let first_char = text.chars().next().unwrap();
+        let text = if let Some(first_char) = text.chars().next() {
             let is_punct = matches!(first_char, ',' | '.' | '!' | '?' | '~' | ':' | '—' | '…' |
                                               '，' | '。' | '！' | '？' | '：');
             let is_english = first_char.is_ascii_alphabetic();
@@ -989,7 +1141,7 @@ impl VoiceCloner {
         // 2. BERT encoding - use normalized text (quotes/parentheses removed)
         let text_chars = text_normalized.chars().count();
         let word2ph_for_bert = &word2ph[..text_chars.min(word2ph.len())];
-        let mut bert_features = self.extract_bert_features(&text_normalized, word2ph_for_bert, phonemes.len())?;
+        let bert_features = self.extract_bert_features(&text_normalized, word2ph_for_bert, phonemes.len())?;
 
         // DEBUG: Print BERT features info
         eval([&bert_features]).map_err(|e| Error::Message(e.to_string()))?;
@@ -1030,6 +1182,7 @@ impl VoiceCloner {
     }
 
     /// Few-shot synthesis (with reference text and prompt semantic codes)
+    #[allow(dead_code)]
     fn synthesize_few_shot(&mut self, text: &str, ref_mel: &Array, is_first_chunk: bool) -> Result<AudioOutput, Error> {
         let ref_text = self.reference_text.clone()
             .ok_or_else(|| Error::Message("Reference text not set".to_string()))?;
@@ -1041,8 +1194,7 @@ impl VoiceCloner {
 
         // Python's pre_seg_text: prepend punctuation if text doesn't start with one
         // and first segment is short (< 4 chars). This helps T2S model alignment.
-        let text = if !text.is_empty() {
-            let first_char = text.chars().next().unwrap();
+        let text = if let Some(first_char) = text.chars().next() {
             let is_punct = matches!(first_char, ',' | '.' | '!' | '?' | '~' | ':' | '—' | '…' |
                                               '，' | '。' | '！' | '？' | '：');
             let is_english = first_char.is_ascii_alphabetic();
@@ -1093,7 +1245,7 @@ impl VoiceCloner {
         let target_text_trimmed = target_text_normalized.trim();
         let target_text_chars = target_text_trimmed.chars().count();
         let target_word2ph_for_bert = &target_word2ph[..target_text_chars.min(target_word2ph.len())];
-        let mut target_bert_features = self.extract_bert_features(target_text_trimmed, target_word2ph_for_bert, target_phonemes.len())?;
+        let target_bert_features = self.extract_bert_features(target_text_trimmed, target_word2ph_for_bert, target_phonemes.len())?;
 
         // 3. Combine: ref_phones + target_phones (NO extra period — Python doesn't append one)
         let combined_phoneme_ids = mlx_rs::ops::concatenate_axis(&[&ref_phoneme_ids, &target_phoneme_ids], 1)
@@ -1152,7 +1304,7 @@ impl VoiceCloner {
     /// - English sub-segments get zero features
     /// - All concatenated in order
     fn extract_bert_features(&mut self, text: &str, word2ph: &[i32], phoneme_count: usize) -> Result<Array, Error> {
-        use crate::text::{is_chinese_char, detect_language, Language};
+        use crate::text::{detect_language, Language};
 
         let language = detect_language(text);
         eprintln!("   [BERT] text='{}', detected={:?}", text, language);
@@ -1352,30 +1504,27 @@ impl VoiceCloner {
             .map_err(|e| Error::Message(e.to_string()))?;
         let eos_token = 1024;
 
+        // Create sampler with config
+        let sampling_config = SamplingConfig {
+            top_k: self.config.top_k,
+            top_p: self.config.top_p,
+            temperature: self.config.temperature,
+            repetition_penalty: self.config.repetition_penalty,
+            eos_token,
+        };
+        let mut sampler = Sampler::new(sampling_config);
+
         // Python masks EOS during first 11 tokens (idx < 11), so we mask here (idx=0)
         // IMPORTANT: For first token, DON'T apply penalty to prompt tokens
         // Python's behavior: penalty is only applied to previously GENERATED tokens
         // At step 0, there are no generated tokens yet, so no penalty
-        let mut token_id = sample_top_k_with_penalty(
-            &last_logits,
-            &[],  // No penalty for first token - no generated tokens yet
-            self.config.top_k,
-            self.config.top_p,
-            self.config.temperature,
-            self.config.repetition_penalty,
-            true,  // mask_eos for first token
-        )?;
+        let (mut token_id, _) = sampler.sample_with_eos_mask(&last_logits)?;
         semantic_ids = Array::from_slice(&[token_id], &[1, 1]);
         // all_tokens contains prompt + generated (Python behavior: returns prompts + new tokens to VITS)
         // This matches Python's infer_panel which returns pred_semantic that includes prompt semantic
         let prompt_len = prompt_tokens.len();
         let mut all_tokens: Vec<i32> = prompt_tokens.clone();
         all_tokens.push(token_id);
-        // IMPORTANT: Only penalize GENERATED tokens, not prompt tokens
-        // Python's behavior: penalty is applied to tokens BEFORE the current one
-        // This allows immediate repetition (e.g., [937, 937, ...]) which is natural in speech
-        // Start empty - first token's penalty was already applied above (with empty list)
-        let mut generated_tokens_for_penalty: Vec<i32> = vec![];
         // Track number of newly generated tokens (excluding prompt)
         let mut generated_count: usize = 1;
 
@@ -1383,7 +1532,7 @@ impl VoiceCloner {
         // Python generates ~5-8 tokens per phoneme for natural speech
         // Short text needs more tokens per phoneme for complete pronunciation
         let tokens_per_phoneme = if phoneme_count <= 10 { 6.0 } else { 4.0 };
-        let target_tokens = (phoneme_count as f32 * tokens_per_phoneme) as usize;
+        let _target_tokens = (phoneme_count as f32 * tokens_per_phoneme) as usize;
         let max_tokens = (phoneme_count * 10).max(100);
         // min_tokens: Allow EOS after generating at least 4 tokens per phoneme for short text
         let min_tokens = (phoneme_count as f32 * if phoneme_count <= 10 { 4.0 } else { 3.0 }) as usize;
@@ -1412,28 +1561,12 @@ impl VoiceCloner {
             // step=1 corresponds to Python idx=1, so mask_eos when step < 11
             let mask_eos = step < 11;
 
-            token_id = sample_top_k_with_penalty(
-                &last_logits,
-                &generated_tokens_for_penalty,
-                self.config.top_k,
-                self.config.top_p,
-                self.config.temperature,
-                self.config.repetition_penalty,
-                mask_eos,
-            )?;
-
-            // Compute argmax token for dual EOS detection (like Python)
-            let argmax_token = {
-                let logits_vec: Vec<f32> = last_logits.flatten(None, None)
-                    .map_err(|e| Error::Message(e.to_string()))?
-                    .as_slice()
-                    .to_vec();
-                logits_vec.iter()
-                    .enumerate()
-                    .max_by(|a, b| a.1.partial_cmp(b.1).unwrap())
-                    .map(|(i, _)| i as i32)
-                    .unwrap_or(0)
+            let (sampled, argmax_token) = if mask_eos {
+                sampler.sample_with_eos_mask(&last_logits)?
+            } else {
+                sampler.sample(&last_logits)?
             };
+            token_id = sampled;
 
             // EOS detection: match Python exactly (line 871):
             //   if torch.argmax(logits, dim=-1)[0] == self.EOS or samples[0, 0] == self.EOS:
@@ -1447,7 +1580,7 @@ impl VoiceCloner {
             }
 
             all_tokens.push(token_id);
-            generated_tokens_for_penalty.push(token_id);
+            sampler.add_token(token_id);
             generated_count += 1;
 
             // Repetition detection for longer patterns (check only generated portion)
@@ -1571,6 +1704,7 @@ impl VoiceCloner {
 }
 
 /// Compute word2ph (phonemes per character) for text
+#[allow(dead_code)]
 fn compute_word2ph(text: &str) -> Vec<i32> {
     let mut word2ph = Vec::new();
     for c in text.chars() {
@@ -1587,188 +1721,12 @@ fn compute_word2ph(text: &str) -> Vec<i32> {
     word2ph
 }
 
-/// Sample from logits using top-k and top-p (nucleus) sampling with optional repetition penalty
-///
-/// When `mask_eos` is true, the EOS token (1024) is masked out from sampling.
-/// Python does this during the first 11 tokens of generation to prevent early stopping.
-///
-/// Sampling order: repetition penalty → temperature → softmax → top-k → top-p → sample
-fn sample_top_k_with_penalty(
-    logits: &Array,
-    previous_tokens: &[i32],
-    top_k: i32,
-    top_p: f32,
-    temperature: f32,
-    repetition_penalty: f32,
-    mask_eos: bool,
-) -> Result<i32, Error> {
-    // Apply repetition penalty to previously used tokens
-    let mut logits_vec: Vec<f32> = logits.flatten(None, None)
-        .map_err(|e| Error::Message(e.to_string()))?
-        .as_slice()
-        .to_vec();
-
-    // Mask EOS token during early generation (Python: if idx < 11: logits = logits[:, :-1])
-    // This prevents early stopping and forces generation of at least 10 tokens (~0.4s audio)
-    if mask_eos && logits_vec.len() > 1024 {
-        logits_vec[1024] = f32::NEG_INFINITY;
-    }
-
-    if repetition_penalty != 1.0 && !previous_tokens.is_empty() {
-        use std::collections::HashSet;
-        let used_tokens: HashSet<i32> = previous_tokens.iter().cloned().collect();
-
-        // Apply standard repetition penalty to all used tokens
-        for &token in &used_tokens {
-            if token >= 0 && (token as usize) < logits_vec.len() {
-                let score = logits_vec[token as usize];
-                // Penalize: if score < 0, multiply by penalty; if score > 0, divide by penalty
-                logits_vec[token as usize] = if score < 0.0 {
-                    score * repetition_penalty
-                } else {
-                    score / repetition_penalty
-                };
-            }
-        }
-
-        // Note: Python allows immediate repetition (e.g., [937, 937, ...])
-        // Don't add extra penalty for immediate repetition as it breaks generation
-    }
-
-    // Match Python order: repetition_penalty → top_p → temperature → top_k → softmax → sample
-    // (Python: logits_to_probs applies rep_penalty, top_p, temperature, top_k, then softmax)
-
-    // top_p filtering (on logits, before temperature — matches Python line 130-140)
-    if top_p < 1.0 && top_p > 0.0 {
-        let mut indexed: Vec<(usize, f32)> = logits_vec.iter().cloned().enumerate().collect();
-        indexed.sort_by(|a, b| b.1.partial_cmp(&a.1).unwrap());
-        // Compute cumulative softmax probs on sorted logits
-        let max_val = indexed[0].1;
-        let sorted_probs: Vec<f32> = indexed.iter().map(|(_, v)| (v - max_val).exp()).collect();
-        let sum: f32 = sorted_probs.iter().sum();
-        let mut cumsum = 0.0f32;
-        let mut remove_set = std::collections::HashSet::new();
-        for (i, &(orig_idx, _)) in indexed.iter().enumerate() {
-            cumsum += sorted_probs[i] / sum;
-            if cumsum > top_p {
-                remove_set.insert(orig_idx);
-            }
-        }
-        for idx in remove_set {
-            logits_vec[idx] = f32::NEG_INFINITY;
-        }
-    }
-
-    // Apply temperature (Python line 142: logits = logits / temperature)
-    if temperature != 1.0 {
-        let t = temperature.max(1e-5);
-        for v in logits_vec.iter_mut() {
-            *v /= t;
-        }
-    }
-
-    // top_k filtering (on logits — Python line 144-147)
-    let effective_k = if top_k <= 0 { logits_vec.len() } else { top_k as usize };
-    if effective_k < logits_vec.len() {
-        let mut indexed: Vec<(usize, f32)> = logits_vec.iter().cloned().enumerate().collect();
-        indexed.sort_by(|a, b| b.1.partial_cmp(&a.1).unwrap());
-        let pivot = indexed[effective_k.min(indexed.len()) - 1].1;
-        for v in logits_vec.iter_mut() {
-            if *v < pivot {
-                *v = f32::NEG_INFINITY;
-            }
-        }
-    }
-
-    // Softmax (Python line 149)
-    let max_logit = logits_vec.iter().cloned().fold(f32::NEG_INFINITY, f32::max);
-    let exp_sum: f32 = logits_vec.iter().map(|v| (v - max_logit).exp()).sum();
-    let prob_vec: Vec<f32> = logits_vec.iter().map(|v| (v - max_logit).exp() / exp_sum).collect();
-
-    // Collect top items for sampling
-    let mut indexed: Vec<(usize, f32)> = prob_vec.iter().cloned().enumerate().collect();
-    indexed.sort_by(|a, b| b.1.partial_cmp(&a.1).unwrap());
-    let mut top_items: Vec<(usize, f32)> = indexed.into_iter()
-        .filter(|(_, p)| *p > 0.0)
-        .collect();
-
-    let total: f32 = top_items.iter().map(|(_, p)| p).sum();
-    let normalized: Vec<f32> = top_items.iter().map(|(_, p)| p / total).collect();
-
-    let rand_arr = random::uniform::<f32, f32>(0.0, 1.0, &[], None)
-        .map_err(|e| Error::Message(e.to_string()))?;
-    eval([&rand_arr]).map_err(|e| Error::Message(e.to_string()))?;
-    let r: f32 = rand_arr.item();
-
-    let mut cumsum = 0.0f32;
-    for (i, p) in normalized.iter().enumerate() {
-        cumsum += p;
-        if r < cumsum {
-            return Ok(top_items[i].0 as i32);
-        }
-    }
-
-    Ok(top_items[0].0 as i32)
-}
-
-/// Sample from logits using top-k sampling (no repetition penalty)
-fn sample_top_k(logits: &Array, top_k: i32, temperature: f32) -> Result<i32, Error> {
-    let scaled = if temperature != 1.0 {
-        logits.divide(mlx_rs::array!(temperature))
-            .map_err(|e| Error::Message(e.to_string()))?
-    } else {
-        logits.clone()
-    };
-    eval([&scaled]).map_err(|e| Error::Message(e.to_string()))?;
-
-    let flat_logits = scaled.flatten(None, None)
-        .map_err(|e| Error::Message(e.to_string()))?;
-    eval([&flat_logits]).map_err(|e| Error::Message(e.to_string()))?;
-
-    let probs = mlx_rs::ops::softmax_axis(&flat_logits, -1, None)
-        .map_err(|e| Error::Message(e.to_string()))?;
-    eval([&probs]).map_err(|e| Error::Message(e.to_string()))?;
-
-    let prob_vec: Vec<f32> = probs.as_slice().to_vec();
-
-    let mut indexed: Vec<(usize, f32)> = prob_vec.iter().cloned().enumerate().collect();
-    indexed.sort_by(|a, b| b.1.partial_cmp(&a.1).unwrap());
-    // If top_k <= 0, use full vocabulary (disabled top_k, like Python's -100)
-    let effective_k = if top_k <= 0 { indexed.len() } else { top_k as usize };
-    let top_k_items: Vec<(usize, f32)> = indexed.into_iter().take(effective_k).collect();
-
-    let total: f32 = top_k_items.iter().map(|(_, p)| p).sum();
-    let normalized: Vec<f32> = top_k_items.iter().map(|(_, p)| p / total).collect();
-
-    let rand_arr = random::uniform::<f32, f32>(0.0, 1.0, &[], None)
-        .map_err(|e| Error::Message(e.to_string()))?;
-    eval([&rand_arr]).map_err(|e| Error::Message(e.to_string()))?;
-    let r: f32 = rand_arr.item();
-
-    let mut cumsum = 0.0f32;
-    for (i, p) in normalized.iter().enumerate() {
-        cumsum += p;
-        if r < cumsum {
-            return Ok(top_k_items[i].0 as i32);
-        }
-    }
-
-    Ok(top_k_items[0].0 as i32)
-}
-
-/// Detect n-gram repetition
-fn detect_repetition(tokens: &[i32], n: usize, min_count: usize) -> bool {
-    if tokens.len() < n * 2 {
-        return false;
-    }
-    let last_n: Vec<i32> = tokens[tokens.len() - n..].to_vec();
-    tokens.windows(n).filter(|w| *w == last_n.as_slice()).count() >= min_count
-}
-
 /// Global language detector (lazy initialized)
 /// Uses lingua for ML-based language detection like Python's LangSegment
+#[allow(dead_code)]
 static LANG_DETECTOR: OnceLock<LanguageDetector> = OnceLock::new();
 
+#[allow(dead_code)]
 fn get_lang_detector() -> &'static LanguageDetector {
     LANG_DETECTOR.get_or_init(|| {
         LanguageDetectorBuilder::from_languages(&[
@@ -1873,11 +1831,10 @@ fn cut5_split(text: &str) -> Vec<String> {
         }
     }
     if !acc.is_empty() {
-        if result.is_empty() {
-            result.push(acc);
-        } else {
-            let last = result.last_mut().unwrap();
+        if let Some(last) = result.last_mut() {
             last.push_str(&acc);
+        } else {
+            result.push(acc);
         }
     }
 
@@ -1903,6 +1860,7 @@ fn cut5_split(text: &str) -> Vec<String> {
 ///
 /// This matches Python's LangSegment which uses regex for obvious patterns
 /// and py3langid for edge cases.
+#[allow(dead_code)]
 fn split_text_by_language(text: &str) -> Vec<String> {
     #[derive(Clone, Copy, PartialEq, Debug)]
     enum Lang { English, Cjk, Other }
@@ -2035,7 +1993,7 @@ fn split_text_by_language(text: &str) -> Vec<String> {
     // Step 4: Filter out segments that are too short (only punctuation, less than 2 actual characters)
     let result: Vec<String> = result.into_iter().filter(|s| {
         let content_chars = s.chars().filter(|c| {
-            !matches!(*c, ',' | '.' | ';' | '?' | '!' | '、' | '，' | '。' | '？' | '！' | '；' | '：' | '…' | '"' | '"' | '\'' | '（' | '）' | '(' | ')' | '《' | '》' | '【' | '】')
+            !matches!(*c, ',' | '.' | ';' | '?' | '!' | '、' | '，' | '。' | '？' | '！' | '；' | '：' | '…' | '\u{201C}' | '\u{201D}' | '\'' | '（' | '）' | '(' | ')' | '《' | '》' | '【' | '】')
         }).count();
         content_chars >= 2
     }).collect();
@@ -2052,19 +2010,21 @@ fn split_text_by_language(text: &str) -> Vec<String> {
         let content_chars: usize = seg.chars().filter(|c| is_cjk_char(*c)).count();
         let is_short_cjk = content_chars > 0 && content_chars <= 4;
 
-        if is_short_cjk && !merged.is_empty() {
-            // Check if we can merge with previous segment
-            let prev = merged.last().unwrap();
-            let prev_has_cjk = prev.chars().any(|c| is_cjk_char(c));
-            let prev_ends_with_punct = prev.chars().last()
-                .map(|c| matches!(c, '）' | ')' | '》' | '】' | '"'))
-                .unwrap_or(false);
+        if is_short_cjk {
+            if let Some(prev) = merged.last() {
+                // Check if we can merge with previous segment
+                let prev_has_cjk = prev.chars().any(|c| is_cjk_char(c));
+                let prev_ends_with_punct = prev.chars().last()
+                    .map(|c| matches!(c, '）' | ')' | '》' | '】' | '"'))
+                    .unwrap_or(false);
 
-            if prev_has_cjk || prev_ends_with_punct {
-                // Merge with previous segment
-                let prev = merged.pop().unwrap();
-                merged.push(format!("{}{}", prev, seg));
-                continue;
+                if prev_has_cjk || prev_ends_with_punct {
+                    // Merge with previous segment
+                    if let Some(prev) = merged.pop() {
+                        merged.push(format!("{}{}", prev, seg));
+                        continue;
+                    }
+                }
             }
         }
         merged.push(seg);
@@ -2080,6 +2040,7 @@ fn split_text_by_language(text: &str) -> Vec<String> {
 /// Estimate phoneme count for a text segment
 ///
 /// Rough estimation: Chinese chars ~2 phonemes, English words ~3-4 phonemes
+#[allow(dead_code)]
 fn estimate_phoneme_count(text: &str) -> usize {
     let mut count = 0;
     let mut in_english_word = false;
@@ -2108,6 +2069,7 @@ fn estimate_phoneme_count(text: &str) -> usize {
 /// Chunk segments that exceed max_phonemes by splitting at comma/space boundaries
 ///
 /// This prevents T2S attention degradation on very long sequences.
+#[allow(dead_code)]
 fn chunk_segments_by_length(segments: &[String], max_phonemes: usize) -> Vec<String> {
     let comma_chars: std::collections::HashSet<char> = ['，', ',', '、', '；', ';'].into_iter().collect();
 
@@ -2123,7 +2085,7 @@ fn chunk_segments_by_length(segments: &[String], max_phonemes: usize) -> Vec<Str
             // Split at comma/pause boundaries
             let mut current = String::new();
             let mut current_est = 0;
-            let mut last_split_point = 0;
+            let mut _last_split_point = 0;
             let chars: Vec<char> = segment.chars().collect();
 
             for (i, &c) in chars.iter().enumerate() {
@@ -2151,7 +2113,7 @@ fn chunk_segments_by_length(segments: &[String], max_phonemes: usize) -> Vec<Str
                             result.push(current.clone());
                             current.clear();
                             current_est = 0;
-                            last_split_point = i + 1;
+                            _last_split_point = i + 1;
                         }
                     }
                 }
@@ -2162,7 +2124,7 @@ fn chunk_segments_by_length(segments: &[String], max_phonemes: usize) -> Vec<Str
                         result.push(current.clone());
                         current.clear();
                         current_est = 0;
-                        last_split_point = i + 1;
+                        _last_split_point = i + 1;
                     }
                 }
             }

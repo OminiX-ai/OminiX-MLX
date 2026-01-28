@@ -41,13 +41,18 @@ fn print_help() {
     println!("============================");
     println!();
     println!("Usage:");
-    println!("  voice_clone \"text to speak\"              Synthesize and play text (zero-shot mode)");
+    println!("  voice_clone \"text to speak\"              Synthesize and play text");
     println!("  voice_clone \"text\" --ref FILE            Use custom reference audio");
     println!("  voice_clone \"text\" --ref-text \"text\"     Reference transcript (enables few-shot mode)");
     println!("  voice_clone \"text\" --codes FILE.bin      Use pre-computed prompt semantic codes");
     println!("  voice_clone \"text\" --output FILE.wav     Save to WAV file");
     println!("  voice_clone --interactive                 Interactive mode");
+    println!("  voice_clone --mlx-vits                    Use MLX VITS (not recommended)");
     println!("  voice_clone --help                        Show this help");
+    println!();
+    println!("VITS Backend:");
+    println!("  Default: ONNX VITS (batched decode, matches Python, best quality)");
+    println!("  --mlx-vits: Force MLX VITS (per-chunk decode, may have artifacts)");
     println!();
     println!("Examples:");
     println!("  voice_clone \"你好，世界！\"");
@@ -74,7 +79,7 @@ struct Args {
     output: Option<String>,
     interactive: bool,
     greedy: bool,
-    vits_onnx: Option<String>,
+    mlx_vits: bool,  // Force MLX VITS instead of default ONNX
 }
 
 fn parse_args() -> Args {
@@ -88,7 +93,7 @@ fn parse_args() -> Args {
     let mut output = None;
     let mut interactive = false;
     let mut greedy = false;
-    let mut vits_onnx = None;
+    let mut mlx_vits = false;
 
     let mut i = 0;
     while i < args.len() {
@@ -164,11 +169,9 @@ fn parse_args() -> Args {
             "--greedy" => {
                 greedy = true;
             }
-            "--vits-onnx" => {
-                if i + 1 < args.len() {
-                    vits_onnx = Some(args[i + 1].clone());
-                    i += 1;
-                }
+            "--mlx-vits" => {
+                // Force MLX VITS instead of default ONNX (not recommended)
+                mlx_vits = true;
             }
             arg if !arg.starts_with('-') => {
                 if text.is_none() {
@@ -180,7 +183,7 @@ fn parse_args() -> Args {
         i += 1;
     }
 
-    Args { text, ref_audio, ref_text, codes_path, tokens_path, output, interactive, greedy, vits_onnx }
+    Args { text, ref_audio, ref_text, codes_path, tokens_path, output, interactive, greedy, mlx_vits }
 }
 
 fn synthesize_and_play(cloner: &mut VoiceCloner, text: &str, output: Option<&str>) -> Result<(), Box<dyn std::error::Error>> {
@@ -287,9 +290,9 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
         config.noise_scale = 0.0;  // Deterministic VITS too
         println!("   Greedy mode: top_k=1, temperature=0.001, noise_scale=0.0");
     }
-    if let Some(ref onnx_path) = args.vits_onnx {
-        config.vits_onnx_path = Some(onnx_path.clone());
-        println!("   ONNX VITS: {}", onnx_path);
+    if args.mlx_vits {
+        config.use_mlx_vits = true;
+        println!("   Using MLX VITS (per-chunk decode) - not recommended");
     }
     let mut cloner = VoiceCloner::new(config)?;
     println!("   Models loaded in {:.1}ms", start.elapsed().as_secs_f64() * 1000.0);

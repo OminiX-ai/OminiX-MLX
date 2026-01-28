@@ -6,7 +6,7 @@
 
 use std::path::Path;
 
-use ort::{ep, inputs, session::Session, value::Tensor};
+use ort::{inputs, session::Session, value::Tensor};
 
 /// ONNX-based VITS decoder.
 pub struct VitsOnnx {

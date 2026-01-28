@@ -522,8 +522,6 @@ impl T2SModel {
     /// Audio rows: [0, 0, ..., causal    ]  (attend to text + causal audio)
     /// ```
     pub fn create_t2s_mask(&self, text_len: i32, audio_len: i32) -> Result<Array, Exception> {
-        let total_len = text_len + audio_len;
-
         // Text rows: attend to text (0), masked from audio (-inf)
         let text_to_text = Array::zeros::<f32>(&[text_len, text_len])?;
         let text_to_audio = Array::full::<f32>(&[text_len, audio_len], array!(f32::NEG_INFINITY))?;
@@ -977,8 +975,13 @@ where
         self.current_token = next_token.index((.., NewAxis));
         self.generated += 1;
 
-        // Periodic cache clearing
+        // Periodic cache clearing to prevent memory accumulation during long sequences
         if self.generated % 256 == 0 {
+            // SAFETY: mlx_clear_cache() is safe to call at any point. It clears the MLX
+            // computation graph cache, releasing memory from completed operations.
+            // This is called during single-threaded inference with no concurrent MLX
+            // operations, so there's no race condition risk. The function is idempotent
+            // and documented as safe to call from the MLX C API.
             unsafe {
                 mlx_sys::mlx_clear_cache();
             }

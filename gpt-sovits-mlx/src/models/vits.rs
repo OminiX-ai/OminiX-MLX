@@ -260,6 +260,7 @@ impl RelativeAttention {
     }
 
     /// Get relative embeddings for the given sequence length
+    #[allow(dead_code)]
     fn get_relative_embeddings(&self, rel_emb: &Array, length: i32) -> Result<Array, Exception> {
         let _max_rel_pos = 2 * self.window_size + 1;
         let pad_length = (length - (self.window_size + 1)).max(0);
@@ -280,6 +281,7 @@ impl RelativeAttention {
     }
 
     /// Matmul with relative keys: x[b,h,l,d] @ y[1,m,d].T -> [b,h,l,m]
+    #[allow(dead_code)]
     fn matmul_with_relative_keys(&self, x: &Array, y: &Array) -> Result<Array, Exception> {
         // y shape: [1, m, d] -> [1, 1, m, d] -> transpose to [1, 1, d, m]
         let y_exp = y.index((mlx_rs::ops::indexing::NewAxis, .., .., ..));
@@ -288,6 +290,7 @@ impl RelativeAttention {
     }
 
     /// Matmul with relative values: x[b,h,l,m] @ y[1,m,d] -> [b,h,l,d]
+    #[allow(dead_code)]
     fn matmul_with_relative_values(&self, x: &Array, y: &Array) -> Result<Array, Exception> {
         // y shape: [1, m, d] -> [1, 1, m, d]
         let y_exp = y.index((mlx_rs::ops::indexing::NewAxis, .., .., ..));
@@ -296,6 +299,7 @@ impl RelativeAttention {
 
     /// Convert relative position to absolute position
     /// x: [b, h, l, 2*l-1] -> [b, h, l, l]
+    #[allow(dead_code)]
     fn relative_position_to_absolute_position(&self, x: &Array) -> Result<Array, Exception> {
         let shape = x.shape();
         let batch = shape[0] as i32;
@@ -322,6 +326,7 @@ impl RelativeAttention {
 
     /// Convert absolute position to relative position
     /// x: [b, h, l, l] -> [b, h, l, 2*l-1]
+    #[allow(dead_code)]
     fn absolute_position_to_relative_position(&self, x: &Array) -> Result<Array, Exception> {
         let shape = x.shape();
         let batch = shape[0] as i32;
@@ -1070,7 +1075,7 @@ impl WNEncoder {
             None
         };
 
-        let mask_nlc = swap_axes(mask, 1, 2)?;
+        let _mask_nlc = swap_axes(mask, 1, 2)?;
         let mut h = x.clone();
 
         for (i, (in_layer, res_skip)) in self
@@ -1366,7 +1371,7 @@ impl HiFiGANGenerator {
 
         let mut ups = Vec::new();
         let mut ch = config.upsample_initial_channel;
-        for (i, (&u, &k)) in config
+        for (_i, (&u, &k)) in config
             .upsample_rates
             .iter()
             .zip(config.upsample_kernel_sizes.iter())
@@ -1384,9 +1389,9 @@ impl HiFiGANGenerator {
 
         let mut resblocks = Vec::new();
         ch = config.upsample_initial_channel;
-        for i in 0..config.upsample_rates.len() {
+        for _i in 0..config.upsample_rates.len() {
             ch = ch / 2;
-            for (j, (k, d)) in config
+            for (_j, (k, d)) in config
                 .resblock_kernel_sizes
                 .iter()
                 .zip(config.resblock_dilation_sizes.iter())
@@ -1713,8 +1718,6 @@ impl SynthesizerTrn {
         noise_scale: f32,
         _speed: f32,
     ) -> Result<Array, Exception> {
-        use mlx_rs::transforms::eval;
-
         // Get style embedding from reference
         // For v2, slice to first 704 channels: refer[:, :704, :]
         let ge = if let Some(r) = refer {

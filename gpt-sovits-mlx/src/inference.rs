@@ -170,7 +170,7 @@ where
     let batch_size = phoneme_ids.shape()[0];
 
     // Initialize with start token (0)
-    let mut current_token = Array::zeros::<i32>(&[batch_size, 1])
+    let current_token = Array::zeros::<i32>(&[batch_size, 1])
         .map_err(|e| Error::Message(format!("Failed to create start token: {e}")))?;
     let mut all_tokens = vec![current_token.clone()];
 

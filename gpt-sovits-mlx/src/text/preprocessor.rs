@@ -14,11 +14,11 @@ use std::sync::OnceLock;
 
 use pinyin::ToPinyin;
 
-use super::erhua::{merge_erhua, MUST_ERHUA, NOT_ERHUA};
+use super::erhua::{MUST_ERHUA, NOT_ERHUA};
 use super::g2pw::get_pinyin_with_g2pw;
 use super::symbols::{self, bos_id, eos_id, has_symbol, symbol_to_id};
 use super::tone_sandhi::{ToneSandhi, WordSegment, pre_merge_for_modify};
-use super::jieba_seg::{cut_with_pos, Segment};
+use super::jieba_seg::cut_with_pos;
 use super::text_normalizer::mix_text_normalize;
 
 /// Detected language
@@ -373,7 +373,6 @@ fn normalize_numbers_to_chinese(text: &str) -> String {
             if !num_buffer.is_empty() {
                 let next_char = Some(c);
                 flush_number_buffer(&mut result, &mut num_buffer, is_negative, next_char);
-                is_negative = false;
             }
             is_negative = true;
             i += 1;
@@ -469,7 +468,8 @@ fn is_punctuation(c: char) -> bool {
         '?' | '@' | '[' | '\\' | ']' | '^' | '_' | '`' | '{' | '|' |
         '}' | '~' | ' ' |
         // Chinese punctuation
-        '，' | '。' | '！' | '？' | '、' | '；' | '：' | '"' | '"' |
+        '，' | '。' | '！' | '？' | '、' | '；' | '：' |
+        '\u{201C}' | '\u{201D}' |  // " " (curly double quotes)
         '\u{2018}' | '\u{2019}' |  // ' ' (curly single quotes)
         '（' | '）' | '【' | '】' | '《' | '》' | '—' |
         '…' | '·' | '「' | '」' | '『' | '』' | '〈' | '〉'
@@ -699,7 +699,7 @@ fn get_polyphonic_dict() -> &'static HashMap<String, Vec<String>> {
 
 /// Apply polyphone corrections based on word context
 fn apply_polyphone_corrections(chars: &[char], pinyins: &mut [Option<String>]) {
-    let text: String = chars.iter().collect();
+    let _text: String = chars.iter().collect();
 
     // First, apply corrections from the external polyphonic dictionary
     let poly_dict = get_polyphonic_dict();
@@ -954,6 +954,7 @@ fn replace_fraction(text: &str) -> String {
 /// Convert date formats to Chinese
 /// e.g., "2024年1月15日" stays as-is (numbers converted)
 /// e.g., "2024-01-15" → "二零二四年一月十五日"
+#[allow(dead_code)]
 fn replace_date(text: &str) -> String {
     // ISO format: 2024-01-15 or 2024/01/15
     let re = regex::Regex::new(r"(\d{4})[-/.](\d{1,2})[-/.](\d{1,2})").unwrap();
@@ -981,6 +982,7 @@ fn replace_date(text: &str) -> String {
 
 /// Convert time formats to Chinese
 /// e.g., "14:30" → "十四点三十分", "14:30:00" → "十四点三十分"
+#[allow(dead_code)]
 fn replace_time(text: &str) -> String {
     let re = regex::Regex::new(r"(\d{1,2}):(\d{2})(?::(\d{2}))?").unwrap();
     re.replace_all(text, |caps: &regex::Captures| {
@@ -1011,6 +1013,7 @@ fn replace_time(text: &str) -> String {
 
 /// Convert numeric ranges to Chinese
 /// e.g., "1-10" → "一到十", "0.5~1.5" → "零点五到一点五"
+#[allow(dead_code)]
 fn replace_range(text: &str) -> String {
     let re = regex::Regex::new(r"(-?\d+(?:\.\d+)?)\s*[-~]\s*(-?\d+(?:\.\d+)?)").unwrap();
     re.replace_all(text, |caps: &regex::Captures| {
@@ -1027,6 +1030,7 @@ fn replace_range(text: &str) -> String {
 
 /// Convert temperature to Chinese
 /// e.g., "-3°C" → "零下三摄氏度", "25℃" → "二十五度"
+#[allow(dead_code)]
 fn replace_temperature(text: &str) -> String {
     let re = regex::Regex::new(r"(-?)(\d+(?:\.\d+)?)\s*(°C|℃|度|摄氏度)").unwrap();
     re.replace_all(text, |caps: &regex::Captures| {
@@ -1106,6 +1110,7 @@ fn replace_measure_units(text: &str) -> String {
 
 /// Convert circled numbers to Chinese
 /// e.g., "①" → "一", "②" → "二"
+#[allow(dead_code)]
 fn replace_circled_numbers(text: &str) -> String {
     let replacements = [
         ('①', '一'), ('②', '二'), ('③', '三'), ('④', '四'), ('⑤', '五'),
@@ -1120,6 +1125,7 @@ fn replace_circled_numbers(text: &str) -> String {
 }
 
 /// Convert Greek letters to Chinese pronunciation
+#[allow(dead_code)]
 fn replace_greek_letters(text: &str) -> String {
     let replacements = [
         ('α', "阿尔法"), ('β', "贝塔"), ('γ', "伽玛"), ('δ', "德尔塔"),
@@ -1139,6 +1145,7 @@ fn replace_greek_letters(text: &str) -> String {
 
 /// Convert math operators to Chinese
 /// e.g., "+" → "加", "=" → "等于"
+#[allow(dead_code)]
 fn replace_math_operators(text: &str) -> String {
     // Only replace standalone operators, not in numeric context
     let mut result = text.to_string();
@@ -1156,6 +1163,7 @@ fn replace_math_operators(text: &str) -> String {
 
 /// Replace slash with 每 (per)
 /// e.g., "km/h" → "千米每小时"
+#[allow(dead_code)]
 fn replace_slash(text: &str) -> String {
     // Replace / with 每 in unit contexts
     let re = regex::Regex::new(r"(\p{Han}+)/(\p{Han}+)").unwrap();
@@ -1191,7 +1199,7 @@ fn apply_word_level_tone_sandhi(text: &str, pinyins: &mut [Option<String>]) {
         // Skip non-Chinese segments
         if word_len == 0 || !word_chars.iter().any(|c| is_chinese_char(*c)) {
             // Still advance char_idx for non-Chinese chars
-            for c in word.chars() {
+            for _c in word.chars() {
                 if char_idx < pinyins.len() {
                     char_idx += 1;
                 }
@@ -1527,7 +1535,7 @@ pub fn chinese_g2p(text: &str) -> (Vec<String>, Vec<i32>) {
                 '-' | '—' | '–' => Some("-"),
                 // Skip brackets and other punctuation entirely - don't produce SP
                 '（' | '）' | '《' | '》' | '【' | '】' | '「' | '」' | '『' | '』' | '〈' | '〉'
-                | '"' | '"' | '：' | '；' | '…' => None,
+                | '\u{201C}' | '\u{201D}' | '：' | '；' | '…' => None,
                 _ => None,  // Skip unknown punctuation
             };
             if let Some(ph) = punct_phoneme {
@@ -1592,7 +1600,7 @@ pub fn english_g2p(text: &str) -> (Vec<String>, Vec<i32>) {
     let mut chars = text.chars().peekable();
 
     while let Some(c) = chars.next() {
-        if c.is_ascii_alphabetic() || c == '\'' {
+        if c.is_ascii_alphabetic() {
             // Flush any pending number
             if !current_number.is_empty() {
                 let num_phonemes = number_to_english_phonemes(&current_number);
@@ -1603,6 +1611,19 @@ pub fn english_g2p(text: &str) -> (Vec<String>, Vec<i32>) {
                 current_number.clear();
             }
             current_word.push(c);
+        } else if c == '\'' {
+            // Apostrophe: Python tokenizes it separately, then replace_phs maps ' -> '-'
+            // Flush current word first
+            if !current_word.is_empty() {
+                let word_phonemes = g2p_en::word_to_phonemes(&current_word);
+                let count = word_phonemes.len() as i32;
+                phonemes.extend(word_phonemes);
+                word2ph.push(count);
+                current_word.clear();
+            }
+            // Emit '-' phoneme for apostrophe
+            phonemes.push("-".to_string());
+            word2ph.push(1);
         } else if c.is_ascii_digit() {
             // Flush any pending word
             if !current_word.is_empty() {
@@ -1827,6 +1848,7 @@ pub fn mixed_g2p(text: &str) -> (Vec<String>, Vec<i32>) {
 /// where uppercase concatenated English is split into individual letters.
 /// Each letter gets its CMU dict pronunciation (the letter name, not the sound).
 /// Punctuation is kept as-is.
+#[allow(dead_code)]
 fn english_letter_spell(text: &str) -> (Vec<String>, Vec<i32>) {
     use super::g2p_en;
 
