@@ -42,7 +42,8 @@ lazy_static = "1.4"  # For global singletons (segmenter, etc.)
 jieba-rs = { version = "0.7", optional = true }
 
 # G2PW (ONNX)
-ort = { version = "2.0.0-rc.11", default-features = false, features = ["std", "download-binaries", "tls-native", "coreml"] }
+ort = { version = "2.0.0-rc.11", default-features = false, features = ["std", "download-binaries", "tls-native", "coreml", "ndarray"] }
+ndarray = "0.17.2"
 
 [features]
 default = []

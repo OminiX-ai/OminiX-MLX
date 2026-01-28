@@ -103,6 +103,8 @@ pub struct VoiceClonerConfig {
     pub noise_scale: f32,
     /// Speed factor (1.0 = normal)
     pub speed: f32,
+    /// Optional path to ONNX VITS model for batched decode (eliminates per-chunk noise)
+    pub vits_onnx_path: Option<String>,
 }
 
 impl Default for VoiceClonerConfig {
@@ -121,6 +123,7 @@ impl Default for VoiceClonerConfig {
             repetition_penalty: 1.35,  // Match Python TTS.py default
             noise_scale: 0.5,
             speed: 1.0,
+            vits_onnx_path: None,
         }
     }
 }
@@ -196,6 +199,8 @@ pub struct VoiceCloner {
     prompt_semantic: Option<Array>,
     /// Reference text for few-shot mode
     reference_text: Option<String>,
+    /// Optional ONNX VITS for batched decode
+    vits_onnx: Option<crate::models::vits_onnx::VitsOnnx>,
 }
 
 impl VoiceCloner {
@@ -233,6 +238,19 @@ impl VoiceCloner {
             None
         };
 
+        // Try to load ONNX VITS if path provided
+        let vits_onnx = if let Some(ref onnx_path) = config.vits_onnx_path {
+            match crate::models::vits_onnx::VitsOnnx::load(std::path::Path::new(onnx_path)) {
+                Ok(v) => Some(v),
+                Err(e) => {
+                    eprintln!("Warning: Failed to load ONNX VITS: {}. Falling back to MLX.", e);
+                    None
+                }
+            }
+        } else {
+            None
+        };
+
         Ok(Self {
             config,
             t2s_config,
@@ -245,6 +263,7 @@ impl VoiceCloner {
             reference_path: None,
             prompt_semantic: None,
             reference_text: None,
+            vits_onnx,
         })
     }
 
@@ -522,7 +541,14 @@ impl VoiceCloner {
 
         // Split text using Python-compatible cut5 method:
         // Split at every punctuation mark, merge short segments (< 5 chars)
-        let chunks = cut5_split(text);
+        let mut chunks = cut5_split(text);
+
+        // Trim whitespace from chunks (cut5_split already appends 。 and filters)
+        for chunk in chunks.iter_mut() {
+            let trimmed = chunk.trim().to_string();
+            *chunk = trimmed;
+        }
+        chunks.retain(|c| !c.trim().is_empty());
 
         // Debug: print chunks
         eprintln!("📦 Chunks ({}):", chunks.len());
@@ -530,70 +556,394 @@ impl VoiceCloner {
             eprintln!("   [{}]: \"{}\"", i, chunk);
         }
 
-        // Process each chunk separately
-        let mut all_samples = Vec::new();
+        // Phase 1: Generate semantic tokens for each chunk (T2S only, no VITS yet)
+        // Python (speed==1.0) concatenates all semantic tokens + all phone IDs and calls VITS once
+        struct ChunkT2SResult {
+            semantic_tokens: Vec<i32>,
+            phone_ids: Array,
+            num_tokens: usize,
+        }
+
+        let mut chunk_results: Vec<ChunkT2SResult> = Vec::new();
         let mut total_tokens = 0;
 
         for (i, chunk) in chunks.iter().enumerate() {
-            // Strip brackets from chunk edges - they don't produce phonemes but can cause artifacts
-            let chunk = chunk.trim_matches(|c: char| {
-                matches!(c, '（' | '）' | '《' | '》' | '【' | '】' | '「' | '」' | '『' | '』' | '〈' | '〉'
-                         | '(' | ')' | '[' | ']' | '{' | '}' | '"' | '"' | '\'' | '"' | ' ')
-            });
-
             if chunk.trim().is_empty() {
                 continue;
             }
 
-            // Use few-shot mode if reference text and prompt semantic codes are available
             let is_few_shot = self.is_few_shot_mode();
             let preview: String = chunk.chars().take(15).collect();
             eprintln!("   Processing chunk [{}]: few_shot={}, text=\"{}...\"", i, is_few_shot, preview);
-            let chunk_output = if is_few_shot {
-                self.synthesize_few_shot(&chunk, &ref_mel, i == 0)?
+
+            let (tokens, phone_ids) = if is_few_shot {
+                self.generate_chunk_tokens(&chunk, &ref_mel, i == 0)?
             } else {
-                self.synthesize_zero_shot(&chunk, &ref_mel, i == 0)?
+                self.generate_chunk_tokens_zero_shot(&chunk, &ref_mel, i == 0)?
             };
 
-            eprintln!("   Chunk [{}]: {} tokens, {:.2}s", i, chunk_output.num_tokens, chunk_output.duration);
-            total_tokens += chunk_output.num_tokens;
-            all_samples.extend(chunk_output.samples);
+            eprintln!("   Chunk [{}]: {} tokens", i, tokens.len());
+            total_tokens += tokens.len();
+            chunk_results.push(ChunkT2SResult {
+                semantic_tokens: tokens,
+                phone_ids,
+                num_tokens: 0,
+            });
+        }
 
-            // Insert silence between chunks (Python uses 300ms = 0.3s)
-            // This prevents artifacts at chunk boundaries
-            let silence_duration = 0.3; // seconds
-            let silence_samples = (self.config.sample_rate as f32 * silence_duration) as usize;
+        // Phase 2: VITS decode
+        // If ONNX VITS is available, use batched decode (all chunks in one call).
+        // Otherwise, fall back to per-chunk MLX decode with tail trimming.
+        if let Some(ref mut vits_onnx) = self.vits_onnx {
+            // Concatenate all chunks' semantic tokens and phone IDs (like Python)
+            let all_tokens: Vec<i32> = chunk_results.iter()
+                .flat_map(|r| r.semantic_tokens.iter().copied())
+                .collect();
+
+            let mut all_phones: Vec<i32> = Vec::new();
+            for result in &chunk_results {
+                let phone_arr = &result.phone_ids;
+                eval([phone_arr]).map_err(|e| Error::Message(e.to_string()))?;
+                let flat = phone_arr.flatten(None, None).map_err(|e| Error::Message(e.to_string()))?;
+                eval([&flat]).map_err(|e| Error::Message(e.to_string()))?;
+                let phone_slice: &[i32] = flat.as_slice();
+                all_phones.extend_from_slice(phone_slice);
+            }
+
+            // Extract ref_mel data
+            eval([&ref_mel]).map_err(|e| Error::Message(e.to_string()))?;
+            let mel_shape = ref_mel.shape().to_vec();
+            let mel_channels = mel_shape[1] as usize; // 704
+            let mel_time = mel_shape[2] as usize;
+            let mel_flat = ref_mel.flatten(None, None).map_err(|e| Error::Message(e.to_string()))?;
+            eval([&mel_flat]).map_err(|e| Error::Message(e.to_string()))?;
+            let mel_data: &[f32] = mel_flat.as_slice();
+
+            // Debug: per-chunk breakdown
+            for (i, result) in chunk_results.iter().enumerate() {
+                let phone_arr = &result.phone_ids;
+                eval([phone_arr]).map_err(|e| Error::Message(e.to_string()))?;
+                let flat = phone_arr.flatten(None, None).map_err(|e| Error::Message(e.to_string()))?;
+                eval([&flat]).map_err(|e| Error::Message(e.to_string()))?;
+                let ps: &[i32] = flat.as_slice();
+                eprintln!("[ONNX] Chunk[{}]: {} tokens, {} phones, tokens[..10]={:?}",
+                         i, result.semantic_tokens.len(), ps.len(),
+                         &result.semantic_tokens[..result.semantic_tokens.len().min(10)]);
+            }
+            eprintln!("[ONNX] Batched decode: {} tokens, {} phones, refer=[1,{},{}]",
+                     all_tokens.len(), all_phones.len(), mel_channels, mel_time);
+
+            let raw_samples = vits_onnx.decode(
+                &all_tokens, &all_phones, mel_data, mel_channels, mel_time,
+                self.config.noise_scale,
+            ).map_err(|e| Error::Message(format!("ONNX VITS decode failed: {}", e)))?;
+
+            // Split ONNX output by chunk boundaries and apply per-chunk tail trimming.
+            // Each chunk produces tokens * 2 * 640 samples (2x upsample, hop_length=640).
+            let upsample_factor = 2 * 640;
+            let sr = self.config.sample_rate as f32;
+            let silence_duration = 0.3f32;
+            let silence_samples = (sr * silence_duration) as usize;
+            let crossfade_samples = (sr * 0.05) as usize; // 50ms crossfade
+
+            // Split output by chunk boundaries and join with silence (matching Python exactly).
+            // Python: clip to [-1,1], append 0.3s silence after each chunk, concatenate. No trimming.
+            let mut all_samples: Vec<f32> = Vec::new();
+            let mut pos = 0usize;
+
+            for (i, result) in chunk_results.iter().enumerate() {
+                let chunk_len = result.semantic_tokens.len() * upsample_factor;
+                let end = (pos + chunk_len).min(raw_samples.len());
+                let mut samples = raw_samples[pos..end].to_vec();
+                pos = end;
+
+                // Clipping prevention (same as Python)
+                let max_abs = samples.iter().map(|s| s.abs()).fold(0.0f32, f32::max);
+                if max_abs > 1.0 {
+                    for s in samples.iter_mut() {
+                        *s /= max_abs;
+                    }
+                }
+
+                eprintln!("   [ONNX] Chunk [{}]: {} tokens -> {} samples",
+                         i, result.semantic_tokens.len(), samples.len());
+
+                // Append chunk audio + 0.3s silence (matching Python's fragment_interval=0.3)
+                all_samples.extend_from_slice(&samples);
+                all_samples.extend(std::iter::repeat(0.0f32).take(silence_samples));
+            }
+
+            let duration = all_samples.len() as f32 / sr;
+            return Ok(AudioOutput {
+                samples: all_samples,
+                sample_rate: self.config.sample_rate,
+                duration,
+                num_tokens: total_tokens,
+            });
+        }
+
+        // Fallback: Per-chunk VITS with tail trimming and crossfade
+        // Each chunk is decoded individually to avoid VITS attention artifacts from
+        // concatenating independent T2S sequences.
+        let sr = self.config.sample_rate as f32;
+        let silence_duration = 0.3f32; // seconds of silence between chunks
+        let silence_samples = (sr * silence_duration) as usize;
+        let crossfade_samples = (sr * 0.05) as usize; // 50ms crossfade
+
+        let mut all_samples: Vec<f32> = Vec::new();
+
+        for (i, result) in chunk_results.iter().enumerate() {
+            let audio = self.vocode(&result.semantic_tokens, &result.phone_ids, &ref_mel)?;
+            let mut samples = array_to_f32_samples(&audio)?;
+
+            // Clipping prevention
+            let max_abs = samples.iter().map(|s| s.abs()).fold(0.0f32, f32::max);
+            if max_abs > 1.0 {
+                for s in samples.iter_mut() {
+                    *s /= max_abs;
+                }
+            }
+
+            // Trim trailing artifacts from T2S over-generation.
+            // Problem pattern: speech ends, then silence gap, then noise burst, then fade.
+            // E.g., chunk 2 "合并，": speech at 0-5.5s, silence at 5.75-6.0s,
+            // noise burst at 6.25-6.75s, fade at 7.0-7.4s.
+            //
+            // Strategy: Compute RMS in 50ms windows from the end. Walk backwards
+            // through: (1) trailing silence, (2) any noise burst, (3) a silence gap.
+            // If we find pattern "silence gap -> burst -> trailing silence", cut at the
+            // silence gap. Otherwise just trim trailing silence.
+            let win = (sr * 0.05) as usize; // 50ms window
+            let n_windows = samples.len() / win;
+            let mut trim_pos = samples.len();
+
+            if n_windows > 4 {
+                // Compute RMS per window
+                let rms_vals: Vec<f32> = (0..n_windows).map(|w| {
+                    let start = w * win;
+                    let end = (start + win).min(samples.len());
+                    let slice = &samples[start..end];
+                    (slice.iter().map(|s| s * s).sum::<f32>() / slice.len() as f32).sqrt()
+                }).collect();
+
+                // Walk backwards to find the last "real speech" window
+                // Real speech: RMS > 0.03, and it's part of the main content
+                // (not an isolated burst after silence)
+                let speech_thresh = 0.03f32;
+                let silence_thresh = 0.01f32;
+
+                // Find the cut point by detecting "silence gap after speech"
+                // Walk backwards: skip trailing silence, skip any burst, find silence gap
+                let mut w = n_windows - 1;
+
+                // Phase 1: Skip trailing silence
+                while w > 0 && rms_vals[w] < silence_thresh {
+                    w -= 1;
+                }
+                let last_energy = w; // last window with energy
+
+                // Phase 2: Check if there's a silence gap before this energy block
+                // Walk backwards through the energy block
+                while w > 0 && rms_vals[w] >= silence_thresh {
+                    w -= 1;
+                }
+                let energy_block_start = w + 1;
+
+                // Phase 3: Check if there's a silence gap here
+                let mut gap_count = 0;
+                while w > 0 && rms_vals[w] < silence_thresh {
+                    gap_count += 1;
+                    w -= 1;
+                }
+                let gap_end_window = w + 1; // first window of the silence gap
+
+                // Phase 4: Check if there's speech BEFORE the gap
+                let has_speech_before_gap = w > 2 && rms_vals[..=w].iter().any(|&r| r > speech_thresh);
+
+                // Decision: if there's a silence gap (>= 100ms = 2 windows) between
+                // speech and an isolated energy block, cut at the gap.
+                // Only cut if the burst is short (<20% of total) — long blocks are real speech.
+                let burst_len = last_energy.saturating_sub(energy_block_start) + 1;
+                let burst_is_short = burst_len < n_windows / 5;
+
+                let trim_window_idx = if gap_count >= 2 && has_speech_before_gap && burst_is_short {
+                    // Cut at the start of the silence gap, with small margin
+                    let cut_at = gap_end_window + 1; // keep 1 window into the gap for decay
+                    eprintln!("   [TRIM] Chunk {}: detected silence gap at window {} ({}ms), cutting burst ({} wins) at {}-{}",
+                             i, gap_end_window, gap_end_window * 50, burst_len, energy_block_start, last_energy);
+                    cut_at.min(n_windows)
+                } else {
+                    // No gap pattern — just trim trailing silence
+                    (last_energy + 2).min(n_windows) // +2 windows (100ms) margin
+                };
+
+                let trim_pos_new = (trim_window_idx * win).min(samples.len());
+
+                // Apply fade-out over last 30ms
+                let fadeout_len = (sr * 0.03) as usize;
+                let fade_start = trim_pos_new.saturating_sub(fadeout_len);
+                for j in fade_start..trim_pos_new {
+                    let t = (trim_pos_new - j) as f32 / fadeout_len as f32;
+                    samples[j] *= t;
+                }
+                // Zero out everything after trim
+                for j in trim_pos_new..samples.len() {
+                    samples[j] = 0.0;
+                }
+                trim_pos = trim_pos_new;
+            }
+
+            let trimmed = &samples[..trim_pos];
+            eprintln!("   Chunk [{}]: {} tokens -> {} samples (trimmed from {})",
+                     i, result.semantic_tokens.len(), trimmed.len(), samples.len());
+
+            // Crossfade with previous chunk's tail
+            if !all_samples.is_empty() && crossfade_samples > 0 {
+                // Remove trailing silence we just added, crossfade into it
+                let overlap = crossfade_samples.min(all_samples.len()).min(trimmed.len());
+                let base_start = all_samples.len() - overlap;
+                for j in 0..overlap {
+                    let t = j as f32 / overlap as f32; // 0->1
+                    all_samples[base_start + j] = all_samples[base_start + j] * (1.0 - t) + trimmed[j] * t;
+                }
+                all_samples.extend_from_slice(&trimmed[overlap..]);
+            } else {
+                all_samples.extend_from_slice(trimmed);
+            }
+
+            // Add silence after chunk
             all_samples.extend(vec![0.0f32; silence_samples]);
         }
 
         // Combine all samples into final output
         let duration = all_samples.len() as f32 / self.config.sample_rate as f32;
-        let mut output = AudioOutput {
+        let output = AudioOutput {
             samples: all_samples,
             sample_rate: self.config.sample_rate,
             duration,
             num_tokens: total_tokens,
         };
 
-        // Apply fade in/out like Python (10 samples each)
-        // Python: moyoyo_tts_wrapper_streaming_fix.py lines 318-328
-        let fade_len = 10.min(output.samples.len() / 2);
-        if fade_len > 0 {
-            // Fade in first 10 samples
-            for i in 0..fade_len {
-                let factor = i as f32 / fade_len as f32;
-                output.samples[i] *= factor;
-            }
-            // Fade out last 10 samples
-            let start = output.samples.len() - fade_len;
-            for i in 0..fade_len {
-                let factor = 1.0 - (i as f32 / fade_len as f32);
-                output.samples[start + i] *= factor;
-            }
-        }
-
 
         Ok(output)
+    }
+
+    /// Generate semantic tokens for a chunk (zero-shot T2S only, no VITS).
+    /// Returns (semantic_tokens, target_phone_ids).
+    fn generate_chunk_tokens_zero_shot(&mut self, text: &str, ref_mel: &Array, is_first_chunk: bool) -> Result<(Vec<i32>, Array), Error> {
+        // Reuse the same text preprocessing as synthesize_zero_shot
+        let text = if !text.is_empty() {
+            let first_char = text.chars().next().unwrap();
+            let is_punct = matches!(first_char, ',' | '.' | '!' | '?' | '~' | ':' | '—' | '…' |
+                                              '，' | '。' | '！' | '？' | '：');
+            let is_english = first_char.is_ascii_alphabetic();
+            let punct_chars = [',', '.', '!', '?', '~', ':', '—', '…', '，', '。', '！', '？', '：'];
+            let first_segment_len = text.chars()
+                .take_while(|c| !punct_chars.contains(c))
+                .count();
+
+            if is_first_chunk && !is_punct && is_english {
+                format!(", {}", text)
+            } else if is_first_chunk && !is_punct && first_segment_len < 4 {
+                eprintln!("   [zero-shot] Short first segment ({}): prepending '.'", first_segment_len);
+                format!(".{}", text)
+            } else {
+                text.to_string()
+            }
+        } else {
+            text.to_string()
+        };
+
+        let (phoneme_ids, phonemes, word2ph, text_normalized) = preprocess_text_with_lang(&text, Some(crate::text::Language::Chinese));
+        eprintln!("   Phonemes: {:?}", &phonemes[..phonemes.len().min(30)]);
+        eprintln!("   Normalized: \"{}\"", text_normalized);
+
+        let text_chars = text_normalized.chars().count();
+        let word2ph_for_bert = &word2ph[..text_chars.min(word2ph.len())];
+        let bert_features = self.extract_bert_features(&text_normalized, word2ph_for_bert, phonemes.len())?;
+
+        let (all_tokens, generated_count) = self.generate_semantic_tokens(&phoneme_ids, &bert_features, phonemes.len(), None)?;
+        let tokens = all_tokens[all_tokens.len().saturating_sub(generated_count)..].to_vec();
+
+        eprintln!("   Semantic tokens ({}): {:?}", tokens.len(), &tokens[..tokens.len().min(20)]);
+
+        Ok((tokens, phoneme_ids))
+    }
+
+    /// Generate semantic tokens for a chunk (few-shot T2S only, no VITS).
+    /// Returns (semantic_tokens, target_phone_ids).
+    fn generate_chunk_tokens(&mut self, text: &str, ref_mel: &Array, is_first_chunk: bool) -> Result<(Vec<i32>, Array), Error> {
+        let ref_text = self.reference_text.clone()
+            .ok_or_else(|| Error::Message("Reference text not set".to_string()))?;
+        let prompt_semantic = self.prompt_semantic.clone()
+            .ok_or_else(|| Error::Message("Prompt semantic not set".to_string()))?;
+
+        // Same text preprocessing as synthesize_few_shot
+        let text = if !text.is_empty() {
+            let first_char = text.chars().next().unwrap();
+            let is_punct = matches!(first_char, ',' | '.' | '!' | '?' | '~' | ':' | '—' | '…' |
+                                              '，' | '。' | '！' | '？' | '：');
+            let is_english = first_char.is_ascii_alphabetic();
+            let punct_chars = [',', '.', '!', '?', '~', ':', '—', '…', '，', '。', '！', '？', '：'];
+            let first_segment_len = text.chars()
+                .take_while(|c| !punct_chars.contains(c))
+                .count();
+
+            if is_first_chunk && !is_punct && is_english {
+                format!(", {}", text)
+            } else if is_first_chunk && !is_punct && first_segment_len < 4 {
+                let preview: String = text.chars().take(15).collect();
+                eprintln!("   [few-shot] Short first segment ({}): \"{}\" -> prepending '.'", first_segment_len, preview);
+                format!(".{}", text)
+            } else {
+                text.to_string()
+            }
+        } else {
+            text.to_string()
+        };
+
+        // 1. Preprocess reference text
+        let (ref_phoneme_ids, ref_phonemes, ref_word2ph, ref_text_normalized) = preprocess_text_with_lang(&ref_text, Some(crate::text::Language::Chinese));
+        let ref_text_trimmed = ref_text_normalized.trim();
+        let ref_text_chars = ref_text_trimmed.chars().count();
+        let ref_word2ph_for_bert = &ref_word2ph[..ref_text_chars.min(ref_word2ph.len())];
+        let ref_bert_features = self.extract_bert_features(ref_text_trimmed, ref_word2ph_for_bert, ref_phonemes.len())?;
+
+        // 2. Preprocess target text
+        let (target_phoneme_ids, target_phonemes, target_word2ph, target_text_normalized) = preprocess_text_with_lang(&text, Some(crate::text::Language::Chinese));
+        eprintln!("   [few-shot] Target phonemes ({}):", target_phonemes.len());
+        eprintln!("      {:?}", &target_phonemes[..target_phonemes.len().min(20)]);
+        eprintln!("   [few-shot] Target normalized: '{}'", target_text_normalized);
+
+        let target_text_trimmed = target_text_normalized.trim();
+        let target_text_chars = target_text_trimmed.chars().count();
+        let target_word2ph_for_bert = &target_word2ph[..target_text_chars.min(target_word2ph.len())];
+        let target_bert_features = self.extract_bert_features(target_text_trimmed, target_word2ph_for_bert, target_phonemes.len())?;
+
+        // 3. Combine ref + target
+        let combined_phoneme_ids = mlx_rs::ops::concatenate_axis(&[&ref_phoneme_ids, &target_phoneme_ids], 1)
+            .map_err(|e| Error::Message(format!("Failed to concat phonemes: {}", e)))?;
+        eval([&combined_phoneme_ids]).map_err(|e| Error::Message(e.to_string()))?;
+
+        let combined_bert_features = mlx_rs::ops::concatenate_axis(&[&ref_bert_features, &target_bert_features], 1)
+            .map_err(|e| Error::Message(format!("Failed to concat BERT features: {}", e)))?;
+        eval([&combined_bert_features]).map_err(|e| Error::Message(e.to_string()))?;
+
+        // 4. Generate semantic tokens
+        let (all_tokens, generated_count) = self.generate_semantic_tokens(
+            &combined_phoneme_ids,
+            &combined_bert_features,
+            target_phonemes.len(),
+            Some(&prompt_semantic),
+        )?;
+
+        // 5. Extract newly generated tokens
+        let new_tokens = all_tokens[all_tokens.len().saturating_sub(generated_count)..].to_vec();
+        let prompt_len = prompt_semantic.shape()[2] as usize;
+        eprintln!("   [few-shot] Semantic tokens: all={}, prompt={}, generated={}",
+                  all_tokens.len(), prompt_len, generated_count);
+
+        Ok((new_tokens, target_phoneme_ids))
     }
 
     /// Zero-shot synthesis (no reference text, only reference audio for style)
@@ -745,19 +1095,13 @@ impl VoiceCloner {
         let target_word2ph_for_bert = &target_word2ph[..target_text_chars.min(target_word2ph.len())];
         let mut target_bert_features = self.extract_bert_features(target_text_trimmed, target_word2ph_for_bert, target_phonemes.len())?;
 
-        // 3. Combine: ref_phones + target_phones + period
-        let period_token = Array::from_slice(&[3i32], &[1, 1]);
-        let combined_phoneme_ids = mlx_rs::ops::concatenate_axis(&[&ref_phoneme_ids, &target_phoneme_ids, &period_token], 1)
+        // 3. Combine: ref_phones + target_phones (NO extra period — Python doesn't append one)
+        let combined_phoneme_ids = mlx_rs::ops::concatenate_axis(&[&ref_phoneme_ids, &target_phoneme_ids], 1)
             .map_err(|e| Error::Message(format!("Failed to concat phonemes: {}", e)))?;
         eval([&combined_phoneme_ids]).map_err(|e| Error::Message(e.to_string()))?;
 
-
-
-        // 4. Combine: all_bert = ref_bert + target_bert + zero_padding (Python: torch.cat([prompt_data["bert_features"], item["bert_features"]], 1))
-        // Add zero padding for the trailing period token to match phoneme count
-        let period_bert = Array::zeros::<f32>(&[1, 1, 1024])
-            .map_err(|e| Error::Message(e.to_string()))?;
-        let combined_bert_features = mlx_rs::ops::concatenate_axis(&[&ref_bert_features, &target_bert_features, &period_bert], 1)
+        // 4. Combine: all_bert = ref_bert + target_bert (Python: torch.cat([prompt_data["bert_features"], item["bert_features"]], 1))
+        let combined_bert_features = mlx_rs::ops::concatenate_axis(&[&ref_bert_features, &target_bert_features], 1)
             .map_err(|e| Error::Message(format!("Failed to concat BERT features: {}", e)))?;
         eval([&combined_bert_features]).map_err(|e| Error::Message(e.to_string()))?;
 
@@ -781,16 +1125,11 @@ impl VoiceCloner {
         eprintln!("   [few-shot] First 10 new tokens: {:?}", &new_tokens[..new_tokens.len().min(10)]);
 
 
-        // Add trailing period token (3) like Python does
-        let mut target_ids_with_period: Vec<i32> = target_phoneme_ids.as_slice().to_vec();
-        target_ids_with_period.push(3);  // Period token
-        let target_phoneme_ids_padded = Array::from_slice(&target_ids_with_period, &[1, target_ids_with_period.len() as i32]);
-
         // Don't pad - the tokens should be correct with Python prompt codes
         let new_tokens: Vec<i32> = new_tokens.to_vec();
 
-        // 7. VITS vocoding with target phonemes only (matching Python)
-        let audio = self.vocode(&new_tokens, &target_phoneme_ids_padded, ref_mel)?;
+        // 7. VITS vocoding with target phonemes only (NO extra period — matching Python)
+        let audio = self.vocode(&new_tokens, &target_phoneme_ids, ref_mel)?;
 
         // 8. Convert to output
         let samples = array_to_f32_samples(&audio)?;
@@ -1096,39 +1435,15 @@ impl VoiceCloner {
                     .unwrap_or(0)
             };
 
-            // EOS detection: require BOTH sampled AND argmax to be EOS when below target
-            // This prevents premature stopping in few-shot mode
-            let eos_detected = if generated_count < target_tokens {
-                // Below target: require both to agree on EOS
-                token_id == eos_token && argmax_token == eos_token
-            } else {
-                // At or above target: either one can trigger EOS
-                token_id == eos_token || argmax_token == eos_token
-            };
+            // EOS detection: match Python exactly (line 871):
+            //   if torch.argmax(logits, dim=-1)[0] == self.EOS or samples[0, 0] == self.EOS:
+            //       stop = True
+            let eos_detected = token_id == eos_token || argmax_token == eos_token;
 
-            if eos_detected && generated_count >= min_tokens {
+            if eos_detected {
                 eprintln!("   [T2S] EOS at step {}: token={}, argmax={}, eos_token={}",
                          generated_count, token_id, argmax_token, eos_token);
                 break;
-            }
-
-            // Target overflow check
-            if generated_count > (target_tokens as f32 * 1.5) as usize {
-                break;
-            }
-
-            // EOS retry if too early (only if sampled token is EOS)
-            if token_id == eos_token {
-                // Retry with EOS masked to force a non-EOS token
-                token_id = sample_top_k_with_penalty(
-                    &last_logits,
-                    &generated_tokens_for_penalty,
-                    self.config.top_k * 2,
-                    1.0,  // Disable top-p on retry to allow more diversity
-                    self.config.temperature * 1.5,
-                    self.config.repetition_penalty,
-                    true,  // mask_eos to force non-EOS token
-                )?;
             }
 
             all_tokens.push(token_id);
@@ -1320,46 +1635,62 @@ fn sample_top_k_with_penalty(
         // Don't add extra penalty for immediate repetition as it breaks generation
     }
 
-    let penalized_logits = Array::from_slice(&logits_vec, &[logits_vec.len() as i32]);
+    // Match Python order: repetition_penalty → top_p → temperature → top_k → softmax → sample
+    // (Python: logits_to_probs applies rep_penalty, top_p, temperature, top_k, then softmax)
 
-    // Apply temperature
-    let scaled = if temperature != 1.0 {
-        penalized_logits.divide(mlx_rs::array!(temperature))
-            .map_err(|e| Error::Message(e.to_string()))?
-    } else {
-        penalized_logits
-    };
-    eval([&scaled]).map_err(|e| Error::Message(e.to_string()))?;
-
-    let flat_logits = scaled.flatten(None, None)
-        .map_err(|e| Error::Message(e.to_string()))?;
-    eval([&flat_logits]).map_err(|e| Error::Message(e.to_string()))?;
-
-    let probs = mlx_rs::ops::softmax_axis(&flat_logits, -1, None)
-        .map_err(|e| Error::Message(e.to_string()))?;
-    eval([&probs]).map_err(|e| Error::Message(e.to_string()))?;
-
-    let prob_vec: Vec<f32> = probs.as_slice().to_vec();
-
-    let mut indexed: Vec<(usize, f32)> = prob_vec.iter().cloned().enumerate().collect();
-    indexed.sort_by(|a, b| b.1.partial_cmp(&a.1).unwrap());
-    // If top_k <= 0, use full vocabulary (disabled top_k, like Python's -100)
-    let effective_k = if top_k <= 0 { indexed.len() } else { top_k as usize };
-    let mut top_items: Vec<(usize, f32)> = indexed.into_iter().take(effective_k).collect();
-
-    // Apply top-p (nucleus) sampling: keep smallest set of tokens whose cumulative prob >= top_p
+    // top_p filtering (on logits, before temperature — matches Python line 130-140)
     if top_p < 1.0 && top_p > 0.0 {
+        let mut indexed: Vec<(usize, f32)> = logits_vec.iter().cloned().enumerate().collect();
+        indexed.sort_by(|a, b| b.1.partial_cmp(&a.1).unwrap());
+        // Compute cumulative softmax probs on sorted logits
+        let max_val = indexed[0].1;
+        let sorted_probs: Vec<f32> = indexed.iter().map(|(_, v)| (v - max_val).exp()).collect();
+        let sum: f32 = sorted_probs.iter().sum();
         let mut cumsum = 0.0f32;
-        let mut cutoff_idx = top_items.len();
-        for (i, &(_, prob)) in top_items.iter().enumerate() {
-            cumsum += prob;
-            if cumsum >= top_p {
-                cutoff_idx = i + 1;  // Include this token
-                break;
+        let mut remove_set = std::collections::HashSet::new();
+        for (i, &(orig_idx, _)) in indexed.iter().enumerate() {
+            cumsum += sorted_probs[i] / sum;
+            if cumsum > top_p {
+                remove_set.insert(orig_idx);
             }
         }
-        top_items.truncate(cutoff_idx);
+        for idx in remove_set {
+            logits_vec[idx] = f32::NEG_INFINITY;
+        }
     }
+
+    // Apply temperature (Python line 142: logits = logits / temperature)
+    if temperature != 1.0 {
+        let t = temperature.max(1e-5);
+        for v in logits_vec.iter_mut() {
+            *v /= t;
+        }
+    }
+
+    // top_k filtering (on logits — Python line 144-147)
+    let effective_k = if top_k <= 0 { logits_vec.len() } else { top_k as usize };
+    if effective_k < logits_vec.len() {
+        let mut indexed: Vec<(usize, f32)> = logits_vec.iter().cloned().enumerate().collect();
+        indexed.sort_by(|a, b| b.1.partial_cmp(&a.1).unwrap());
+        let pivot = indexed[effective_k.min(indexed.len()) - 1].1;
+        for v in logits_vec.iter_mut() {
+            if *v < pivot {
+                *v = f32::NEG_INFINITY;
+            }
+        }
+    }
+
+    // Softmax (Python line 149)
+    let max_logit = logits_vec.iter().cloned().fold(f32::NEG_INFINITY, f32::max);
+    let exp_sum: f32 = logits_vec.iter().map(|v| (v - max_logit).exp()).sum();
+    let prob_vec: Vec<f32> = logits_vec.iter().map(|v| (v - max_logit).exp() / exp_sum).collect();
+
+    // Collect top items for sampling
+    let mut indexed: Vec<(usize, f32)> = prob_vec.iter().cloned().enumerate().collect();
+    indexed.sort_by(|a, b| b.1.partial_cmp(&a.1).unwrap());
+    let mut top_items: Vec<(usize, f32)> = indexed.into_iter()
+        .filter(|(_, p)| *p > 0.0)
+        .collect();
 
     let total: f32 = top_items.iter().map(|(_, p)| p).sum();
     let normalized: Vec<f32> = top_items.iter().map(|(_, p)| p / total).collect();
@@ -1467,9 +1798,27 @@ fn is_cjk_char(c: char) -> bool {
 /// then merge short segments (< threshold chars) with the next segment.
 /// This matches the dora-primespeech `cut5` method + `merge_short_text_in_array(5)`.
 /// Count word2ph entries for an English text segment in mixed G2P mode.
-/// Must match `english_letter_spell`: one entry per letter + one per punctuation.
+/// Must match `english_g2p`: one entry per word + one per punctuation + one per apostrophe.
 fn count_english_word2ph_entries(text: &str) -> usize {
-    text.chars().filter(|c| c.is_ascii_alphabetic() || matches!(c, ',' | '.' | '!' | '?')).count()
+    let mut count = 0;
+    let mut in_word = false;
+    for c in text.chars() {
+        if c.is_ascii_alphabetic() {
+            if !in_word {
+                count += 1;
+                in_word = true;
+            }
+        } else if c == '\'' {
+            in_word = false;
+            count += 1; // apostrophe emits '-' phoneme
+        } else {
+            in_word = false;
+            if matches!(c, ',' | '.' | '!' | '?') {
+                count += 1;
+            }
+        }
+    }
+    count
 }
 
 fn cut5_split(text: &str) -> Vec<String> {
@@ -1518,7 +1867,7 @@ fn cut5_split(text: &str) -> Vec<String> {
     let mut acc = String::new();
     for ele in &filtered {
         acc.push_str(ele);
-        if acc.len() >= threshold {
+        if acc.chars().count() >= threshold {
             result.push(acc.clone());
             acc.clear();
         }

@@ -74,6 +74,7 @@ struct Args {
     output: Option<String>,
     interactive: bool,
     greedy: bool,
+    vits_onnx: Option<String>,
 }
 
 fn parse_args() -> Args {
@@ -87,6 +88,7 @@ fn parse_args() -> Args {
     let mut output = None;
     let mut interactive = false;
     let mut greedy = false;
+    let mut vits_onnx = None;
 
     let mut i = 0;
     while i < args.len() {
@@ -162,6 +164,12 @@ fn parse_args() -> Args {
             "--greedy" => {
                 greedy = true;
             }
+            "--vits-onnx" => {
+                if i + 1 < args.len() {
+                    vits_onnx = Some(args[i + 1].clone());
+                    i += 1;
+                }
+            }
             arg if !arg.starts_with('-') => {
                 if text.is_none() {
                     text = Some(arg.to_string());
@@ -172,7 +180,7 @@ fn parse_args() -> Args {
         i += 1;
     }
 
-    Args { text, ref_audio, ref_text, codes_path, tokens_path, output, interactive, greedy }
+    Args { text, ref_audio, ref_text, codes_path, tokens_path, output, interactive, greedy, vits_onnx }
 }
 
 fn synthesize_and_play(cloner: &mut VoiceCloner, text: &str, output: Option<&str>) -> Result<(), Box<dyn std::error::Error>> {
@@ -278,6 +286,10 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
         config.repetition_penalty = 1.0;
         config.noise_scale = 0.0;  // Deterministic VITS too
         println!("   Greedy mode: top_k=1, temperature=0.001, noise_scale=0.0");
+    }
+    if let Some(ref onnx_path) = args.vits_onnx {
+        config.vits_onnx_path = Some(onnx_path.clone());
+        println!("   ONNX VITS: {}", onnx_path);
     }
     let mut cloner = VoiceCloner::new(config)?;
     println!("   Models loaded in {:.1}ms", start.elapsed().as_secs_f64() * 1000.0);
