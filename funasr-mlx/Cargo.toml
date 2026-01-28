@@ -20,6 +20,14 @@ thiserror = "2"
 # FFT for efficient STFT computation (replaces O(N²) manual DFT)
 rustfft = "6.2"
 
+# ONNX Runtime for CT-Transformer punctuation model
+ort = { version = "2.0.0-rc.11", optional = true }
+serde_json = { version = "1", optional = true }
+
+[features]
+default = []
+punctuation = ["ort", "serde_json"]
+
 [dev-dependencies]
 # For examples only
 

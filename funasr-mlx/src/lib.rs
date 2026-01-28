@@ -50,6 +50,8 @@
 pub mod audio;
 pub mod error;
 pub mod paraformer;
+#[cfg(feature = "punctuation")]
+pub mod punctuation;
 
 // Re-export main types for convenience
 pub use error::{Error, Result};
@@ -135,4 +137,21 @@ pub fn transcribe(
         .to_vec();
 
     Ok(vocab.decode(&token_ids_vec))
+}
+
+/// Transcribe audio and apply punctuation restoration
+///
+/// Same as `transcribe` but passes result through CT-Transformer punctuation model.
+#[cfg(feature = "punctuation")]
+pub fn transcribe_with_punctuation(
+    model: &mut Paraformer,
+    audio: &[f32],
+    vocab: &Vocabulary,
+    punc_model: &mut punctuation::PunctuationModel,
+) -> Result<String> {
+    let text = transcribe(model, audio, vocab)?;
+    if text.is_empty() {
+        return Ok(text);
+    }
+    punc_model.punctuate(&text)
 }
