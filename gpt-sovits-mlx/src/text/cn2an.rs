@@ -255,7 +255,6 @@ pub fn transform(text: &str) -> String {
             if !num_buffer.is_empty() {
                 result.push_str(&process_number(&num_buffer, is_negative, None));
                 num_buffer.clear();
-                is_negative = false;
             }
             is_negative = true;
             i += 1;

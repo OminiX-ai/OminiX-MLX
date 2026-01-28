@@ -32,10 +32,14 @@ pub mod cache;
 pub mod error;
 pub mod inference;
 pub mod models;
+pub mod sampling;
+pub mod synthesis;
 pub mod text;
 pub mod voice_clone;
 
 // Re-export main types
-pub use voice_clone::{VoiceCloner, VoiceClonerConfig, AudioOutput};
+pub use voice_clone::{VoiceCloner, VoiceClonerConfig, AudioOutput, SynthesisOptions};
+pub use synthesis::ReferenceManager;
+pub use sampling::{Sampler, SamplingConfig};
 pub use text::{Language, preprocess_text};
 pub use error::Error;

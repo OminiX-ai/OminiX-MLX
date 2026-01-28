@@ -27,6 +27,9 @@ serde_json = "1"
 anyhow = "1"
 thiserror = "2"
 
+# Logging
+tracing = "0.1"
+
 # Tokenizers
 tokenizers = { version = "0.22.0", features = ["http"] }
 

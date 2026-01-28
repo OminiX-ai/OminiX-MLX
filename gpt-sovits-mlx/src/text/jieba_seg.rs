@@ -234,7 +234,7 @@ impl Segmenter {
     }
 }
 
-/// Global segmenter instance (lazy initialized)
+// Global segmenter instance (lazy initialized)
 lazy_static::lazy_static! {
     pub static ref GLOBAL_SEGMENTER: Segmenter = Segmenter::new();
 }

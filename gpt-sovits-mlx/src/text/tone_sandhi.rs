@@ -545,7 +545,7 @@ impl ToneSandhi {
 /// Get pinyin finals with tone for a word
 /// Uses the pinyin crate to get finals like ["a1", "o3", "e4"]
 fn get_word_finals(word: &str) -> Vec<String> {
-    use pinyin::{ToPinyin, ToPinyinMulti};
+    use pinyin::ToPinyin;
 
     word.chars()
         .filter_map(|c| {

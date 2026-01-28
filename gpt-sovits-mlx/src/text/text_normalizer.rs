@@ -349,6 +349,7 @@ impl TextNormalizer {
                         || c.is_ascii_alphabetic()
                         || c.is_ascii_digit()
                         || is_valid_punct(c)
+                        || c == '\'' // Python keeps apostrophe (in string.punctuation)
                         || c.is_whitespace()
                 })
                 .collect()
@@ -386,7 +387,7 @@ fn is_valid_punct(c: char) -> bool {
 fn strip_special_symbols(text: &str) -> String {
     text.chars()
         .filter(|c| !matches!(c,
-            '—' | '\u{2014}' | // em dash
+            '—' | // em dash (U+2014)
             '《' | '》' |
             '【' | '】' |
             '<' | '>' |
