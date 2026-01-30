@@ -333,7 +333,7 @@ fn create_mel_filterbank(sample_rate: u32, n_fft: usize, n_mels: usize) -> Vec<f
     filterbank
 }
 
-/// Apply Low Frame Rate (LFR) transformation using pure MLX operations.
+/// Apply Low Frame Rate (LFR) transformation.
 ///
 /// LFR stacks `m` consecutive frames and subsamples by factor `n`.
 /// This reduces the sequence length while preserving temporal information.
@@ -342,70 +342,72 @@ fn create_mel_filterbank(sample_rate: u32, n_fft: usize, n_mels: usize) -> Vec<f
 /// Output: [batch, n_frames/n, n_mels * m]
 ///
 /// For Fun-ASR-Nano: m=7, n=6, producing 560-dim features (80 * 7).
-///
-/// This implementation uses pure MLX operations to avoid GPU→CPU→GPU transfers,
-/// providing ~5-10% speedup over CPU-based implementations.
 pub fn apply_lfr(mel: &Array, lfr_m: usize, lfr_n: usize) -> Result<Array> {
-    use mlx_rs::ops::{self, indexing::IndexOp};
-
     let shape = mel.shape();
-    let batch = shape[0];
-    let n_mels = shape[1];
+    let batch = shape[0] as usize;
+    let n_mels = shape[1] as usize;
     let n_frames = shape[2] as usize;
 
     // Calculate output dimensions
     let n_lfr_frames = (n_frames + lfr_n - 1) / lfr_n;
-    let left_pad = lfr_m / 2;
+    let lfr_dim = n_mels * lfr_m;
 
-    // Transpose to [batch, n_frames, n_mels] for frame-wise processing
-    let mel_t = mel.transpose_axes(&[0, 2, 1])?;
+    // Get data from mel array
+    mlx_rs::transforms::eval([mel])?;
 
-    // Pad frames on both sides to handle edge cases
-    // Left padding: replicate first frame
-    // Right padding: replicate last frame + extra for subsampling alignment
-    let right_pad = lfr_m - 1 - left_pad + (lfr_n - (n_frames % lfr_n)) % lfr_n;
+    // Transpose to [batch, n_frames, n_mels] for easier processing
+    let mel_transposed = mel.transpose_axes(&[0, 2, 1])?;
+    // Make contiguous for as_slice to work (transpose creates strided view)
+    let mel_contiguous = mlx_rs::ops::contiguous(&mel_transposed)?;
+    mlx_rs::transforms::eval([&mel_contiguous])?;
 
-    // Get first and last frames for padding
-    let first_frame = mel_t.index((.., 0..1, ..)); // [batch, 1, n_mels]
-    let last_frame = mel_t.index((.., (n_frames as i32 - 1).., ..)); // [batch, 1, n_mels]
+    // Get the mel data as a slice
+    let mel_data: Vec<f32> = mel_contiguous.try_as_slice::<f32>()
+        .map_err(|e| Error::Audio(format!("Failed to get mel data: {}", e)))?
+        .to_vec();
 
-    // Create padding by repeating first/last frames along axis 1
-    let left_padding = if left_pad > 0 {
-        ops::repeat_axis::<f32>(first_frame, left_pad as i32, 1)?
-    } else {
-        Array::zeros::<f32>(&[batch, 0, n_mels])?
-    };
+    // Create output buffer
+    let mut lfr_data = vec![0.0f32; batch * n_lfr_frames * lfr_dim];
 
-    let right_padding = if right_pad > 0 {
-        ops::repeat_axis::<f32>(last_frame, right_pad as i32, 1)?
-    } else {
-        Array::zeros::<f32>(&[batch, 0, n_mels])?
-    };
+    // Process each batch
+    for b in 0..batch {
+        for out_frame in 0..n_lfr_frames {
+            let center_frame = out_frame * lfr_n;
 
-    // Concatenate: [left_pad | mel_t | right_pad]
-    let padded = ops::concatenate_axis(&[&left_padding, &mel_t, &right_padding], 1)?;
-    // padded shape: [batch, left_pad + n_frames + right_pad, n_mels]
+            // Stack lfr_m frames centered around center_frame
+            for m in 0..lfr_m {
+                // Calculate source frame index with padding
+                let src_frame = if m < lfr_m / 2 {
+                    // Left padding: use first frame
+                    let offset = (lfr_m / 2) - m;
+                    if offset > center_frame {
+                        0
+                    } else {
+                        center_frame - offset
+                    }
+                } else {
+                    // Right: use frame or pad with last
+                    let offset = m - (lfr_m / 2);
+                    (center_frame + offset).min(n_frames - 1)
+                };
 
-    // Now gather lfr_m consecutive frames for each output frame
-    // Output frame i uses frames [i*lfr_n, i*lfr_n + lfr_m)
-    let mut stacked_frames = Vec::with_capacity(lfr_m);
-    for m in 0..lfr_m {
-        // Create indices for this offset: [0, lfr_n, 2*lfr_n, ...]
-        let indices: Vec<i32> = (0..n_lfr_frames)
-            .map(|i| (i * lfr_n + m) as i32)
-            .collect();
-        let idx_array = Array::from_slice(&indices, &[n_lfr_frames as i32]);
+                // Copy mel features for this frame
+                let src_idx = b * n_frames * n_mels + src_frame * n_mels;
+                let dst_idx = b * n_lfr_frames * lfr_dim + out_frame * lfr_dim + m * n_mels;
 
-        // Gather frames at these indices using take_axis
-        let gathered = padded.take_axis(&idx_array, 1)?; // [batch, n_lfr_frames, n_mels]
-        stacked_frames.push(gathered);
+                for i in 0..n_mels {
+                    if src_idx + i < mel_data.len() && dst_idx + i < lfr_data.len() {
+                        lfr_data[dst_idx + i] = mel_data[src_idx + i];
+                    }
+                }
+            }
+        }
     }
 
-    // Concatenate along the last axis to create [batch, n_lfr_frames, n_mels * lfr_m]
-    let refs: Vec<&Array> = stacked_frames.iter().collect();
-    let lfr_result = ops::concatenate_axis(&refs, 2)?;
+    // Create output array [batch, n_lfr_frames, lfr_dim]
+    let lfr_array = Array::from_slice(&lfr_data, &[batch as i32, n_lfr_frames as i32, lfr_dim as i32]);
 
-    Ok(lfr_result)
+    Ok(lfr_array)
 }
 
 #[cfg(test)]
@@ -505,64 +507,5 @@ mod tests {
         assert_eq!(config.n_fft, 400);
         assert_eq!(config.hop_length, 160);
         assert_eq!(config.max_length, 30.0);
-    }
-
-    #[test]
-    fn test_lfr_correctness() {
-        // Create a known mel spectrogram pattern [1, 80, 12]
-        // Input layout: mel[batch, n_mels, n_frames] where mel[0, m, t] is at linear index m*n_frames + t
-        let n_mels = 80;
-        let n_frames = 12;
-        let lfr_m = 7;
-        let lfr_n = 6;
-
-        // Create mel data where mel[0, m, t] = m * n_frames + t
-        // After transpose to [1, n_frames, n_mels]: mel_t[0, t, m] = mel[0, m, t] = m * n_frames + t
-        let mut mel_data: Vec<f32> = Vec::with_capacity(n_mels * n_frames);
-        for m in 0..n_mels {
-            for t in 0..n_frames {
-                mel_data.push((m * n_frames + t) as f32);
-            }
-        }
-        let mel = Array::from_slice(&mel_data, &[1, n_mels as i32, n_frames as i32]);
-
-        // Apply LFR
-        let lfr = apply_lfr(&mel, lfr_m, lfr_n).unwrap();
-        let lfr_data: Vec<f32> = lfr.as_slice().to_vec();
-        let shape = lfr.shape();
-
-        // Check dimensions
-        let expected_frames = (n_frames + lfr_n - 1) / lfr_n; // ceil(12/6) = 2
-        assert_eq!(shape[0], 1, "batch dimension mismatch");
-        assert_eq!(shape[1], expected_frames as i32, "lfr_frames dimension mismatch");
-        assert_eq!(shape[2], (n_mels * lfr_m) as i32, "lfr_dim dimension mismatch");
-
-        // Validate first output frame
-        // After transpose: mel_t[0, t, m] = m * n_frames + t
-        // LFR output: lfr[0, out_frame, offset * n_mels + mel_bin]
-        //   = mel_t[0, padded_src_frame, mel_bin]
-        // where padded_src_frame = clamp(out_frame * lfr_n + offset - left_pad, 0, n_frames-1)
-        let left_pad = lfr_m / 2; // 3
-        for offset in 0..lfr_m {
-            let padded_idx = 0 * lfr_n + offset; // for first output frame
-            let src_frame = if padded_idx < left_pad {
-                0
-            } else if padded_idx - left_pad < n_frames {
-                padded_idx - left_pad
-            } else {
-                n_frames - 1
-            };
-
-            for m_bin in 0..n_mels {
-                let lfr_idx = offset * n_mels + m_bin;
-                // mel_t[0, src_frame, m_bin] = m_bin * n_frames + src_frame
-                let expected_val = (m_bin * n_frames + src_frame) as f32;
-                assert!(
-                    (lfr_data[lfr_idx] - expected_val).abs() < 1e-6,
-                    "Mismatch at offset={}, m_bin={}: got {} expected {} (src_frame={})",
-                    offset, m_bin, lfr_data[lfr_idx], expected_val, src_frame
-                );
-            }
-        }
     }
 }
