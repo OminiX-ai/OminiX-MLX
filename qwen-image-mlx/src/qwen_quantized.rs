@@ -873,7 +873,12 @@ impl QwenQuantizedTransformer {
         }
 
         // Final norm and projection
+        // OPTIMIZATION: Upcast to FP32 before norm_out for numerical stability
+        // DiT activations can reach ±50M which causes precision issues in FP16
+        let input_dtype = hidden_states.dtype();
+        let hidden_states = hidden_states.as_dtype(mlx_rs::Dtype::Float32)?;
         let hidden_states = self.norm_out.forward(&hidden_states, &text_embeddings)?;
+        let hidden_states = hidden_states.as_dtype(input_dtype)?;
 
         // Debug after norm_out
         static DEBUG_POST_NORM: std::sync::atomic::AtomicBool = std::sync::atomic::AtomicBool::new(false);

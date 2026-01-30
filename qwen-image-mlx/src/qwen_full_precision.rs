@@ -604,7 +604,12 @@ impl QwenFullTransformer {
         }
 
         // Final norm and projection (image only)
+        // OPTIMIZATION: Upcast to FP32 before norm_out for numerical stability
+        // DiT activations can reach extreme values which causes precision issues
+        let input_dtype = img.dtype();
+        let img = img.as_dtype(mlx_rs::Dtype::Float32)?;
         let img = self.norm_out.forward(&img, &temb)?;
+        let img = img.as_dtype(input_dtype)?;
         self.proj_out.forward(&img)
     }
 }
