@@ -543,6 +543,102 @@ impl T2SModel {
         // Combine text and audio masks
         concatenate_axis(&[&text_mask, &audio_mask], 0)
     }
+
+    /// Training forward pass
+    ///
+    /// Args:
+    ///   phoneme_ids: [batch, phoneme_len] - phoneme token IDs
+    ///   _phoneme_lens: [batch] - actual lengths (unused for now, padding handled by mask)
+    ///   bert_features: [batch, bert_dim, phoneme_len] - BERT features (transposed storage)
+    ///   semantic_ids: [batch, semantic_len] - target semantic token IDs
+    ///   _semantic_lens: [batch] - actual lengths (unused for now)
+    ///
+    /// Returns:
+    ///   logits: [batch, semantic_len, vocab_size] - predictions for each semantic position
+    #[allow(non_snake_case)]
+    pub fn forward_train(
+        &mut self,
+        phoneme_ids: &Array,
+        _phoneme_lens: &Array,
+        bert_features: &Array,
+        semantic_ids: &Array,
+        _semantic_lens: &Array,
+    ) -> Result<Array, Exception> {
+        // Embed phonemes: (B, text_len, hidden)
+        let phoneme_emb = self.phoneme_embedding.forward(phoneme_ids)?;
+        let text_len = phoneme_emb.shape()[1] as i32;
+
+        // BERT features come in as [batch, bert_dim, seq_len], transpose to [batch, seq_len, bert_dim]
+        let bert_transposed = bert_features.transpose_axes(&[0, 2, 1])?;
+        // Project and ADD BERT features: (B, text_len, hidden)
+        let bert_proj = self.bert_proj.forward(&bert_transposed)?;
+        let text_emb = phoneme_emb.add(&bert_proj)?;
+
+        // Apply text position encoding
+        let text_emb = self.text_position.apply(&text_emb, 0)?;
+
+        // Embed semantic tokens: (B, semantic_len, hidden)
+        let semantic_emb = self.semantic_embedding.forward(semantic_ids)?;
+        let semantic_len = semantic_emb.shape()[1] as i32;
+
+        // Apply audio position encoding
+        let semantic_emb = self.audio_position.apply(&semantic_emb, 0)?;
+
+        // Concatenate: text + semantic
+        let mut h = concatenate_axis(&[&text_emb, &semantic_emb], 1)?;
+
+        // Create T2S-style mask
+        let mask = self.create_t2s_mask(text_len, semantic_len)?;
+
+        // Process through transformer layers (no cache for training)
+        for layer in &mut self.layers {
+            let layer_input = T2SAttentionInput::<crate::cache::ConcatKeyValueCache> {
+                x: &h,
+                mask: Some(&mask),
+                cache: None,
+            };
+            h = layer.forward(layer_input)?;
+        }
+
+        // Project to vocabulary - only return semantic token positions
+        // h is [batch, text_len + semantic_len, hidden]
+        // We want logits for semantic positions only: [batch, semantic_len, vocab_size]
+        let semantic_hidden = h.index((.., text_len.., ..));
+        self.predict_layer.forward(&semantic_hidden)
+    }
+
+    /// Save model weights to safetensors file
+    pub fn save_weights(&self, path: impl AsRef<Path>) -> Result<(), Error> {
+        use mlx_rs::module::ModuleParameters;
+
+        let path = path.as_ref();
+
+        // Collect all parameters - flatten returns (Rc<str>, &Array) pairs
+        // save_safetensors accepts anything that implements AsRef<str> and AsRef<Array>
+        let params = self.parameters().flatten();
+        let weights: Vec<(String, Array)> = params
+            .into_iter()
+            .map(|(k, v)| (k.to_string(), v.as_ref().clone()))
+            .collect();
+
+        // Save to safetensors (arrays, metadata, path)
+        Array::save_safetensors(weights, None::<&HashMap<String, String>>, path)?;
+
+        Ok(())
+    }
+
+    /// Load model weights from safetensors file
+    pub fn load_weights(&mut self, path: impl AsRef<Path>) -> Result<(), Error> {
+        let path = path.as_ref();
+
+        // Load weights from safetensors
+        let weights = Array::load_safetensors(path)?;
+
+        // Apply weights to model
+        load_t2s_weights(self, &weights)?;
+
+        Ok(())
+    }
 }
 
 /// Input for T2S model forward pass
