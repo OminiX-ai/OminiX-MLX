@@ -9,10 +9,11 @@
 | Generator `forward_train()` | ✅ Complete | `src/models/vits.rs` |
 | Multi-Period Discriminator | ✅ Complete | `src/models/discriminator.rs` |
 | VITS Loss Functions | ✅ Complete | `src/training/vits_loss.rs` |
-| VITS Trainer | ✅ Complete (forward only) | `src/training/vits_trainer.rs` |
-| Gradient-based Training | 🚧 TODO | Need `value_and_grad` wiring |
-| Training CLI | 🚧 TODO | `examples/train_vits.rs` |
-| Checkpoint Save/Load | 🚧 TODO | |
+| VITS Trainer | ✅ Complete | `src/training/vits_trainer.rs` |
+| Discriminator Gradient Training | ✅ Complete | `src/training/vits_trainer.rs` |
+| Training CLI | ✅ Complete | `examples/train_vits.rs` |
+| Checkpoint Save/Load | ✅ Complete | `src/training/vits_trainer.rs` |
+| Full GAN Gradient Training | 🚧 Partial | Generator uses eval-only, D uses gradients |
 
 ## Overview
 
