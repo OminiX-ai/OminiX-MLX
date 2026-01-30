@@ -108,42 +108,43 @@ let system = get_special_token_id(&tokenizer, "system", 8948);
 
 ## Phase 2: Medium Effort Optimizations
 
-### 2.1 INT8 Quantization for Encoder
+### 2.1 ~~INT8 Quantization for Encoder~~ (Reconsidered)
 
-**Status:** Not Started
-**Effort:** Medium (1-2 days)
-**Impact:** 50% memory reduction, 20-30% speedup on memory-bound systems
+**Status:** Deprioritized
+**Original Claim:** 50% memory reduction, 20-30% speedup
 
-**Approach:**
-1. Use MLX's built-in quantization for encoder weights
-2. Keep LLM in FP16/BF16 for accuracy
-3. Validate WER (Word Error Rate) doesn't degrade significantly
+**Why It's Less Beneficial for ASR:**
 
-**Components to Quantize:**
-- SenseVoice Encoder (221M params → ~110MB INT8)
-- Audio Adaptor (12.6M params → ~6MB INT8)
+1. **MLX dequantizes to FP32 for compute** - No compute speedup
+2. **Models are small enough to fit in memory:**
+   - Paraformer: 220M params = ~440MB (FP16)
+   - funasr-nano: 985M params = ~2GB
+3. **ASR is compute-bound, not memory-bound** for these model sizes
+4. **Apple Silicon has fast unified memory** - bandwidth rarely the bottleneck
 
-**Skip Quantization:**
-- Qwen3 LLM (quality-critical for text generation)
-- Embedding layers (sparse access patterns)
+**When Quantization WOULD Help:**
+- Very large models (>10B params)
+- Deploying on memory-constrained devices
+- Loading model from disk repeatedly
 
-**MLX Quantization API:**
-```rust
-// Pseudo-code for MLX quantization
-let quantized_weights = mlx_rs::quantize::quantize_weights(
-    &encoder_weights,
-    bits: 8,
-    group_size: 64,
-)?;
-```
-
-**Validation:**
-- Compare WER on test set before/after quantization
-- Acceptable degradation: <2% relative WER increase
+**Recommendation:** Skip quantization for now. Focus on algorithmic optimizations instead.
 
 ---
 
-### 2.2 KV Cache Optimization (funasr-nano-mlx)
+### 2.2 Fused Operations (Alternative to Quantization)
+
+---
+
+**Better Alternative:** Look for operations that can be fused into single kernels:
+- Fused attention (already using `mlx_rs::fast::scaled_dot_product_attention`)
+- Fused LayerNorm + projection
+- Fused GELU/SwiGLU activation
+
+These provide real speedup by reducing kernel launches without accuracy loss.
+
+---
+
+### 2.3 KV Cache Optimization (funasr-nano-mlx)
 
 **Status:** Partially Implemented
 **Effort:** Medium
@@ -229,6 +230,20 @@ Draft Model (fast) → Propose N tokens → Main Model (verify) → Accept/Rejec
 
 ---
 
+### ⚠️ INT8 Quantization (Low Priority)
+
+**Original Claim:** 50% memory reduction, 20-30% speedup.
+
+**Reality:**
+- MLX dequantizes INT8 to FP32 for compute (no compute speedup)
+- ASR models are small (220M-985M params) and fit in memory
+- Apple Silicon has fast unified memory (not memory-bandwidth bound)
+- These models are compute-bound, not memory-bound
+
+**Conclusion:** Deprioritize. Only useful for very large models (>10B params) or memory-constrained deployment.
+
+---
+
 ## Validation Framework
 
 ### Performance Metrics
@@ -260,8 +275,10 @@ cargo test --release
 | Phase | Items | Est. Effort | Priority |
 |-------|-------|-------------|----------|
 | Phase 1 | Repetition penalty, token IDs, cleanup | 1-2 days | High |
-| Phase 2 | INT8 quantization, KV cache | 3-5 days | Medium |
+| Phase 2 | KV cache optimization, fused ops | 2-3 days | Medium |
 | Phase 3 | Speculative decoding, streaming | 2-3 weeks | Low |
+
+**Deprioritized:** INT8 quantization (MLX dequantizes to FP32, models fit in memory)
 
 ---
 
