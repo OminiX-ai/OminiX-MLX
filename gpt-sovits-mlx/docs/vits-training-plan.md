@@ -1,5 +1,19 @@
 # VITS Training in Rust + MLX - Development Plan
 
+## Implementation Status
+
+| Component | Status | Location |
+|-----------|--------|----------|
+| Mel Spectrogram (STFT) | ✅ Complete | `src/audio/mel.rs` |
+| PosteriorEncoder (enc_q) | ✅ Complete | `src/models/vits.rs` |
+| Generator `forward_train()` | ✅ Complete | `src/models/vits.rs` |
+| Multi-Period Discriminator | ✅ Complete | `src/models/discriminator.rs` |
+| VITS Loss Functions | ✅ Complete | `src/training/vits_loss.rs` |
+| VITS Trainer | ✅ Complete (forward only) | `src/training/vits_trainer.rs` |
+| Gradient-based Training | 🚧 TODO | Need `value_and_grad` wiring |
+| Training CLI | 🚧 TODO | `examples/train_vits.rs` |
+| Checkpoint Save/Load | 🚧 TODO | |
+
 ## Overview
 
 Implement VITS (SoVITS) training in Rust + MLX, enabling full voice cloning training on Apple Silicon using MLX acceleration.

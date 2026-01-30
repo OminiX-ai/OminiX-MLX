@@ -7,8 +7,9 @@
 use std::path::Path;
 
 use mlx_rs::{
-    optimizers::AdamW,
+    module::ModuleParameters,
     ops::indexing::IndexOp,
+    optimizers::AdamW,
     transforms::eval,
     Array,
 };
@@ -91,6 +92,7 @@ pub struct VITSBatch {
     /// Phoneme indices [batch, text_len]
     pub text: Array,
     /// Text lengths [batch]
+    #[allow(dead_code)]
     pub text_lengths: Array,
     /// Target audio [batch, 1, samples]
     pub audio: Array,
@@ -104,9 +106,11 @@ pub struct VITSTrainer {
     pub generator: SynthesizerTrn,
     /// Discriminator (MultiPeriodDiscriminator)
     pub discriminator: MultiPeriodDiscriminator,
-    /// Generator optimizer
+    /// Generator optimizer (for future use with gradient updates)
+    #[allow(dead_code)]
     optim_g: AdamW,
-    /// Discriminator optimizer
+    /// Discriminator optimizer (for future use with gradient updates)
+    #[allow(dead_code)]
     optim_d: AdamW,
     /// Training configuration
     pub config: VITSTrainingConfig,
@@ -128,7 +132,7 @@ impl VITSTrainer {
         let mpd_config = MPDConfig::default();
         let discriminator = MultiPeriodDiscriminator::new(mpd_config)?;
 
-        // Create optimizers
+        // Create optimizers (for future gradient-based training)
         let optim_g = AdamW::new(config.learning_rate_g);
         let optim_d = AdamW::new(config.learning_rate_d);
 
@@ -147,20 +151,21 @@ impl VITSTrainer {
 
     /// Load pretrained generator weights
     pub fn load_generator_weights(&mut self, path: impl AsRef<Path>) -> Result<(), Error> {
-        // Load the entire model from the path
         self.generator = load_vits_model(path)?;
         Ok(())
     }
 
     /// Single training step
     ///
-    /// Performs alternating D and G updates following HiFi-GAN training.
+    /// Performs forward pass and loss computation for both D and G.
+    /// Currently computes losses without gradient updates.
+    ///
+    /// TODO: Add gradient-based parameter updates using value_and_grad
     pub fn train_step(&mut self, batch: &VITSBatch) -> Result<VITSLosses, Error> {
         // ======================
         // Step 1: Forward pass through generator
         // ======================
 
-        // Call forward_train() to get all intermediate values
         let (y_hat, z_p, m_p, logs_p, _z, _m_q, logs_q, y_mask) = self.generator.forward_train(
             &batch.ssl_features,
             &batch.spec,
@@ -169,41 +174,29 @@ impl VITSTrainer {
             &batch.refer_mel,
         ).map_err(|e| Error::Message(e.to_string()))?;
 
-        // Force evaluation of forward pass
+        // Force evaluation
         eval([&y_hat, &z_p, &m_p, &logs_p, &logs_q, &y_mask])?;
 
-        // ======================
-        // Step 2: Discriminator update
-        // ======================
-
         // Match audio lengths for discriminator
-        // y_hat: [batch, 1, generated_samples]
-        // batch.audio: [batch, 1, target_samples]
-        let y_real = &batch.audio;
-
-        // Slice y_hat to match y_real length or vice versa
         let gen_len = y_hat.dim(2) as i32;
-        let real_len = y_real.dim(2) as i32;
+        let real_len = batch.audio.dim(2) as i32;
         let min_len = gen_len.min(real_len);
 
         let y_hat_sliced = y_hat.index((.., .., 0..min_len));
-        let y_real_sliced = y_real.index((.., .., 0..min_len));
+        let y_real_sliced = batch.audio.index((.., .., 0..min_len));
 
-        // Discriminator forward on real and fake
+        // ======================
+        // Step 2: Discriminator forward and loss
+        // ======================
+
         let (d_real, d_fake, fmap_real, fmap_fake) =
             self.discriminator.forward(&y_real_sliced, &y_hat_sliced)?;
 
         // Discriminator loss: wants real=1, fake=0
         let loss_d = disc_losses::discriminator_loss(&d_real, &d_fake)?;
-        let loss_d_val: f32 = loss_d.item();
-
-        // TODO: In a full implementation with nn::value_and_grad:
-        // 1. Define discriminator loss function
-        // 2. Compute gradients w.r.t discriminator parameters
-        // 3. Update discriminator with optim_d.update()
 
         // ======================
-        // Step 3: Generator update
+        // Step 3: Generator losses
         // ======================
 
         // Generator adversarial loss: wants fake=1
@@ -213,7 +206,6 @@ impl VITSTrainer {
         let loss_fm = disc_losses::feature_matching_loss(&fmap_real, &fmap_fake)?;
 
         // Mel spectrogram reconstruction loss
-        // Compute mel from real and generated audio
         let mel_real = mel_spectrogram_mlx(&y_real_sliced.squeeze_axes(&[1])?, &self.mel_config)
             .map_err(|e| Error::Message(e.to_string()))?;
         let mel_fake = mel_spectrogram_mlx(&y_hat_sliced.squeeze_axes(&[1])?, &self.mel_config)
@@ -222,11 +214,14 @@ impl VITSTrainer {
         let loss_mel = mel_reconstruction_loss(&mel_real, &mel_fake)
             .map_err(|e| Error::Message(e.to_string()))?;
 
-        // KL divergence loss between posterior and prior
+        // KL divergence loss
         let loss_kl = kl_loss(&z_p, &logs_q, &m_p, &logs_p, &y_mask)
             .map_err(|e| Error::Message(e.to_string()))?;
 
-        // Extract scalar values
+        // Evaluate all losses
+        eval([&loss_d, &loss_gen, &loss_fm, &loss_mel, &loss_kl])?;
+
+        let loss_d_val: f32 = loss_d.item();
         let loss_gen_val: f32 = loss_gen.item();
         let loss_fm_val: f32 = loss_fm.item();
         let loss_mel_val: f32 = loss_mel.item();
@@ -237,12 +232,6 @@ impl VITSTrainer {
             + loss_fm_val * self.config.c_fm
             + loss_mel_val * self.config.c_mel
             + loss_kl_val * self.config.c_kl;
-
-        // TODO: In a full implementation with nn::value_and_grad:
-        // 1. Define generator loss function
-        // 2. Compute gradients w.r.t generator parameters
-        // 3. Clip gradients if needed
-        // 4. Update generator with optim_g.update()
 
         self.step += 1;
 
@@ -256,11 +245,31 @@ impl VITSTrainer {
         })
     }
 
-    /// Save checkpoint
-    pub fn save_checkpoint(&self, _path: impl AsRef<Path>) -> Result<(), Error> {
-        // In a full implementation, this would save both G and D weights
-        // using model.trainable_parameters() and Array::save_safetensors()
-        // For now, just a placeholder
+    /// Save checkpoint to safetensors file
+    pub fn save_checkpoint(&self, path: impl AsRef<Path>) -> Result<(), Error> {
+        let path = path.as_ref();
+
+        // Get generator trainable parameters
+        let g_params = self.generator.trainable_parameters().flatten();
+        let g_arrays: std::collections::HashMap<String, &Array> = g_params
+            .iter()
+            .map(|(k, v)| (format!("generator.{}", k), v.as_ref()))
+            .collect();
+
+        // Get discriminator trainable parameters
+        let d_params = self.discriminator.trainable_parameters().flatten();
+        let d_arrays: std::collections::HashMap<String, &Array> = d_params
+            .iter()
+            .map(|(k, v)| (format!("discriminator.{}", k), v.as_ref()))
+            .collect();
+
+        // Combine all parameters
+        let mut all_params: std::collections::HashMap<String, &Array> = g_arrays;
+        all_params.extend(d_arrays);
+
+        // Save to safetensors (with None metadata)
+        Array::save_safetensors(all_params, None, path)?;
+
         Ok(())
     }
 
@@ -287,9 +296,9 @@ impl VITSTrainer {
             }
 
             if self.step % self.config.save_every == 0 && self.step > 0 {
-                let path = format!("checkpoint_{}.safetensors", self.step);
-                self.save_checkpoint(&path)?;
-                println!("Saved checkpoint to {}", path);
+                let ckpt_path = format!("checkpoint_{}.safetensors", self.step);
+                self.save_checkpoint(&ckpt_path)?;
+                println!("Saved checkpoint to {}", ckpt_path);
             }
         }
 

@@ -52,6 +52,9 @@ ndarray = "0.17.2"
 # Training
 rand = "0.8"
 
+# CLI
+clap = { version = "4", features = ["derive"] }
+
 [features]
 default = []
 debug-attn = []
@@ -73,3 +76,7 @@ path = "examples/trace_t2s_full.rs"
 [[example]]
 name = "train_t2s"
 path = "examples/train_t2s.rs"
+
+[[example]]
+name = "train_vits"
+path = "examples/train_vits.rs"
