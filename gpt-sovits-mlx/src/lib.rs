@@ -35,6 +35,7 @@ pub mod models;
 pub mod sampling;
 pub mod synthesis;
 pub mod text;
+pub mod training;
 pub mod voice_clone;
 
 // Re-export main types
