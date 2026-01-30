@@ -1,12 +1,21 @@
-//! Qwen-Image generation example
+//! Qwen-Image generation example (4-bit quantized)
 //!
-//! Downloads the mlx-community/Qwen-Image-2512-4bit model and generates an image.
+//! Model path can be set via environment variable:
+//!   export DORA_MODELS_PATH=~/.dora/models
+//!
+//! Expected directory structure:
+//!   $DORA_MODELS_PATH/qwen-image-2512-4bit/
+//!   ├── transformer/    (4-bit quantized)
+//!   ├── text_encoder/   (full precision)
+//!   ├── vae/            (full precision)
+//!   └── tokenizer/
+//!
+//! Falls back to HuggingFace cache if not found.
 //!
 //! Usage:
 //!   cargo run --release --example generate_qwen_image -- --prompt "a cat sitting on a couch"
 
 use std::collections::HashMap;
-use std::io::Write;
 use std::path::PathBuf;
 
 use clap::Parser;
@@ -78,29 +87,49 @@ fn get_hf_cache_dirs() -> Vec<PathBuf> {
     dirs
 }
 
-/// Get model directory from HuggingFace cache
+/// Get model directory from DORA_MODELS_PATH or HuggingFace cache
 fn get_model_dir(repo_id: &str) -> std::io::Result<PathBuf> {
+    // Determine model name for dora path
+    let dora_model_name = if repo_id.contains("8bit") {
+        "qwen-image-2512-8bit"
+    } else {
+        "qwen-image-2512-4bit"
+    };
+
+    // Check DORA_MODELS_PATH environment variable first
+    if let Ok(models_path) = std::env::var("DORA_MODELS_PATH") {
+        let model_dir = PathBuf::from(models_path).join(dora_model_name);
+        if model_dir.join("transformer").exists() {
+            return Ok(model_dir);
+        }
+    }
+
+    // Check default dora location
+    if let Some(home) = dirs::home_dir() {
+        let dora_path = home.join(".dora").join("models").join(dora_model_name);
+        if dora_path.join("transformer").exists() {
+            return Ok(dora_path);
+        }
+    }
+
+    // Fall back to HuggingFace cache
     let cache_dirs = get_hf_cache_dirs();
     let repo_name = format!("models--{}", repo_id.replace('/', "--"));
 
-    // Try each cache directory
     for cache_dir in &cache_dirs {
         let repo_dir = cache_dir.join(&repo_name);
         let snapshots_dir = repo_dir.join("snapshots");
 
         if snapshots_dir.exists() {
-            // Find the latest snapshot with the most complete set of files
             let mut entries: Vec<_> = std::fs::read_dir(&snapshots_dir)?
                 .filter_map(|e| e.ok())
                 .filter(|e| {
-                    // Prefer snapshots that have text_encoder directory
                     let has_text_encoder = e.path().join("text_encoder").exists();
                     let has_tokenizer = e.path().join("tokenizer").exists();
                     has_text_encoder && has_tokenizer
                 })
                 .collect();
 
-            // If no snapshot has text_encoder, try all snapshots
             if entries.is_empty() {
                 entries = std::fs::read_dir(&snapshots_dir)?
                     .filter_map(|e| e.ok())
@@ -118,9 +147,11 @@ fn get_model_dir(repo_id: &str) -> std::io::Result<PathBuf> {
     Err(std::io::Error::new(
         std::io::ErrorKind::NotFound,
         format!(
-            "Model not found. Please download with:\n  \
-             huggingface-cli download {} --include 'transformer/*.safetensors' --include 'vae/*.safetensors' --include 'text_encoder/*' --include 'tokenizer/*'",
-            repo_id
+            "Model not found. Please either:\n  \
+             1. Set DORA_MODELS_PATH and place model in $DORA_MODELS_PATH/{}/\n  \
+             2. Place model in ~/.dora/models/{}/\n  \
+             3. Download with: huggingface-cli download {}",
+            dora_model_name, dora_model_name, repo_id
         ),
     ))
 }
@@ -186,7 +217,7 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
         };
 
         // Find model directory
-        println!("Looking for model in HuggingFace cache...");
+        println!("Looking for model...");
         let dir = get_model_dir(repo_id)?;
         println!("  Found: {}", dir.display());
         dir
@@ -352,7 +383,7 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
 
     // Get text embeddings (conditional and unconditional for CFG)
     // Returns (cond_states, uncond_states, cond_mask, uncond_mask, cond_seq_len, uncond_seq_len)
-    let (cond_hidden_states, uncond_hidden_states, cond_mask, uncond_mask, cond_txt_len, uncond_txt_len) = if args.skip_text_encoder {
+    let (cond_hidden_states, uncond_hidden_states, _cond_mask, _uncond_mask, cond_txt_len, uncond_txt_len) = if args.skip_text_encoder {
         println!("\n=== Using Dummy Text Embeddings ===");
         let seed = args.seed.unwrap_or(42);
         let txt_key = mlx_rs::random::key(seed + 1)?;
@@ -405,7 +436,7 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
         let cond_mask_data: Vec<f32> = (0..max_output_len)
             .map(|i| if i < cond_num_output_tokens { 1.0 } else { 0.0 })
             .collect();
-        let cond_mask = Array::from_slice(&cond_mask_data, &[1, max_output_len as i32]);
+        let _cond_mask = Array::from_slice(&cond_mask_data, &[1, max_output_len as i32]);
 
         // Tokenize empty prompt for unconditional (CFG) - use same template with space
         println!("Tokenizing empty prompt for CFG...");
@@ -427,7 +458,7 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
         let uncond_mask_data: Vec<f32> = (0..max_output_len)
             .map(|i| if i < uncond_num_output_tokens { 1.0 } else { 0.0 })
             .collect();
-        let uncond_mask = Array::from_slice(&uncond_mask_data, &[1, max_output_len as i32]);
+        let _uncond_mask = Array::from_slice(&uncond_mask_data, &[1, max_output_len as i32]);
 
         println!("  Conditional: {} input tokens -> {} output tokens (after dropping {})",
             cond_total_tokens, cond_num_output_tokens, drop_idx);
@@ -845,36 +876,16 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
     let img = img.reshape(&[img_h as i32, img_w as i32, 3])?;
     mlx_rs::transforms::eval([&img])?;
 
-    // Save as PPM (RGB)
+    // Save as PNG using the image crate
     let img_data: Vec<u8> = img.as_slice().to_vec();
 
-    let output_path = std::path::Path::new("output_qwen.ppm");
-    let mut file = std::fs::File::create(output_path)?;
-    writeln!(file, "P6")?;
-    writeln!(file, "{} {}", img_w, img_h)?;
-    writeln!(file, "255")?;
-    file.write_all(&img_data)?;
+    use image::RgbImage;
+    let rgb_image = RgbImage::from_raw(img_w, img_h, img_data)
+        .ok_or_else(|| std::io::Error::new(std::io::ErrorKind::InvalidData, "Failed to create image from data"))?;
+    rgb_image.save(&args.output)?;
 
-    println!("Saved image to: {}", output_path.display());
+    println!("Saved image to: {}", args.output.display());
     println!("  Image size: {}x{}", img_w, img_h);
-
-    // Also save latent visualization for debugging
-    let latent_vis = vae_latents.index((0, 0, .., ..));
-    let min_val = latent_vis.min(None)?;
-    let max_val = latent_vis.max(None)?;
-    let range = mlx_rs::ops::subtract(&max_val, &min_val)?;
-    let normalized = mlx_rs::ops::divide(&mlx_rs::ops::subtract(&latent_vis, &min_val)?, &range)?;
-    let scaled = mlx_rs::ops::multiply(&normalized, &Array::from_f32(255.0))?;
-    let latent_u8 = scaled.as_dtype(mlx_rs::Dtype::Uint8)?;
-    let latent_data: Vec<u8> = latent_u8.as_slice().to_vec();
-
-    let latent_path = std::path::Path::new("output_qwen_latent.pgm");
-    let mut latent_file = std::fs::File::create(latent_path)?;
-    writeln!(latent_file, "P5")?;
-    writeln!(latent_file, "{} {}", vae_w, vae_h)?;
-    writeln!(latent_file, "255")?;
-    latent_file.write_all(&latent_data)?;
-    println!("Saved latent visualization to: {}", latent_path.display());
 
     println!("\n=== Generation Complete ===");
 

@@ -11,27 +11,30 @@ description = "Qwen-Image-2512 implementation in Rust using MLX"
 [dependencies]
 mlx-rs = { path = "../mlx-rs", features = ["safetensors"] }
 mlx-macros = { path = "../mlx-rs/mlx-macros" }
+mlx-rs-core = { path = "../mlx-rs-core" }
 thiserror.workspace = true
 safetensors.workspace = true
 bytemuck.workspace = true
 memmap2.workspace = true
 serde_json = "1"
 tokenizers = "0.21"
+mlx-sys = { path = "../mlx-rs/mlx-sys" }
 
 [dev-dependencies]
 pretty_assertions.workspace = true
 clap = { version = "4", features = ["derive"] }
 dirs = "5"
+half = "2"
+image = "0.25"
 
 [[example]]
 name = "generate_qwen_image"
 path = "examples/generate_qwen_image.rs"
-[[bin]]
-name = "test_index"
-path = "/tmp/test_index.rs"
-[[bin]]
-name = "test_index2"
-path = "/tmp/test_index2.rs"
-[[bin]]
-name = "test_contiguous"
-path = "/tmp/test_contiguous_example.rs"
+
+[[example]]
+name = "generate_full_precision"
+path = "examples/generate_full_precision.rs"
+
+[[example]]
+name = "generate_fp32"
+path = "examples/generate_fp32.rs"

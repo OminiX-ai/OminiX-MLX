@@ -14,6 +14,7 @@ pub mod transformer;
 pub mod pipeline;
 pub mod weights;
 pub mod qwen_quantized;
+pub mod qwen_full_precision;
 pub mod text_encoder;
 
 pub use error::QwenImageError;
