@@ -2,24 +2,27 @@
 //!
 //! Usage:
 //!   cargo run --release --example benchmark -- <audio.wav> [iterations]
+//!
+//! Model path: Uses FUNASR_NANO_MODEL_PATH env var or ~/.dora/models/funasr-nano
 
 use std::env;
 use std::time::Instant;
 
-use funasr_nano_mlx::audio;
-use funasr_nano_mlx::model::FunASRNano;
+use funasr_nano_mlx::{audio, FunASRNano, default_model_path};
 
 fn main() -> Result<(), Box<dyn std::error::Error>> {
     let args: Vec<String> = env::args().collect();
 
-    let audio_path = args.get(1).map(|s| s.as_str()).unwrap_or("/tmp/voice_memo.wav");
+    let model_dir = default_model_path();
+    let default_audio = model_dir.join("example/zh.wav");
+    let audio_path = args.get(1).map(|s| s.to_string())
+        .unwrap_or_else(|| default_audio.to_string_lossy().to_string());
     let iterations: usize = args.get(2).and_then(|s| s.parse().ok()).unwrap_or(10);
-    let model_dir = "./Fun-ASR-Nano-2512";
 
     // Load model
-    println!("Loading model from {}...", model_dir);
+    println!("Loading model from {}...", model_dir.display());
     let load_start = Instant::now();
-    let mut model = FunASRNano::load(model_dir)?;
+    let mut model = FunASRNano::load(&model_dir)?;
     let load_time = load_start.elapsed();
     println!("Model loaded in {:.2}s", load_time.as_secs_f32());
 

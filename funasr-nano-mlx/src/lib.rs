@@ -11,12 +11,19 @@
 //!
 //! Total: ~985M parameters
 //!
+//! ## Model Path
+//!
+//! The model path can be configured via:
+//! 1. Environment variable `FUNASR_NANO_MODEL_PATH`
+//! 2. Default location: `~/.dora/models/funasr-nano`
+//!
 //! ## Example
 //!
 //! ```rust,ignore
-//! use funasr_nano_mlx::{FunASRNano, load_model};
+//! use funasr_nano_mlx::{FunASRNano, load_model, default_model_path};
 //!
-//! let mut model = load_model("path/to/model")?;
+//! // Load from default path or FUNASR_NANO_MODEL_PATH env var
+//! let mut model = load_model(default_model_path())?;
 //! let text = model.transcribe("audio.wav")?;
 //! ```
 
@@ -38,6 +45,40 @@ pub use audio::{AudioConfig, MelFrontend};
 
 // Re-export from mlx-rs-core
 pub use mlx_rs_core::{KVCache, ConcatKeyValueCache};
+
+/// Environment variable name for model path
+pub const MODEL_PATH_ENV: &str = "FUNASR_NANO_MODEL_PATH";
+
+/// Default model directory under ~/.dora/models
+pub const DEFAULT_MODEL_DIR: &str = "funasr-nano";
+
+/// Get the default model path.
+///
+/// Resolution order:
+/// 1. `FUNASR_NANO_MODEL_PATH` environment variable
+/// 2. `~/.dora/models/funasr-nano`
+///
+/// # Example
+///
+/// ```rust,ignore
+/// use funasr_nano_mlx::{load_model, default_model_path};
+///
+/// let model = load_model(default_model_path())?;
+/// ```
+pub fn default_model_path() -> std::path::PathBuf {
+    // Check environment variable first
+    if let Ok(path) = std::env::var(MODEL_PATH_ENV) {
+        return std::path::PathBuf::from(path);
+    }
+
+    // Fall back to ~/.dora/models/funasr-nano
+    if let Some(home) = dirs::home_dir() {
+        return home.join(".dora").join("models").join(DEFAULT_MODEL_DIR);
+    }
+
+    // Last resort: current directory
+    std::path::PathBuf::from(".")
+}
 
 /// Load a Fun-ASR-Nano model from a directory.
 ///

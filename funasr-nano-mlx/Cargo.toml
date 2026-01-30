@@ -30,6 +30,9 @@ rubato = "0.16"  # High-quality resampling
 hound = "3.5"    # WAV file reading
 rustfft = "6.2"  # FFT for mel spectrogram (45x faster than manual DFT)
 
+# Path utilities
+dirs = "5"       # Cross-platform home directory
+
 [dev-dependencies]
 
 [[example]]
