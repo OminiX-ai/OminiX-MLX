@@ -114,15 +114,29 @@ pub struct VoiceClonerConfig {
     pub use_mlx_vits: bool,
 }
 
+/// Get the default model directory path
+/// Uses $GPT_SOVITS_MODEL_DIR if set, otherwise ~/.dora/models/primespeech/gpt-sovits-mlx
+fn default_model_dir() -> String {
+    if let Ok(dir) = std::env::var("GPT_SOVITS_MODEL_DIR") {
+        return dir;
+    }
+    if let Some(home) = std::env::var_os("HOME") {
+        return format!("{}/.dora/models/primespeech/gpt-sovits-mlx", home.to_string_lossy());
+    }
+    // Fallback
+    "/tmp/gpt-sovits-mlx".to_string()
+}
+
 impl Default for VoiceClonerConfig {
     fn default() -> Self {
+        let model_dir = default_model_dir();
         Self {
             // Use doubao-mixed fine-tuned models (converted from dora-primespeech)
-            t2s_weights: "/tmp/gpt-sovits-mlx/doubao_mixed_gpt_new.safetensors".to_string(),
-            bert_weights: "/tmp/gpt-sovits-mlx/bert.safetensors".to_string(),
-            bert_tokenizer: "/tmp/gpt-sovits-mlx/chinese-roberta-tokenizer/tokenizer.json".to_string(),
-            vits_weights: "/tmp/gpt-sovits-mlx/doubao_mixed_sovits_new.safetensors".to_string(),
-            hubert_weights: "/tmp/gpt-sovits-mlx/hubert.safetensors".to_string(),
+            t2s_weights: format!("{}/doubao_mixed_gpt_new.safetensors", model_dir),
+            bert_weights: format!("{}/bert.safetensors", model_dir),
+            bert_tokenizer: format!("{}/chinese-roberta-tokenizer/tokenizer.json", model_dir),
+            vits_weights: format!("{}/doubao_mixed_sovits_new.safetensors", model_dir),
+            hubert_weights: format!("{}/hubert.safetensors", model_dir),
             sample_rate: 32000,
             top_k: 5,  // Match Python TTS.py default
             top_p: 1.0,  // Match Python TTS.py default (no nucleus sampling)
@@ -131,7 +145,7 @@ impl Default for VoiceClonerConfig {
             noise_scale: 0.5,
             speed: 1.0,
             // ONNX VITS is default for best quality (batched decode, matches Python)
-            vits_onnx_path: Some("/tmp/gpt-sovits-mlx/vits.onnx".to_string()),
+            vits_onnx_path: Some(format!("{}/vits.onnx", model_dir)),
             use_mlx_vits: false,
         }
     }

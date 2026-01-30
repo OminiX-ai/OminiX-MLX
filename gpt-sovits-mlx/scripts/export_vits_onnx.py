@@ -5,7 +5,7 @@ Usage:
     python export_vits_onnx.py \
         --moyoyo-tts /path/to/dora-primespeech/dora_primespeech/moyoyo_tts \
         --checkpoint /path/to/doubao-mixed.pth \
-        --output /tmp/gpt-sovits-mlx/vits.onnx
+        --output ~/.dora/models/primespeech/gpt-sovits-mlx/vits.onnx
 """
 
 import argparse

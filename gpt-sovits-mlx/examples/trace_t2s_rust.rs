@@ -92,7 +92,7 @@ fn compare_arrays(name: &str, rust: &Array, python_path: &str) {
 
 fn main() -> Result<(), Box<dyn std::error::Error>> {
     // Load T2S model weights
-    let weights_path = "/tmp/gpt-sovits-mlx/doubao_mixed_gpt_new.safetensors";
+    let weights_path = "~/.dora/models/primespeech/gpt-sovits-mlx/doubao_mixed_gpt_new.safetensors";
     println!("Loading T2S weights from {}", weights_path);
 
     let weights = Array::load_safetensors(weights_path)?;

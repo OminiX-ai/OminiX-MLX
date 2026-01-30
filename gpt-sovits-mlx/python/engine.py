@@ -503,7 +503,7 @@ if __name__ == "__main__":
 
     parser = argparse.ArgumentParser(description="GPT-SoVITS MLX TTS Engine")
     parser.add_argument("text", nargs="?", default="你好，世界！", help="Text to synthesize")
-    parser.add_argument("--model-dir", "-m", default="/tmp/gpt-sovits-mlx", help="Model directory")
+    parser.add_argument("--model-dir", "-m", default="~/.dora/models/primespeech/gpt-sovits-mlx", help="Model directory")
     parser.add_argument("--voice", "-v", default="Doubao", help="Voice name")
     parser.add_argument("--language", "-l", default="zh", help="Language (zh, en, auto)")
     parser.add_argument("--speed", "-s", type=float, default=1.0, help="Speed factor")

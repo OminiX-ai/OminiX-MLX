@@ -199,7 +199,7 @@ def main():
     bert_features_tensor = bert_features.unsqueeze(0)  # [1, 1024, seq]
 
     # Load pre-computed prompt semantic codes for few-shot
-    codes_path = "/tmp/gpt-sovits-mlx/doubao_mixed_codes.bin"
+    codes_path = "~/.dora/models/primespeech/gpt-sovits-mlx/doubao_mixed_codes.bin"
     if os.path.exists(codes_path):
         codes_data = open(codes_path, "rb").read()
         prompt_codes = np.frombuffer(codes_data, dtype=np.int32)

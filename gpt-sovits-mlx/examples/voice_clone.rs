@@ -30,7 +30,7 @@ const DEFAULT_REF_AUDIO: &str = "/Users/yuechen/.dora/models/primespeech/moyoyo/
 // Reference text for doubao voice (must match the reference audio)
 const DEFAULT_REF_TEXT: &str = "这家resturant的steak很有名，但是vegetable salad的price有点贵";
 // Pre-computed codes from Python (for better quality)
-const DEFAULT_REF_CODES: &str = "/tmp/gpt-sovits-mlx/doubao_mixed_codes.bin";
+const DEFAULT_REF_CODES: &str = "~/.dora/models/primespeech/gpt-sovits-mlx/doubao_mixed_codes.bin";
 
 // Luo Xiang reference
 const LUOXIANG_REF_AUDIO: &str = "/Users/yuechen/.dora/models/primespeech/moyoyo/ref_audios/luoxiang_ref.wav";

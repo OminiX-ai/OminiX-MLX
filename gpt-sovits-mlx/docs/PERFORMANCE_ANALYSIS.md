@@ -298,7 +298,7 @@ Successfully converts original weights to MLX format:
 ```bash
 python scripts/convert_gpt_weights.py \
   --input ~/.dora/models/primespeech/moyoyo/GPT_weights/doubao-mixed.ckpt \
-  --output /tmp/gpt-sovits-mlx/doubao_gpt.safetensors
+  --output ~/.dora/models/primespeech/gpt-sovits-mlx/doubao_gpt.safetensors
 ```
 
 Conversion handles:
@@ -480,7 +480,7 @@ All 17 unit tests passing.
 ### Model Directory Structure
 
 ```
-/tmp/gpt-sovits-mlx/
+~/.dora/models/primespeech/gpt-sovits-mlx/
 ├── encoders/
 │   ├── cnhubert_ane.mlpackage     # CNHubert CoreML model
 │   └── roberta_ane.mlpackage      # RoBERTa CoreML model

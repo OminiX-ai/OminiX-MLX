@@ -12,7 +12,7 @@ Usage:
     # Or from local directory:
     python convert_roberta_coreml.py \
         --input ~/.dora/models/primespeech/moyoyo/chinese-roberta-wwm-ext-large \
-        --output /tmp/gpt-sovits-mlx/roberta_ane.mlpackage
+        --output ~/.dora/models/primespeech/gpt-sovits-mlx/roberta_ane.mlpackage
 
 The conversion applies ANE optimizations:
 - FP16 precision for faster inference
