@@ -7,8 +7,9 @@
 use std::path::Path;
 
 use mlx_rs::{
-    array,
     optimizers::AdamW,
+    ops::indexing::IndexOp,
+    transforms::eval,
     Array,
 };
 
@@ -18,10 +19,10 @@ use crate::{
         discriminator::{MultiPeriodDiscriminator, MPDConfig, losses as disc_losses},
         vits::{SynthesizerTrn, VITSConfig, load_vits_model},
     },
-    audio::MelConfig,
+    audio::{MelConfig, mel_spectrogram_mlx},
 };
 
-use super::vits_loss;
+use super::vits_loss::{kl_loss, mel_reconstruction_loss};
 
 /// Configuration for VITS training
 #[derive(Debug, Clone)]
@@ -93,6 +94,8 @@ pub struct VITSBatch {
     pub text_lengths: Array,
     /// Target audio [batch, 1, samples]
     pub audio: Array,
+    /// Reference mel spectrogram [batch, mel_channels, time]
+    pub refer_mel: Array,
 }
 
 /// VITS Trainer with GAN training loop
@@ -153,66 +156,93 @@ impl VITSTrainer {
     ///
     /// Performs alternating D and G updates following HiFi-GAN training.
     pub fn train_step(&mut self, batch: &VITSBatch) -> Result<VITSLosses, Error> {
-        // For now, this is a simplified training step that focuses on the structure
-        // A full implementation would need forward_train() on the generator
-
         // ======================
         // Step 1: Forward pass through generator
         // ======================
 
-        // In a full implementation, this would call generator.forward_train()
-        // which returns y_hat and all intermediate latents for loss computation.
-        // For now, we'll use decode() as a simplified stand-in.
+        // Call forward_train() to get all intermediate values
+        let (y_hat, z_p, m_p, logs_p, _z, _m_q, logs_q, y_mask) = self.generator.forward_train(
+            &batch.ssl_features,
+            &batch.spec,
+            &batch.spec_lengths,
+            &batch.text,
+            &batch.refer_mel,
+        ).map_err(|e| Error::Message(e.to_string()))?;
 
-        // Quantize SSL features
-        let quantized = self.generator.quantizer.decode(&batch.ssl_features)
-            .map_err(|e| Error::Message(e.to_string()))?;
-
-        // For simplified training, we'll compute discriminator loss on existing audio
-        // This is a placeholder - real training needs proper forward_train()
+        // Force evaluation of forward pass
+        eval([&y_hat, &z_p, &m_p, &logs_p, &logs_q, &y_mask])?;
 
         // ======================
         // Step 2: Discriminator update
         // ======================
 
-        // Use real audio for D training
+        // Match audio lengths for discriminator
+        // y_hat: [batch, 1, generated_samples]
+        // batch.audio: [batch, 1, target_samples]
         let y_real = &batch.audio;
 
-        // For demo, use real audio as "fake" too (proper impl needs generator output)
-        let y_fake = y_real.clone();
+        // Slice y_hat to match y_real length or vice versa
+        let gen_len = y_hat.dim(2) as i32;
+        let real_len = y_real.dim(2) as i32;
+        let min_len = gen_len.min(real_len);
 
-        // Discriminator forward
-        let (d_real, d_fake, fmap_real, fmap_fake) = self.discriminator.forward(y_real, &y_fake)?;
+        let y_hat_sliced = y_hat.index((.., .., 0..min_len));
+        let y_real_sliced = y_real.index((.., .., 0..min_len));
 
-        // Discriminator loss
+        // Discriminator forward on real and fake
+        let (d_real, d_fake, fmap_real, fmap_fake) =
+            self.discriminator.forward(&y_real_sliced, &y_hat_sliced)?;
+
+        // Discriminator loss: wants real=1, fake=0
         let loss_d = disc_losses::discriminator_loss(&d_real, &d_fake)?;
         let loss_d_val: f32 = loss_d.item();
 
-        // Note: In a full implementation, we'd compute gradients and update D here
-        // using nn::value_and_grad
+        // TODO: In a full implementation with nn::value_and_grad:
+        // 1. Define discriminator loss function
+        // 2. Compute gradients w.r.t discriminator parameters
+        // 3. Update discriminator with optim_d.update()
 
         // ======================
         // Step 3: Generator update
         // ======================
 
-        // Generator loss components
+        // Generator adversarial loss: wants fake=1
         let loss_gen = disc_losses::generator_loss(&d_fake)?;
+
+        // Feature matching loss
         let loss_fm = disc_losses::feature_matching_loss(&fmap_real, &fmap_fake)?;
 
-        // Simplified mel loss (would need proper mel computation in full impl)
-        let loss_mel = array!(0.0f32);
+        // Mel spectrogram reconstruction loss
+        // Compute mel from real and generated audio
+        let mel_real = mel_spectrogram_mlx(&y_real_sliced.squeeze_axes(&[1])?, &self.mel_config)
+            .map_err(|e| Error::Message(e.to_string()))?;
+        let mel_fake = mel_spectrogram_mlx(&y_hat_sliced.squeeze_axes(&[1])?, &self.mel_config)
+            .map_err(|e| Error::Message(e.to_string()))?;
 
-        // Simplified KL loss
-        let loss_kl = array!(0.0f32);
+        let loss_mel = mel_reconstruction_loss(&mel_real, &mel_fake)
+            .map_err(|e| Error::Message(e.to_string()))?;
 
+        // KL divergence loss between posterior and prior
+        let loss_kl = kl_loss(&z_p, &logs_q, &m_p, &logs_p, &y_mask)
+            .map_err(|e| Error::Message(e.to_string()))?;
+
+        // Extract scalar values
         let loss_gen_val: f32 = loss_gen.item();
         let loss_fm_val: f32 = loss_fm.item();
         let loss_mel_val: f32 = loss_mel.item();
         let loss_kl_val: f32 = loss_kl.item();
 
-        // Total generator loss
-        let loss_total = loss_d_val + loss_gen_val + loss_fm_val * self.config.c_fm
-            + loss_mel_val * self.config.c_mel + loss_kl_val * self.config.c_kl;
+        // Total generator loss (weighted sum)
+        let loss_total = loss_gen_val
+            + loss_fm_val * self.config.c_fm
+            + loss_mel_val * self.config.c_mel
+            + loss_kl_val * self.config.c_kl;
+
+        // TODO: In a full implementation with nn::value_and_grad:
+        // 1. Define generator loss function
+        // 2. Compute gradients w.r.t generator parameters
+        // 3. Clip gradients if needed
+        // 4. Update generator with optim_g.update()
 
         self.step += 1;
 
@@ -227,9 +257,10 @@ impl VITSTrainer {
     }
 
     /// Save checkpoint
-    pub fn save_checkpoint(&self, path: impl AsRef<Path>) -> Result<(), Error> {
+    pub fn save_checkpoint(&self, _path: impl AsRef<Path>) -> Result<(), Error> {
         // In a full implementation, this would save both G and D weights
-        // For now, just note that it would call module.save_weights()
+        // using model.trainable_parameters() and Array::save_safetensors()
+        // For now, just a placeholder
         Ok(())
     }
 
