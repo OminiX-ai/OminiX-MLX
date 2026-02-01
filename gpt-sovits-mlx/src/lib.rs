@@ -32,6 +32,8 @@ pub mod cache;
 pub mod error;
 pub mod inference;
 pub mod models;
+pub mod nn;
+pub mod preprocessing;
 pub mod sampling;
 pub mod synthesis;
 pub mod text;
@@ -44,3 +46,9 @@ pub use synthesis::ReferenceManager;
 pub use sampling::{Sampler, SamplingConfig};
 pub use text::{Language, preprocess_text};
 pub use error::Error;
+pub use preprocessing::{
+    AudioSlicer, SlicerConfig, AudioChunk,
+    ASRProcessor, ASRConfig, Transcript,
+    Denoiser, DenoiseConfig,
+    PreprocessingPipeline, PreprocessingConfig,
+};
