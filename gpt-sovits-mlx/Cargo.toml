@@ -30,6 +30,7 @@ thiserror = "2"
 
 # Logging
 tracing = "0.1"
+tracing-subscriber = { version = "0.3", features = ["env-filter"] }
 
 # Tokenizers
 tokenizers = { version = "0.22.0", features = ["http"] }
@@ -52,8 +53,17 @@ ndarray = "0.17.2"
 # Training
 rand = "0.8"
 
+# ONNX manipulation
+safetensors = "0.5"
+onnx-pb = "0.1"
+prost_old = { package = "prost", version = "0.6.1" }
+byteorder = "1.5"
+
 # CLI
 clap = { version = "4", features = ["derive"] }
+
+# Path expansion
+dirs = "5"
 
 [features]
 default = []
@@ -80,3 +90,19 @@ path = "examples/train_t2s.rs"
 [[example]]
 name = "train_vits"
 path = "examples/train_vits.rs"
+
+[[example]]
+name = "preprocess"
+path = "examples/preprocess.rs"
+
+[[example]]
+name = "test_vits_compare"
+path = "examples/test_vits_compare.rs"
+
+[[example]]
+name = "export_vits_onnx"
+path = "examples/export_vits_onnx.rs"
+
+[[example]]
+name = "preprocess_audio"
+path = "examples/preprocess_audio.rs"
