@@ -27,7 +27,80 @@ use mlx_rs::{
     Array,
 };
 
+/// Linear interpolation along the last axis (1D)
+///
+/// Equivalent to PyTorch's F.interpolate(x, size=new_size, mode="linear")
+///
+/// Args:
+/// - x: Input tensor [batch, channels, seq_len]
+/// - new_size: Target sequence length
+///
+/// Returns tensor [batch, channels, new_size]
+fn interpolate_linear(x: &Array, new_size: i32) -> Result<Array, Exception> {
+    let shape = x.shape();
+    let src_len = shape[2] as i32;
+
+    if new_size == src_len {
+        return Ok(x.clone());
+    }
+
+    if new_size <= 0 {
+        return Err(Exception::from("new_size must be positive"));
+    }
+
+    // For each output position, compute the weighted average of two neighboring input positions
+    // scale = (src_len - 1) / (new_size - 1) for endpoint-aligned interpolation
+    // But PyTorch's "linear" mode uses: scale = src_len / new_size (area-based)
+    let scale = src_len as f32 / new_size as f32;
+
+    // Build indices and weights for linear interpolation
+    let mut left_indices = Vec::with_capacity(new_size as usize);
+    let mut right_indices = Vec::with_capacity(new_size as usize);
+    let mut weights = Vec::with_capacity(new_size as usize);
+
+    for i in 0..new_size {
+        // Source position (align to center of output bin)
+        let src_pos = (i as f32 + 0.5) * scale - 0.5;
+        let src_pos = src_pos.max(0.0).min((src_len - 1) as f32);
+
+        let left = src_pos.floor() as i32;
+        let right = (left + 1).min(src_len - 1);
+        let weight = src_pos - left as f32;
+
+        left_indices.push(left);
+        right_indices.push(right);
+        weights.push(weight);
+    }
+
+    // Gather left and right values
+    // x shape: [batch, channels, seq_len]
+    // We need to index along the last axis
+
+    // Convert to arrays for indexing
+    let left_idx = Array::from_slice(&left_indices, &[new_size]);
+    let right_idx = Array::from_slice(&right_indices, &[new_size]);
+    let weights_arr = Array::from_slice(&weights, &[1, 1, new_size]);
+
+    // Use take along last axis
+    // Transpose to [seq_len, batch, channels]
+    let x_t = x.transpose_axes(&[2, 0, 1])?; // [batch, channels, seq_len] -> [seq_len, batch, channels]
+
+    let left_vals = x_t.index((&left_idx, .., ..));   // [new_size, batch, channels]
+    let right_vals = x_t.index((&right_idx, .., ..)); // [new_size, batch, channels]
+
+    // Transpose back to [batch, channels, new_size]
+    let left_vals = left_vals.transpose_axes(&[1, 2, 0])?;  // [new_size, batch, channels] -> [batch, channels, new_size]
+    let right_vals = right_vals.transpose_axes(&[1, 2, 0])?;
+
+    // Linear interpolation: left * (1 - weight) + right * weight
+    let one_minus_w = array!(1.0f32).subtract(&weights_arr)?;
+    let result = left_vals.multiply(&one_minus_w)?.add(&right_vals.multiply(&weights_arr)?)?;
+
+    Ok(result)
+}
+
 use crate::error::Error;
+use crate::nn::{WeightNormConv1d, WeightNormConvTranspose1d};
 
 /// Configuration for VITS model
 #[derive(Debug, Clone)]
@@ -67,6 +140,9 @@ pub struct VITSConfig {
     /// Semantic frame rate: "25hz" (2x downsample in ssl_proj) or "50hz" (no downsample)
     /// Models trained with s1bert25hz-* use "25hz", older models use "50hz"
     pub semantic_frame_rate: String,
+    /// Segment size for training (in frames, not samples)
+    /// Default 32 frames = 20480 samples at hop_length=640
+    pub segment_size: i32,
 }
 
 impl Default for VITSConfig {
@@ -91,8 +167,69 @@ impl Default for VITSConfig {
             // Default to "50hz" for backwards compatibility with older models (luoxiang, mayun)
             // Set to "25hz" for models trained with s1bert25hz-* (doubao-mixed)
             semantic_frame_rate: "50hz".to_string(),
+            // segment_size = 20480 samples / hop_length = 20480 / 640 = 32 frames
+            segment_size: 32,
         }
     }
+}
+
+/// Randomly slice segments from a tensor for training.
+/// Python: commons.rand_slice_segments(x, x_lengths, segment_size)
+///
+/// # Arguments
+/// * `x` - Input tensor [batch, channels, time]
+/// * `x_lengths` - Optional lengths per batch item (if None, uses full length)
+/// * `segment_size` - Size of segment to slice
+///
+/// # Returns
+/// * `(sliced, ids_slice)` - Sliced tensor and start indices
+pub fn rand_slice_segments(
+    x: &Array,
+    x_lengths: Option<&Array>,
+    segment_size: i32,
+) -> Result<(Array, Array), Exception> {
+    use mlx_rs::transforms::eval;
+
+    let batch = x.dim(0) as i32;
+    let time = x.dim(2) as i32;
+
+    // Get max valid start index per batch item
+    let ids_str_max = if let Some(lengths) = x_lengths {
+        // lengths - segment_size + 1, but clamp to >= 1
+        let seg_arr = Array::from_int(segment_size - 1);
+        let max_idx = lengths.subtract(&seg_arr)?;
+        // Clamp to at least 1 to avoid negative indices
+        maximum(&max_idx, &Array::from_int(1))?
+    } else {
+        // Use full time length: create array filled with (time - segment_size + 1)
+        let max_val = time - segment_size + 1;
+        Array::from_iter((0..batch).map(|_| max_val), &[batch])
+    };
+
+    // Random start indices: (rand([batch]) * max_idx).to_int()
+    // random::uniform needs: uniform::<LowType, HighType>(low, high, shape, key)
+    let rand_vals = random::uniform::<f32, f32>(0.0, 1.0, &[batch], None)?;
+    let ids_str = rand_vals.multiply(&ids_str_max.as_type::<f32>()?)?;
+    let ids_str = ids_str.as_type::<i32>()?;
+
+    // Need to evaluate to get actual values for indexing
+    eval([&ids_str])?;
+
+    // Slice each batch item - need to gather slices
+    // For simplicity, we'll use a loop since MLX doesn't have built-in slice_segments
+    let mut slices = Vec::with_capacity(batch as usize);
+    for b in 0..batch {
+        let start_idx: i32 = ids_str.index(b).item();
+        let end_idx = start_idx + segment_size;
+        let slice = x.index((b, .., start_idx..end_idx));
+        slices.push(slice);
+    }
+
+    // Stack slices back to [batch, channels, segment_size]
+    let slices_refs: Vec<&Array> = slices.iter().collect();
+    let sliced = mlx_rs::ops::stack_axis(&slices_refs, 0)?;
+
+    Ok((sliced, ids_str))
 }
 
 // ============================================================================
@@ -201,6 +338,74 @@ impl RVQCodebook {
 
         // Reshape to [batch, 1, seq]
         codes.reshape(&[batch, 1, seq])
+    }
+
+    /// Forward pass with commitment loss (for training).
+    ///
+    /// This performs VQ quantization with straight-through estimator:
+    /// - Forward: returns quantized embeddings
+    /// - Backward: gradients flow through input features (not through codebook lookup)
+    ///
+    /// Python equivalent:
+    /// ```python
+    /// quantized, codes, commit_loss, _ = self.quantizer(ssl, layers=[0])
+    /// ```
+    ///
+    /// Input: features [batch, dim, seq] (NCL format)
+    /// Returns: (quantized_st, commit_loss)
+    ///   - quantized_st: Quantized features with straight-through gradients [batch, dim, seq]
+    ///   - commit_loss: VQ commitment loss (scalar)
+    pub fn forward_with_loss(&self, features: &Array) -> Result<(Array, Array), Exception> {
+        use mlx_rs::transforms::eval;
+        use mlx_rs::ops::{sum_axis, indexing::argmin_axis};
+        use mlx_rs::stop_gradient;
+
+        let shape = features.shape();
+        let batch = shape[0] as i32;
+        let dim = shape[1] as i32;
+        let seq = shape[2] as i32;
+
+        // Step 1: Find nearest codebook entries (same as encode)
+        let features_t = features.transpose_axes(&[0, 2, 1])?;
+        let flat_features = features_t.reshape(&[batch * seq, dim])?;
+
+        // Compute L2 distances: ||a - b||^2 = ||a||^2 + ||b||^2 - 2 * a . b
+        let features_sq = sum_axis(&flat_features.multiply(&flat_features)?, -1, true)?;
+        let embed_sq = sum_axis(&self.embed.multiply(&self.embed)?, -1, true)?;
+        let embed_sq_t = embed_sq.transpose()?;
+        let embed_t = self.embed.transpose()?;
+        let dot = matmul(&flat_features, &embed_t)?;
+        let distances = features_sq
+            .add(&embed_sq_t)?
+            .subtract(&dot.multiply(array!(2.0f32))?)?;
+
+        // Find nearest codebook entry
+        let codes = argmin_axis(&distances, -1, false)?;
+        let codes = codes.as_type::<i32>()?;
+
+        // Step 2: Look up quantized embeddings
+        let quantized_flat = self.embed.take_axis(&codes, 0)?;
+        // quantized_flat: [batch * seq, dim]
+
+        // Reshape back to [batch, seq, dim] then transpose to [batch, dim, seq]
+        let quantized_nlc = quantized_flat.reshape(&[batch, seq, dim])?;
+        let quantized = quantized_nlc.transpose_axes(&[0, 2, 1])?;
+
+        eval([&quantized])?;
+
+        // Step 3: Compute commitment loss
+        // commit_loss = ||z - quantized||^2
+        // Python uses F.mse_loss, which is mean((z - quantized)^2)
+        let diff = features.subtract(&quantized)?;
+        let commit_loss = diff.square()?.mean(false)?;
+
+        // Step 4: Straight-through estimator
+        // quantized_st = z + stop_gradient(quantized - z)
+        // Forward: returns quantized
+        // Backward: gradients flow through z (as if identity)
+        let quantized_st = features.add(&stop_gradient(&quantized.subtract(features)?)?)?;
+
+        Ok((quantized_st, commit_loss))
     }
 }
 
@@ -1342,17 +1547,20 @@ impl HiFiGANResBlock {
     }
 }
 
-/// HiFiGAN Generator
+/// HiFiGAN Generator with Weight Normalization
+///
+/// Uses weight normalization on conv_pre, ups, and conv_post layers
+/// to match PyTorch training behavior and prevent weight drift.
 #[derive(Debug, Clone, ModuleParameters)]
 pub struct HiFiGANGenerator {
     #[param]
-    pub conv_pre: nn::Conv1d,
+    pub conv_pre: WeightNormConv1d,
     #[param]
-    pub ups: Vec<nn::ConvTranspose1d>,
+    pub ups: Vec<WeightNormConvTranspose1d>,
     #[param]
     pub resblocks: Vec<HiFiGANResBlock>,
     #[param]
-    pub conv_post: nn::Conv1d,
+    pub conv_post: WeightNormConv1d,
     #[param]
     pub cond: nn::Conv1d,
     pub num_kernels: i32,
@@ -1361,14 +1569,18 @@ pub struct HiFiGANGenerator {
 
 impl HiFiGANGenerator {
     pub fn new(config: &VITSConfig) -> Result<Self, Exception> {
-        let conv_pre = nn::Conv1dBuilder::new(
+        // conv_pre with weight normalization
+        let conv_pre = WeightNormConv1d::new(
             config.hidden_channels,
             config.upsample_initial_channel,
-            7,
-        )
-        .padding(3)
-        .build()?;
+            7,    // kernel_size
+            1,    // stride
+            3,    // padding
+            1,    // dilation
+            true, // bias
+        )?;
 
+        // Upsample layers with weight normalization
         let mut ups = Vec::new();
         let mut ch = config.upsample_initial_channel;
         for (_i, (&u, &k)) in config
@@ -1378,15 +1590,18 @@ impl HiFiGANGenerator {
             .enumerate()
         {
             let out_ch = ch / 2;
-            ups.push(
-                nn::ConvTranspose1dBuilder::new(ch, out_ch, k)
-                    .stride(u)
-                    .padding((k - u) / 2)
-                    .build()?,
-            );
+            ups.push(WeightNormConvTranspose1d::new(
+                ch,           // in_channels
+                out_ch,       // out_channels
+                k,            // kernel_size
+                u,            // stride
+                (k - u) / 2,  // padding
+                true,         // bias
+            )?);
             ch = out_ch;
         }
 
+        // ResBlocks (not weight normalized in original)
         let mut resblocks = Vec::new();
         ch = config.upsample_initial_channel;
         for _i in 0..config.upsample_rates.len() {
@@ -1401,12 +1616,20 @@ impl HiFiGANGenerator {
             }
         }
 
+        // conv_post with weight normalization
         let final_ch = config.upsample_initial_channel
             / (2_i32.pow(config.upsample_rates.len() as u32));
-        let conv_post = nn::Conv1dBuilder::new(final_ch, 1, 7)
-            .padding(3)
-            .build()?;
+        let conv_post = WeightNormConv1d::new(
+            final_ch,
+            1,    // out_channels
+            7,    // kernel_size
+            1,    // stride
+            3,    // padding
+            1,    // dilation
+            false, // no bias on final layer
+        )?;
 
+        // cond layer (not weight normalized)
         let cond =
             nn::Conv1dBuilder::new(config.gin_channels, config.upsample_initial_channel, 1)
                 .build()?;
@@ -1823,14 +2046,14 @@ impl SynthesizerTrn {
     /// - text: Phoneme indices [batch, text_seq]
     /// - refer: Reference mel spectrogram [batch, mel_channels, time] (optional)
     /// - noise_scale: Noise scale for sampling (default 0.5)
-    /// - speed: Speed factor (default 1.0)
+    /// - speed: Speed factor (default 1.0, >1.0 = faster speech, <1.0 = slower)
     pub fn decode(
         &mut self,
         codes: &Array,
         text: &Array,
         refer: Option<&Array>,
         noise_scale: f32,
-        _speed: f32,
+        speed: f32,
     ) -> Result<Array, Exception> {
         // Get style embedding from reference
         // For v2, slice to first 704 channels: refer[:, :704, :]
@@ -1855,6 +2078,17 @@ impl SynthesizerTrn {
         let q_rep = Array::repeat_axis::<f32>(q_expanded, 2, 3)?;
         // Reshape: [1, dim, seq*2]
         let quantized = q_rep.reshape(&[1, self.config.codebook_dim, target_len])?;
+
+        // Apply speed factor via linear interpolation
+        // speed > 1.0 = faster (shorter sequence), speed < 1.0 = slower (longer sequence)
+        // Python: y = F.interpolate(y, size=int(y.shape[-1] / speed)+1, mode="linear")
+        let quantized = if (speed - 1.0).abs() > 1e-6 {
+            let current_len = quantized.shape()[2] as i32;
+            let new_len = (current_len as f32 / speed) as i32 + 1;
+            interpolate_linear(&quantized, new_len)?
+        } else {
+            quantized
+        };
 
         // TextEncoder forward
         let (_, m_p, logs_p, y_mask) =
@@ -1892,7 +2126,7 @@ impl SynthesizerTrn {
     /// - refer: Reference mel spectrogram [batch, mel_channels, time] in NCL
     ///
     /// Returns:
-    /// - y_hat: Generated audio [batch, 1, samples]
+    /// - y_hat: Generated audio [batch, 1, segment_samples] (only segment_size frames decoded)
     /// - z_p: Flow-transformed latent [batch, hidden, time]
     /// - m_p: Prior mean from text encoder [batch, hidden, time]
     /// - logs_p: Prior log-variance from text encoder [batch, hidden, time]
@@ -1900,6 +2134,8 @@ impl SynthesizerTrn {
     /// - m_q: Posterior mean [batch, hidden, time]
     /// - logs_q: Posterior log-variance [batch, hidden, time]
     /// - y_mask: Mask for valid positions [batch, 1, time]
+    /// - ids_slice: Random slice start indices [batch] (for slicing real audio)
+    /// - commit_loss: VQ commitment loss (scalar) - called "kl_ssl" in Python training
     #[allow(clippy::type_complexity)]
     pub fn forward_train(
         &mut self,
@@ -1907,13 +2143,9 @@ impl SynthesizerTrn {
         spec: &Array,
         spec_lengths: &Array,
         text: &Array,
-        refer: &Array,
-    ) -> Result<(Array, Array, Array, Array, Array, Array, Array, Array), Exception> {
-        // Get style embedding from reference mel
-        let refer_sliced = refer.index((.., ..704, ..));
-        let ge = self.ref_enc.forward(&refer_sliced)?;
-
-        // Create spectrogram mask from lengths
+        _refer: &Array,  // Not used in training - ref_enc uses spec instead!
+    ) -> Result<(Array, Array, Array, Array, Array, Array, Array, Array, Array, Array), Exception> {
+        // Create spectrogram mask from lengths FIRST (needed for ref_enc)
         // spec_lengths: [batch], spec: [batch, channels, time]
         let batch = spec.dim(0);
         let spec_time = spec.dim(2);
@@ -1924,35 +2156,46 @@ impl SynthesizerTrn {
         let _ = spec_lengths; // Mark as intentionally unused for now
         let y_mask = Array::ones::<f32>(&[batch, 1, spec_time])?;
 
+        // CRITICAL: In training, ref_enc uses the SAME spec as enc_q, not a separate reference!
+        // Python: ge = self.ref_enc(y[:,:704] * y_mask, y_mask)
+        // where y IS the spec parameter, NOT a separate reference mel!
+        let spec_sliced = spec.index((.., ..704, ..));
+        let spec_masked = spec_sliced.multiply(&y_mask)?;  // Apply mask like Python
+        let ge = self.ref_enc.forward(&spec_masked)?;
+
         // Encode spectrogram with posterior encoder (enc_q)
         // Returns z (sampled latent), m_q (mean), logs_q (log variance)
         let (z, m_q, logs_q) = self.enc_q.forward(spec, &y_mask, Some(&ge))?;
 
         // Decode quantized SSL features
-        // First, apply ssl_proj
+        // Step 1: Apply ssl_proj (Conv1d with stride=2 for 25hz)
         let ssl_nlc = swap_axes(ssl_features, 1, 2)?;
         let ssl_proj = self.ssl_proj.forward(&ssl_nlc)?;
         let ssl_proj = swap_axes(&ssl_proj, 1, 2)?; // Back to NCL
 
-        // For training with 25hz models, we need to match SSL length to spec length
-        // The spec is typically 2x the SSL length due to frame rate differences
-        // Interpolate SSL to match z length
+        // Step 2: Apply VQ quantization with commitment loss
+        // Python: quantized, codes, commit_loss, _ = self.quantizer(ssl, layers=[0])
+        // This is the critical step that was missing - kl_ssl in Python training!
+        let (ssl_quantized, commit_loss) = self.quantizer.forward_with_loss(&ssl_proj)?;
+
+        // Step 3: For training with 25hz models, interpolate to match spec length
+        // The spec is typically 2x the SSL length due to frame rate differences (50hz vs 25hz)
         let z_len = z.dim(2);
-        let ssl_len = ssl_proj.dim(2);
-        let quantized = if ssl_len != z_len {
+        let ssl_len = ssl_quantized.dim(2);
+        let quantized = if ssl_len != z_len && ssl_len > 0 {
             // Nearest neighbor interpolation: repeat each frame
             let ratio = z_len / ssl_len;
-            if ratio == 2 {
-                // 2x upsample by repeating
-                let expanded = ssl_proj.index((.., .., .., mlx_rs::ops::indexing::NewAxis));
-                let repeated = Array::repeat_axis::<f32>(expanded, 2, 3)?;
+            if ratio > 0 {
+                // Upsample by repeating: add new axis, repeat, reshape
+                let expanded = ssl_quantized.index((.., .., .., mlx_rs::ops::indexing::NewAxis));
+                let repeated = Array::repeat_axis::<f32>(expanded, ratio, 3)?;
                 repeated.reshape(&[batch, self.config.codebook_dim, z_len])?
             } else {
-                // For other ratios, just use as-is (may need proper interpolation)
-                ssl_proj
+                // Downsample or same length - use as-is
+                ssl_quantized
             }
         } else {
-            ssl_proj
+            ssl_quantized
         };
 
         // Encode text+SSL through TextEncoder to get prior
@@ -1962,10 +2205,20 @@ impl SynthesizerTrn {
         // This transforms from posterior to prior space
         let z_p = self.flow.forward(&z, &y_mask, Some(&ge), false)?;
 
-        // Decode z to audio through HiFiGAN generator
-        let y_hat = self.dec.forward(&z.multiply(&y_mask)?, Some(&ge))?;
+        // Python: z_slice, ids_slice = commons.rand_slice_segments(z, y_lengths, segment_size)
+        // Randomly slice z for decoding (saves memory, adds augmentation)
+        let (z_slice, ids_slice) = rand_slice_segments(
+            &z.multiply(&y_mask)?,
+            Some(spec_lengths),
+            self.config.segment_size,
+        )?;
 
-        Ok((y_hat, z_p, m_p, logs_p, z, m_q, logs_q, y_mask))
+        // Decode z_slice to audio through HiFiGAN generator (only the segment)
+        // Python: o = self.dec(z_slice, g=ge)
+        let y_hat = self.dec.forward(&z_slice, Some(&ge))?;
+
+        // Return all values including commit_loss (kl_ssl in Python)
+        Ok((y_hat, z_p, m_p, logs_p, z, m_q, logs_q, y_mask, ids_slice, commit_loss))
     }
 
     /// Extract latent codes from SSL features (for reference audio encoding)
@@ -1977,6 +2230,36 @@ impl SynthesizerTrn {
         let ssl = self.ssl_proj.forward(&ssl_nlc)?;
         // Convert back to NCL
         swap_axes(&ssl, 1, 2)
+    }
+
+    /// Extract semantic codes from HuBERT features
+    ///
+    /// This applies ssl_proj then quantizes to semantic codes.
+    /// Used for preprocessing training data.
+    ///
+    /// Args:
+    /// - hubert_features: Raw HuBERT features [batch, 768, time] in NCL format
+    ///
+    /// Returns:
+    /// - Semantic codes [batch, 1, time_downsampled]
+    ///
+    /// Note: For 25hz models, time_downsampled = time / 2
+    pub fn extract_semantic_codes(&mut self, hubert_features: &Array) -> Result<Array, Exception> {
+        use mlx_rs::transforms::eval;
+
+        // Apply ssl_proj (Conv1d with kernel=2, stride=2 for 25hz)
+        // Input: [batch, 768, time] -> convert to [batch, time, 768] for Conv1d
+        let ssl_nlc = swap_axes(hubert_features, 1, 2)?;
+        let projected_nlc = self.ssl_proj.forward(&ssl_nlc)?;
+        // Convert back to NCL: [batch, 768, time/2]
+        let projected = swap_axes(&projected_nlc, 1, 2)?;
+        eval([&projected])?;
+
+        // Quantize to semantic codes
+        let codes = self.quantizer.encode(&projected)?;
+        eval([&codes])?;
+
+        Ok(codes)
     }
 }
 
@@ -2315,16 +2598,45 @@ pub fn load_vits_weights(
         }
     }
 
-    // HiFiGAN Generator (dec)
-    if let Some(w) = get_weight("dec.conv_pre.weight") {
-        model.dec.conv_pre.weight = Param::new(transpose_conv(w)?);
+    // HiFiGAN Generator (dec) - with weight normalization
+    // conv_pre: load weight_g and weight_v separately
+    if let Some(g) = get_weight("dec.conv_pre.weight_g") {
+        model.dec.conv_pre.weight_g = Param::new(g);
+    }
+    if let Some(v) = get_weight("dec.conv_pre.weight_v") {
+        // Transpose v from PyTorch [out, in, kernel] to MLX [out, kernel, in]
+        model.dec.conv_pre.weight_v = Param::new(transpose_conv(v)?);
+    } else if let Some(w) = get_weight("dec.conv_pre.weight") {
+        // Fallback: load merged weight and decompose into g and v
+        let w_t = transpose_conv(w)?;
+        // Initialize weight_v = w, weight_g = ||w|| per output channel
+        let w_squared = w_t.square()?;
+        let norm_sq = w_squared.sum_axes(&[1, 2], true)?;
+        let weight_g = sqrt(&norm_sq.add(array!(1e-12f32))?)?;
+        model.dec.conv_pre.weight_g = Param::new(weight_g);
+        model.dec.conv_pre.weight_v = Param::new(w_t);
     }
     if let Some(b) = get_weight("dec.conv_pre.bias") {
         model.dec.conv_pre.bias = Param::new(Some(b));
     }
-    if let Some(w) = get_weight("dec.conv_post.weight") {
-        model.dec.conv_post.weight = Param::new(transpose_conv(w)?);
+
+    // conv_post: load weight_g and weight_v separately
+    if let Some(g) = get_weight("dec.conv_post.weight_g") {
+        model.dec.conv_post.weight_g = Param::new(g);
     }
+    if let Some(v) = get_weight("dec.conv_post.weight_v") {
+        model.dec.conv_post.weight_v = Param::new(transpose_conv(v)?);
+    } else if let Some(w) = get_weight("dec.conv_post.weight") {
+        // Fallback: load merged weight and decompose
+        let w_t = transpose_conv(w)?;
+        let w_squared = w_t.square()?;
+        let norm_sq = w_squared.sum_axes(&[1, 2], true)?;
+        let weight_g = sqrt(&norm_sq.add(array!(1e-12f32))?)?;
+        model.dec.conv_post.weight_g = Param::new(weight_g);
+        model.dec.conv_post.weight_v = Param::new(w_t);
+    }
+
+    // cond layer (not weight normalized)
     if let Some(w) = get_weight("dec.cond.weight") {
         model.dec.cond.weight = Param::new(transpose_conv(w)?);
     }
@@ -2332,15 +2644,27 @@ pub fn load_vits_weights(
         model.dec.cond.bias = Param::new(Some(b));
     }
 
-    // Upsample layers (ConvTranspose1d) - try weight normalization first, fall back to regular
+    // Upsample layers (ConvTranspose1d) - load weight_g and weight_v separately
     for (i, up) in model.dec.ups.iter_mut().enumerate() {
         let prefix = format!("dec.ups.{}", i);
-        if let Some(w_result) = load_weight_norm_convt(&prefix) {
-            // Weight-normalized (luoxiang style)
-            up.weight = Param::new(w_result?);
+
+        // Try to load weight_g and weight_v separately
+        if let Some(g) = get_weight(&format!("{}.weight_g", prefix)) {
+            up.weight_g = Param::new(g);
+        }
+        if let Some(v) = get_weight(&format!("{}.weight_v", prefix)) {
+            // Transpose v from PyTorch [in, out, kernel] to MLX [out, kernel, in]
+            up.weight_v = Param::new(transpose_convt(v)?);
         } else if let Some(w) = get_weight(&format!("{}.weight", prefix)) {
-            // Regular weights (doubao style)
-            up.weight = Param::new(transpose_convt(w)?);
+            // Fallback: load merged weight and decompose
+            let w_t = transpose_convt(w)?;
+            // For ConvTranspose, norm over out and kernel dims (axes 0, 1)
+            let w_squared = w_t.square()?;
+            let norm_sq = w_squared.sum_axes(&[0, 1], true)?;
+            // Transpose to [in, 1, 1] shape for weight_g
+            let weight_g = sqrt(&norm_sq.add(array!(1e-12f32))?)?.transpose_axes(&[2, 0, 1])?;
+            up.weight_g = Param::new(weight_g);
+            up.weight_v = Param::new(w_t);
         }
         if let Some(b) = get_weight(&format!("{}.bias", prefix)) {
             up.bias = Param::new(Some(b));
@@ -2471,6 +2795,24 @@ pub fn load_vits_model(weights_path: impl AsRef<Path>) -> Result<SynthesizerTrn,
     Ok(model)
 }
 
+/// Load VITS model with finetuned weights overlaid on pretrained base.
+///
+/// Finetuned weights only contain trainable layers (dec, ref_enc, ssl_proj),
+/// so we first load the full pretrained model, then overlay finetuned weights.
+pub fn load_vits_model_with_finetuned(
+    pretrained_path: impl AsRef<Path>,
+    finetuned_path: impl AsRef<Path>,
+) -> Result<SynthesizerTrn, Error> {
+    // First load the full pretrained model
+    let mut model = load_vits_model(&pretrained_path)?;
+
+    // Then overlay finetuned weights (only dec, ref_enc, ssl_proj will be present)
+    let finetuned_weights = Array::load_safetensors(finetuned_path.as_ref())?;
+    load_vits_weights(&mut model, &finetuned_weights)?;
+
+    Ok(model)
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -2490,5 +2832,52 @@ mod tests {
         let config = VITSConfig::default();
         assert_eq!(config.hidden_channels, 192);
         assert_eq!(config.gin_channels, 512);
+    }
+
+    #[test]
+    fn test_interpolate_linear_same_size() {
+        // speed = 1.0 -> same size
+        let x = Array::from_slice(&[1.0f32, 2.0, 3.0, 4.0, 5.0], &[1, 1, 5]);
+        let result = interpolate_linear(&x, 5).unwrap();
+        eval([&result]).unwrap();
+        assert_eq!(result.shape(), &[1, 1, 5]);
+    }
+
+    #[test]
+    fn test_interpolate_linear_downsample() {
+        // speed = 2.0 -> half the length (faster speech)
+        let x = Array::from_slice(&[1.0f32, 2.0, 3.0, 4.0], &[1, 1, 4]);
+        let result = interpolate_linear(&x, 2).unwrap();
+        eval([&result]).unwrap();
+        assert_eq!(result.shape(), &[1, 1, 2]);
+    }
+
+    #[test]
+    fn test_interpolate_linear_upsample() {
+        // speed = 0.5 -> double the length (slower speech)
+        let x = Array::from_slice(&[1.0f32, 2.0, 3.0, 4.0], &[1, 1, 4]);
+        let result = interpolate_linear(&x, 8).unwrap();
+        eval([&result]).unwrap();
+        assert_eq!(result.shape(), &[1, 1, 8]);
+    }
+
+    #[test]
+    fn test_interpolate_linear_speed_1_1() {
+        // speed = 1.1 -> ~10% shorter (typical for Chinese voices)
+        let x = Array::from_slice(&[1.0f32; 100], &[1, 1, 100]);
+        // new_len = 100 / 1.1 + 1 = 91 + 1 = 92
+        let new_len = (100.0 / 1.1) as i32 + 1;
+        let result = interpolate_linear(&x, new_len).unwrap();
+        eval([&result]).unwrap();
+        assert_eq!(result.shape(), &[1, 1, new_len]);
+    }
+
+    #[test]
+    fn test_interpolate_linear_batch() {
+        // Test with batch > 1 and channels > 1
+        let x = Array::from_slice(&[1.0f32; 24], &[2, 3, 4]); // [batch=2, channels=3, seq=4]
+        let result = interpolate_linear(&x, 6).unwrap();
+        eval([&result]).unwrap();
+        assert_eq!(result.shape(), &[2, 3, 6]);
     }
 }

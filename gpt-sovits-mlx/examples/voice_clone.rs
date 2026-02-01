@@ -237,6 +237,7 @@ struct Args {
     vits_model: Option<String>,   // Custom VITS model path (finetuned)
     vits_onnx_model: Option<String>,  // Custom VITS ONNX model path
     pretrained_model: Option<String>,  // Pretrained base for finetuned VITS
+    speed_factor: Option<f32>,    // Speed factor (1.0 = normal, >1 = faster)
     interactive: bool,
     greedy: bool,
     mlx_vits: bool,  // Force MLX VITS instead of default ONNX
@@ -261,6 +262,7 @@ fn parse_args() -> Args {
     let mut vits_model = None;
     let mut vits_onnx_model = None;
     let mut pretrained_model = None;
+    let mut speed_factor = None;
     let mut interactive = false;
     let mut greedy = false;
     let mut mlx_vits = false;
@@ -361,6 +363,10 @@ fn parse_args() -> Args {
                                     }
                                 }
                             }
+                            // Get speed_factor from voice config if not already set
+                            if speed_factor.is_none() {
+                                speed_factor = voice.speed_factor;
+                            }
                         } else {
                             warn!(voice = voice_name.as_str(), "Unknown voice. Use --list-voices to see available voices.");
                         }
@@ -379,6 +385,14 @@ fn parse_args() -> Args {
             "--greedy" => {
                 greedy = true;
             }
+            "--speed" => {
+                if i + 1 < args.len() {
+                    if let Ok(s) = args[i + 1].parse::<f32>() {
+                        speed_factor = Some(s);
+                    }
+                    i += 1;
+                }
+            }
             "--mlx-vits" => {
                 // Force MLX VITS instead of default ONNX (not recommended)
                 mlx_vits = true;
@@ -393,7 +407,7 @@ fn parse_args() -> Args {
         i += 1;
     }
 
-    Args { text, ref_audio, ref_text, codes_path, tokens_path, output, t2s_model, vits_model, vits_onnx_model, pretrained_model, interactive, greedy, mlx_vits, list_voices, voices_config }
+    Args { text, ref_audio, ref_text, codes_path, tokens_path, output, t2s_model, vits_model, vits_onnx_model, pretrained_model, speed_factor, interactive, greedy, mlx_vits, list_voices, voices_config }
 }
 
 fn synthesize_and_play(cloner: &mut VoiceCloner, text: &str, output: Option<&str>) -> Result<(), Box<dyn std::error::Error>> {
@@ -549,6 +563,10 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
     if args.mlx_vits {
         config.use_mlx_vits = true;
         warn!("Using MLX VITS (per-chunk decode) - not recommended");
+    }
+    if let Some(speed) = args.speed_factor {
+        config.speed = speed;
+        info!(speed = speed, "Using speed factor");
     }
     let mut cloner = VoiceCloner::new(config)?;
     info!(elapsed_ms = start.elapsed().as_secs_f64() * 1000.0, "Models loaded");

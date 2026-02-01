@@ -67,14 +67,14 @@ use mlx_rs::{Array, module::Module, ops::indexing::IndexOp, random, transforms::
 use tracing::{debug, warn, trace, instrument};
 
 use crate::{
-    audio::{AudioConfig, load_reference_mel, load_audio_for_hubert},
+    audio::{AudioConfig, load_reference_mel, load_audio_for_hubert, load_reference_mel_gpu},
     cache::ConcatKeyValueCache,
     error::Error,
     inference::{preprocess_text, preprocess_text_with_lang},
     models::{
         hubert::{HuBertEncoder, load_hubert_model},
         t2s::{T2SConfig, T2SInput, T2SModel, load_t2s_model},
-        vits::{SynthesizerTrn, load_vits_model},
+        vits::{SynthesizerTrn, load_vits_model, load_vits_model_with_finetuned},
     },
     sampling::{Sampler, SamplingConfig, detect_repetition},
     text::BertFeatureExtractor,
@@ -91,6 +91,9 @@ pub struct VoiceClonerConfig {
     pub bert_tokenizer: String,
     /// Path to VITS model weights
     pub vits_weights: String,
+    /// Path to pretrained VITS weights (base model for finetuned weights)
+    /// When set, vits_weights is treated as finetuned overlay on this pretrained base
+    pub vits_pretrained_base: Option<String>,
     /// Path to HuBERT model weights (for few-shot mode)
     pub hubert_weights: String,
     /// Sample rate for output audio
@@ -112,6 +115,9 @@ pub struct VoiceClonerConfig {
     pub vits_onnx_path: Option<String>,
     /// Use MLX VITS instead of ONNX (not recommended, may have chunk boundary artifacts)
     pub use_mlx_vits: bool,
+    /// Use GPU-accelerated mel spectrogram computation (168x faster than CPU DFT)
+    /// Default: true
+    pub use_gpu_mel: bool,
 }
 
 /// Get the default model directory path
@@ -136,6 +142,7 @@ impl Default for VoiceClonerConfig {
             bert_weights: format!("{}/bert.safetensors", model_dir),
             bert_tokenizer: format!("{}/chinese-roberta-tokenizer/tokenizer.json", model_dir),
             vits_weights: format!("{}/doubao_mixed_sovits_new.safetensors", model_dir),
+            vits_pretrained_base: None,  // Not using finetuned weights by default
             hubert_weights: format!("{}/hubert.safetensors", model_dir),
             sample_rate: 32000,
             top_k: 5,  // Match Python TTS.py default
@@ -147,6 +154,8 @@ impl Default for VoiceClonerConfig {
             // ONNX VITS is default for best quality (batched decode, matches Python)
             vits_onnx_path: Some(format!("{}/vits.onnx", model_dir)),
             use_mlx_vits: false,
+            // GPU mel is 168x faster than CPU DFT
+            use_gpu_mel: true,
         }
     }
 }
@@ -292,7 +301,17 @@ impl VoiceCloner {
         let bert = BertFeatureExtractor::new(&config.bert_tokenizer, &config.bert_weights, -3)?;
         let t2s_config = T2SConfig::default();
         let t2s = load_t2s_model(&config.t2s_weights)?;
-        let vits = load_vits_model(&config.vits_weights)?;
+
+        // Load VITS model - use pretrained base with finetuned overlay if specified
+        let vits = if let Some(ref pretrained_base) = config.vits_pretrained_base {
+            eprintln!("Loading VITS with finetuned overlay:");
+            eprintln!("   Pretrained base: {}", pretrained_base);
+            eprintln!("   Finetuned weights: {}", &config.vits_weights);
+            load_vits_model_with_finetuned(pretrained_base, &config.vits_weights)?
+        } else {
+            load_vits_model(&config.vits_weights)?
+        };
+
         let audio_config = AudioConfig::default();
 
         // Try to load HuBERT (optional for few-shot mode)
@@ -350,6 +369,23 @@ impl VoiceCloner {
         Self::new(VoiceClonerConfig::default())
     }
 
+    /// Load reference mel spectrogram using GPU FFT (168x faster) or CPU DFT
+    fn load_mel(&self, path: &Path) -> Result<Array, Error> {
+        if self.config.use_gpu_mel {
+            load_reference_mel_gpu(
+                path,
+                self.audio_config.n_fft,
+                self.audio_config.hop_length,
+                self.audio_config.win_length,
+                self.audio_config.n_mels,  // 704 for v2
+                self.audio_config.sample_rate as u32,
+            ).map_err(|e| Error::Message(format!("GPU mel failed: {}", e)))
+        } else {
+            load_reference_mel(path, &self.audio_config)
+                .map_err(|e| Error::Message(format!("Failed to load reference audio: {}", e)))
+        }
+    }
+
     /// Set reference audio for voice cloning (zero-shot mode)
     pub fn set_reference_audio(&mut self, path: impl AsRef<Path>) -> Result<(), Error> {
         let path = path.as_ref();
@@ -357,8 +393,7 @@ impl VoiceCloner {
             return Err(Error::Message(format!("Reference audio not found: {:?}", path)));
         }
 
-        let mel = load_reference_mel(path, &self.audio_config)
-            .map_err(|e| Error::Message(format!("Failed to load reference audio: {}", e)))?;
+        let mel = self.load_mel(path)?;
         eval([&mel]).map_err(|e| Error::Message(format!("Failed to evaluate mel: {}", e)))?;
 
         self.reference_mel = Some(mel);
@@ -388,9 +423,8 @@ impl VoiceCloner {
             return Err(Error::Message(format!("Reference audio not found: {:?}", audio_path)));
         }
 
-        // Load mel spectrogram
-        let mel = load_reference_mel(audio_path, &self.audio_config)
-            .map_err(|e| Error::Message(format!("Failed to load reference audio: {}", e)))?;
+        // Load mel spectrogram (GPU FFT if enabled)
+        let mel = self.load_mel(audio_path)?;
         eval([&mel]).map_err(|e| Error::Message(format!("Failed to evaluate mel: {}", e)))?;
 
         // Extract prompt semantic codes if HuBERT is available
@@ -479,9 +513,8 @@ impl VoiceCloner {
             return Err(Error::Message(format!("Codes file not found: {:?}", codes_path)));
         }
 
-        // Load mel spectrogram
-        let mel = load_reference_mel(audio_path, &self.audio_config)
-            .map_err(|e| Error::Message(format!("Failed to load reference audio: {}", e)))?;
+        // Load mel spectrogram (GPU FFT if enabled)
+        let mel = self.load_mel(audio_path)?;
         eval([&mel]).map_err(|e| Error::Message(format!("Failed to evaluate mel: {}", e)))?;
 
         // Load pre-computed codes from file (supports both .npy and raw binary)
@@ -558,9 +591,8 @@ impl VoiceCloner {
             return Err(Error::Message(format!("Reference audio not found: {:?}", audio_path)));
         }
 
-        // Load mel spectrogram
-        let mel = load_reference_mel(audio_path, &self.audio_config)
-            .map_err(|e| Error::Message(format!("Failed to load reference audio: {}", e)))?;
+        // Load mel spectrogram (GPU FFT if enabled)
+        let mel = self.load_mel(audio_path)?;
         eval([&mel]).map_err(|e| Error::Message(format!("Failed to evaluate mel: {}", e)))?;
 
         // Create Array from codes: [1, 1, num_codes]
@@ -804,7 +836,7 @@ impl VoiceCloner {
 
             let raw_samples = vits_onnx.decode(
                 &all_tokens, &all_phones, mel_data, mel_channels, mel_time,
-                self.config.noise_scale,
+                self.config.noise_scale, self.config.speed,
             ).map_err(|e| Error::Message(format!("ONNX VITS decode failed: {}", e)))?;
 
             // Split ONNX output by chunk boundaries and apply per-chunk tail trimming.
