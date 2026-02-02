@@ -22,15 +22,52 @@ huggingface-cli login
 export HF_TOKEN=your_token_here
 ```
 
-Model ID: `black-forest-labs/FLUX.2-klein-4B`
+### Download URLs
 
-Required files (downloaded automatically):
+| Source | URL |
+|--------|-----|
+| **HuggingFace** | https://huggingface.co/black-forest-labs/FLUX.2-klein-4B |
+| **ModelScope** | https://modelscope.cn/models/black-forest-labs/FLUX.2-klein-4B |
+| **Original FLUX.1** | https://huggingface.co/black-forest-labs/FLUX.1-schnell |
+
+### Environment Variables
+
+```bash
+# Use custom model path (optional)
+export FLUX_MODEL_DIR=/path/to/your/flux-model
+
+# HuggingFace token (for gated model)
+export HF_TOKEN=your_token_here
+
+# Or specify when running
+FLUX_MODEL_DIR=./models/flux cargo run --example generate_klein --release
 ```
-transformer/diffusion_pytorch_model.safetensors  # ~8GB
-text_encoder/model-00001-of-00002.safetensors    # ~5GB
-text_encoder/model-00002-of-00002.safetensors    # ~5GB
-vae/diffusion_pytorch_model.safetensors          # ~160MB
-tokenizer/tokenizer.json
+
+### Manual Download
+
+```bash
+# Using huggingface-cli (requires login for gated model)
+huggingface-cli login
+huggingface-cli download black-forest-labs/FLUX.2-klein-4B --local-dir ./models/flux
+
+# Using git lfs
+git lfs install
+git clone https://huggingface.co/black-forest-labs/FLUX.2-klein-4B ./models/flux
+```
+
+### Required Files
+
+```
+models/flux/
+├── transformer/
+│   └── diffusion_pytorch_model.safetensors  # ~8GB
+├── text_encoder/
+│   ├── model-00001-of-00002.safetensors     # ~5GB
+│   └── model-00002-of-00002.safetensors     # ~5GB
+├── vae/
+│   └── diffusion_pytorch_model.safetensors  # ~160MB
+└── tokenizer/
+    └── tokenizer.json
 ```
 
 ## Usage

@@ -45,6 +45,7 @@ mod lr_scheduler;
 mod trainer;
 
 // VITS Training
+mod vits_dataset;
 mod vits_loss;
 mod vits_trainer;
 
@@ -59,4 +60,5 @@ pub use vits_loss::{
     generator_loss, discriminator_loss, feature_matching_loss,
     kl_loss, mel_reconstruction_loss,
 };
+pub use vits_dataset::{VITSDataset, VITSDatasetMetadata, VITSSampleMetadata};
 pub use vits_trainer::{VITSTrainer, VITSTrainingConfig, VITSLosses, VITSBatch};

@@ -415,12 +415,7 @@ const USE_FUSED_MODULATE: bool = false;
 
 /// Apply layer norm (no learnable params) then modulation: (1 + scale) * LayerNorm(x) + shift
 fn modulate(x: &Array, shift: &Array, scale: &Array) -> Result<Array, Exception> {
-    if USE_FUSED_MODULATE {
-        // Use fused Metal kernel (verified working)
-        mlx_rs_core::fused_modulate(x, shift, scale)
-    } else {
-        modulate_manual(x, shift, scale)
-    }
+    modulate_manual(x, shift, scale)
 }
 
 /// Manual modulate implementation

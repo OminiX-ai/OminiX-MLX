@@ -7,14 +7,17 @@
 //!
 //! - **Cache**: KV cache implementations for fast autoregressive decoding
 //! - **Utils**: RoPE, attention masks, scaled dot-product attention
-//! - **Metal Kernels**: Custom Metal kernels (fused_swiglu for MoE models)
+//! - **Metal Kernels**: Custom Metal kernels (fused_swiglu for MoE, fused_modulate for DiT)
 //! - **Error**: Common error types and conversions
 //! - **Sampler**: Token sampling strategies
 //! - **Generate**: Generic token generation infrastructure
 //! - **Audio**: Audio processing utilities (mel spectrograms, etc.)
 //! - **Speculative**: Speculative decoding support
+//! - **Convert**: Model conversion utilities (optional, requires `convert` feature)
 
 pub mod audio;
+#[cfg(feature = "convert")]
+pub mod convert;
 pub mod cache;
 pub mod error;
 pub mod generate;
@@ -25,7 +28,7 @@ pub mod utils;
 
 pub use cache::{ConcatKeyValueCache, KVCache, KeyValueCache};
 pub use error::{Error, Result};
-pub use metal_kernels::fused_swiglu;
+pub use metal_kernels::{fused_swiglu, fused_modulate};
 pub use sampler::{DefaultSampler, Sampler};
 pub use utils::{
     create_attention_mask, initialize_rope, scaled_dot_product_attention,

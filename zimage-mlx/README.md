@@ -11,19 +11,49 @@ Z-Image-Turbo image generation model for Apple Silicon using MLX.
 
 ## Model Download
 
-The model downloads automatically from HuggingFace:
+The model downloads automatically from HuggingFace (no authentication required).
+
+### Download URLs
+
+| Source | URL |
+|--------|-----|
+| **HuggingFace (MLX)** | https://huggingface.co/uqer1244/MLX-z-image |
+| **Original Model** | https://huggingface.co/Zheng-Peng-Fei/Z-Image |
+| **ModelScope (Original)** | https://modelscope.cn/models/ZhengPengFei/Z-Image |
+
+### Environment Variables
 
 ```bash
-# Model ID (public, no auth required)
-# HuggingFace: Freepik/Z-Image-Turbo-mlx
+# Use custom model path (optional)
+export ZIMAGE_MODEL_DIR=/path/to/your/zimage-model
+
+# Or specify when running
+ZIMAGE_MODEL_DIR=./models/zimage cargo run --example generate_zimage_quantized --release
 ```
 
-Required files (downloaded automatically):
+### Manual Download
+
+```bash
+# Using huggingface-cli
+huggingface-cli download uqer1244/MLX-z-image --local-dir ./models/zimage
+
+# Using git lfs
+git lfs install
+git clone https://huggingface.co/uqer1244/MLX-z-image ./models/zimage
 ```
-transformer_q4.safetensors     # ~3GB (quantized transformer)
-text_encoder_q4.safetensors    # ~2GB (quantized Qwen3)
-vae.safetensors                # ~160MB
-tokenizer.json
+
+### Required Files
+
+```
+models/zimage/
+├── transformer/
+│   └── model.safetensors        # ~12GB (full precision) or quantized
+├── text_encoder/
+│   └── model.safetensors        # ~5GB (Qwen3 text encoder)
+├── vae/
+│   └── diffusion_pytorch_model.safetensors  # ~160MB
+└── tokenizer/
+    └── tokenizer.json
 ```
 
 ## Usage

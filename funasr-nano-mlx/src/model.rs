@@ -837,6 +837,55 @@ impl Default for StreamingContext {
     }
 }
 
+/// Custom prompt for transcription or translation tasks.
+#[derive(Debug, Clone)]
+pub struct TaskPrompt {
+    /// System prompt (e.g., "You are a helpful assistant.")
+    pub system: String,
+    /// User instruction (e.g., "语音转写成中文：" or "Transcribe and translate to English:")
+    pub instruction: String,
+}
+
+impl Default for TaskPrompt {
+    fn default() -> Self {
+        Self {
+            system: "You are a helpful assistant.".to_string(),
+            instruction: "语音转写成中文：".to_string(),
+        }
+    }
+}
+
+impl TaskPrompt {
+    /// Create a prompt for Chinese transcription (default behavior).
+    pub fn transcribe_chinese() -> Self {
+        Self::default()
+    }
+
+    /// Create a prompt for transcription with translation to English.
+    pub fn translate_to_english() -> Self {
+        Self {
+            system: "You are a speech translation assistant.".to_string(),
+            instruction: "Transcribe the following speech and translate to English:".to_string(),
+        }
+    }
+
+    /// Create a prompt for correction and translation.
+    pub fn correct_and_translate() -> Self {
+        Self {
+            system: "You are a speech translation assistant that accurately transcribes and translates.".to_string(),
+            instruction: "请准确转写语音并翻译为英文：".to_string(),
+        }
+    }
+
+    /// Create a custom prompt.
+    pub fn custom(system: &str, instruction: &str) -> Self {
+        Self {
+            system: system.to_string(),
+            instruction: instruction.to_string(),
+        }
+    }
+}
+
 impl FunASRNano {
     /// Create a new streaming context for incremental transcription.
     ///
@@ -938,6 +987,319 @@ impl FunASRNano {
         ctx.audio_buffer.clear();
 
         Ok(Some(text))
+    }
+
+    // ============================================================
+    // Translation and Custom Prompt Methods
+    // ============================================================
+
+    /// Transcribe audio with a custom prompt.
+    ///
+    /// This allows changing the task from pure transcription to translation,
+    /// correction, or other audio-to-text tasks.
+    ///
+    /// # Example
+    ///
+    /// ```rust,ignore
+    /// use funasr_nano_mlx::{FunASRNano, TaskPrompt};
+    ///
+    /// let mut model = FunASRNano::load("model_dir")?;
+    ///
+    /// // Transcribe and translate to English
+    /// let prompt = TaskPrompt::translate_to_english();
+    /// let english = model.transcribe_with_prompt("audio.wav", &prompt)?;
+    /// ```
+    pub fn transcribe_with_prompt(
+        &mut self,
+        audio_path: impl AsRef<Path>,
+        prompt: &TaskPrompt,
+    ) -> Result<String> {
+        self.transcribe_with_prompt_and_config(audio_path, prompt, SamplingConfig::default())
+    }
+
+    /// Transcribe with custom prompt and sampling configuration.
+    pub fn transcribe_with_prompt_and_config(
+        &mut self,
+        audio_path: impl AsRef<Path>,
+        prompt: &TaskPrompt,
+        config: SamplingConfig,
+    ) -> Result<String> {
+        // Load and preprocess audio
+        let (samples, sample_rate) = audio::load_wav(audio_path)?;
+        let samples = audio::resample(&samples, sample_rate, self.audio_config.sample_rate)?;
+
+        // Compute mel spectrogram
+        let mel = self.mel_frontend.compute_mel_spectrogram(&samples)?;
+
+        // Apply LFR
+        let mel_lfr = audio::apply_lfr(&mel, 7, 6)?;
+
+        // Encode audio
+        let audio_features = self.encode_audio(&mel_lfr)?;
+
+        // Generate text with custom prompt
+        self.generate_text_with_prompt(&audio_features, prompt, &config)
+    }
+
+    /// Generate text from audio features with a custom prompt.
+    pub fn generate_text_with_prompt(
+        &mut self,
+        audio_features: &Array,
+        prompt: &TaskPrompt,
+        config: &SamplingConfig,
+    ) -> Result<String> {
+        let mut cache: Vec<Option<KVCache>> = Vec::new();
+        let mut tokens: Vec<i32> = Vec::new();
+
+        // Audio feature length
+        let audio_len = audio_features.shape()[1];
+
+        // Tokenize the custom prompt
+        let tokenizer = self.tokenizer.as_ref()
+            .ok_or_else(|| Error::Tokenizer("Tokenizer not loaded".to_string()))?;
+
+        // Build ChatML format with custom system and instruction
+        // <|im_start|>system\n{system}<|im_end|>\n
+        // <|im_start|>user\n{instruction}<|startofspeech|>{AUDIO}<|endofspeech|><|im_end|>\n
+        // <|im_start|>assistant\n
+
+        let system_text = format!("{}\n", prompt.system);
+        let system_tokens = tokenizer.encode(system_text.as_str(), false)
+            .map_err(|e| Error::Tokenizer(e.to_string()))?;
+
+        let instruction_tokens = tokenizer.encode(prompt.instruction.as_str(), false)
+            .map_err(|e| Error::Tokenizer(e.to_string()))?;
+
+        // Special tokens
+        let im_start: i32 = 151644;  // <|im_start|>
+        let im_end: i32 = 151645;    // <|im_end|>
+        let newline: i32 = 198;      // \n
+        let system_id: i32 = 8948;   // system
+        let user_id: i32 = 872;      // user
+        let assistant_id: i32 = 77091; // assistant
+
+        // Build prefix tokens
+        let mut prefix_tokens: Vec<i32> = vec![
+            im_start,
+            system_id,
+            newline,
+        ];
+        for tok in system_tokens.get_ids() {
+            prefix_tokens.push(*tok as i32);
+        }
+        prefix_tokens.extend_from_slice(&[im_end, newline, im_start, user_id, newline]);
+        for tok in instruction_tokens.get_ids() {
+            prefix_tokens.push(*tok as i32);
+        }
+
+        let suffix_tokens = [
+            im_end,
+            newline,
+            im_start,
+            assistant_id,
+            newline,
+        ];
+
+        // Audio position markers
+        let speech_start = self.markers.start_token;  // 151646
+        let speech_end = self.markers.end_token;      // 151647
+
+        // Build full prompt
+        let prompt_len = prefix_tokens.len() + 1 + audio_len as usize + 1 + suffix_tokens.len();
+        let mut prompt_tokens: Vec<i32> = Vec::with_capacity(prompt_len);
+        prompt_tokens.extend_from_slice(&prefix_tokens);
+        prompt_tokens.push(speech_start);
+        for _ in 0..audio_len {
+            prompt_tokens.push(0);  // Placeholder for audio
+        }
+        prompt_tokens.push(speech_end);
+        prompt_tokens.extend_from_slice(&suffix_tokens);
+
+        // Get text embeddings
+        let prompt_array = Array::from_slice(&prompt_tokens, &[1, prompt_tokens.len() as i32]);
+        let embeddings = self.llm.get_token_embeddings(&prompt_array)?;
+        eval([&embeddings])?;
+
+        // Audio position
+        let audio_start = prefix_tokens.len() + 1;
+        let audio_end = audio_start + audio_len as usize;
+
+        // Replace placeholder embeddings with audio features
+        let prefix_embed = embeddings.index((.., ..audio_start as i32, ..));
+        let suffix_embed = embeddings.index((.., audio_end as i32.., ..));
+
+        let h = mlx_rs::ops::concatenate_axis(&[&prefix_embed, audio_features, &suffix_embed], 1)?;
+        eval([&h])?;
+
+        // Forward pass
+        let logits = self.llm.forward_embeddings(&h, &mut cache)?;
+
+        // Sample
+        let last_logits = logits.index((.., -1, ..));
+        let token = Self::sample_with_config(&last_logits, config, &tokens)?;
+        eval([&token])?;
+        let mut token_id = token.item::<i32>();
+
+        let mut recent_tokens: Vec<i32> = Vec::new();
+
+        for _ in 0..config.max_tokens {
+            if token_id == self.markers.eos_token || token_id == self.markers.im_end_token {
+                break;
+            }
+
+            recent_tokens.push(token_id);
+            if recent_tokens.len() > 10 {
+                recent_tokens.remove(0);
+            }
+            if recent_tokens.len() >= 10 && recent_tokens.iter().all(|&t| t == token_id) {
+                break;
+            }
+
+            tokens.push(token_id);
+
+            let token_array = Array::from_slice(&[token_id], &[1, 1]);
+            let h = self.llm.get_token_embeddings(&token_array)?;
+            let logits = self.llm.forward_embeddings(&h, &mut cache)?;
+
+            let last_logits = logits.index((.., -1, ..));
+            let token = Self::sample_with_config(&last_logits, config, &tokens)?;
+            eval([&token])?;
+            token_id = token.item::<i32>();
+        }
+
+        self.decode_tokens(&tokens)
+    }
+
+    /// Generate text from text-only input (no audio).
+    ///
+    /// This uses the Qwen3 LLM directly for text-to-text tasks like
+    /// translation, correction, or summarization.
+    ///
+    /// # Example
+    ///
+    /// ```rust,ignore
+    /// let translation = model.generate_from_text(
+    ///     "请翻译为英文：今天天气很好",
+    ///     &SamplingConfig::default(),
+    /// )?;
+    /// ```
+    pub fn generate_from_text(
+        &mut self,
+        text: &str,
+        config: &SamplingConfig,
+    ) -> Result<String> {
+        let mut cache: Vec<Option<KVCache>> = Vec::new();
+        let mut tokens: Vec<i32> = Vec::new();
+
+        let tokenizer = self.tokenizer.as_ref()
+            .ok_or_else(|| Error::Tokenizer("Tokenizer not loaded".to_string()))?;
+
+        // Build ChatML format
+        // <|im_start|>user\n{text}<|im_end|>\n<|im_start|>assistant\n
+        let text_tokens = tokenizer.encode(text, false)
+            .map_err(|e| Error::Tokenizer(e.to_string()))?;
+
+        let im_start: i32 = 151644;
+        let im_end: i32 = 151645;
+        let newline: i32 = 198;
+        let user_id: i32 = 872;
+        let assistant_id: i32 = 77091;
+
+        let mut prompt_tokens: Vec<i32> = vec![im_start, user_id, newline];
+        for tok in text_tokens.get_ids() {
+            prompt_tokens.push(*tok as i32);
+        }
+        prompt_tokens.extend_from_slice(&[im_end, newline, im_start, assistant_id, newline]);
+
+        // Get embeddings and forward
+        let prompt_array = Array::from_slice(&prompt_tokens, &[1, prompt_tokens.len() as i32]);
+        let h = self.llm.get_token_embeddings(&prompt_array)?;
+        eval([&h])?;
+
+        let logits = self.llm.forward_embeddings(&h, &mut cache)?;
+
+        let last_logits = logits.index((.., -1, ..));
+        let token = Self::sample_with_config(&last_logits, config, &tokens)?;
+        eval([&token])?;
+        let mut token_id = token.item::<i32>();
+
+        let mut recent_tokens: Vec<i32> = Vec::new();
+
+        for _ in 0..config.max_tokens {
+            if token_id == self.markers.eos_token || token_id == self.markers.im_end_token {
+                break;
+            }
+
+            recent_tokens.push(token_id);
+            if recent_tokens.len() > 10 {
+                recent_tokens.remove(0);
+            }
+            if recent_tokens.len() >= 10 && recent_tokens.iter().all(|&t| t == token_id) {
+                break;
+            }
+
+            tokens.push(token_id);
+
+            let token_array = Array::from_slice(&[token_id], &[1, 1]);
+            let h = self.llm.get_token_embeddings(&token_array)?;
+            let logits = self.llm.forward_embeddings(&h, &mut cache)?;
+
+            let last_logits = logits.index((.., -1, ..));
+            let token = Self::sample_with_config(&last_logits, config, &tokens)?;
+            eval([&token])?;
+            token_id = token.item::<i32>();
+        }
+
+        self.decode_tokens(&tokens)
+    }
+
+    /// Translate text from Chinese to English.
+    ///
+    /// Uses the integrated Qwen3-0.6B LLM for text translation.
+    pub fn translate_text(&mut self, text: &str) -> Result<String> {
+        let prompt = format!("请将以下中文翻译为英文：{}", text);
+        self.generate_from_text(&prompt, &SamplingConfig::default())
+    }
+
+    /// Transcribe audio and then translate the transcription to English.
+    ///
+    /// This is a two-pass approach:
+    /// 1. ASR: Audio -> Chinese transcription
+    /// 2. Translation: Chinese -> English
+    ///
+    /// # Returns
+    /// A tuple of (Chinese transcription, English translation)
+    ///
+    /// # Example
+    ///
+    /// ```rust,ignore
+    /// let (chinese, english) = model.transcribe_and_translate("audio.wav")?;
+    /// println!("Chinese: {}", chinese);
+    /// println!("English: {}", english);
+    /// ```
+    pub fn transcribe_and_translate(
+        &mut self,
+        audio_path: impl AsRef<Path>,
+    ) -> Result<(String, String)> {
+        // Pass 1: ASR
+        let transcription = self.transcribe(&audio_path)?;
+
+        // Pass 2: Translation
+        let translation = self.translate_text(&transcription)?;
+
+        Ok((transcription, translation))
+    }
+
+    /// Transcribe with correction and translation in one prompt.
+    ///
+    /// Attempts to use a single audio-to-English prompt.
+    /// Note: Quality depends on Qwen3-0.6B's translation capability.
+    pub fn transcribe_translate_direct(
+        &mut self,
+        audio_path: impl AsRef<Path>,
+    ) -> Result<String> {
+        let prompt = TaskPrompt::translate_to_english();
+        self.transcribe_with_prompt(audio_path, &prompt)
     }
 }
 

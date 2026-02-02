@@ -220,11 +220,11 @@ pub fn stft_mlx(
         }
 
         if !batch_mags.is_empty() {
-            // Stack frames: [n_frames, 1, n_freqs] -> [n_freqs, n_frames]
+            // Stack frames and transpose to [n_freqs, n_frames]
+            // Each mag has shape [1, n_freqs], concatenating gives [n_frames, n_freqs]
             let refs: Vec<&Array> = batch_mags.iter().collect();
-            let stacked = concatenate_axis(&refs, 0)?; // [n_frames, 1, n_freqs]
-            let squeezed = stacked.squeeze_axes(&[1])?; // [n_frames, n_freqs]
-            let transposed = squeezed.transpose()?; // [n_freqs, n_frames]
+            let stacked = concatenate_axis(&refs, 0)?; // [n_frames, n_freqs]
+            let transposed = stacked.transpose()?; // [n_freqs, n_frames]
             magnitudes.push(transposed);
         }
     }
@@ -233,9 +233,12 @@ pub fn stft_mlx(
         return Err(Exception::from("No frames computed in STFT"));
     }
 
-    // Stack batches
+    // Stack batches - always return [batch, n_freqs, n_frames]
     if batch_size == 1 {
-        Ok(magnitudes.into_iter().next().unwrap())
+        // Add batch dimension: [n_freqs, n_frames] -> [1, n_freqs, n_frames]
+        let single = magnitudes.into_iter().next().unwrap();
+        let n_frames_actual = single.shape()[1];
+        single.reshape(&[1, n_freqs, n_frames_actual])
     } else {
         let refs: Vec<&Array> = magnitudes.iter().collect();
         let stacked = concatenate_axis(&refs, 0)?;
@@ -290,6 +293,120 @@ pub fn mel_spectrogram_mlx(
     let mel_log = maximum(&mel, &array!(1e-5f32))?.log()?;
 
     Ok(mel_log)
+}
+
+/// Convert linear spectrogram to mel spectrogram
+///
+/// This matches Python's spec_to_mel_torch:
+/// 1. Apply mel filterbank: mel = mel_basis @ spec
+/// 2. Apply log compression: log(clamp(mel, 1e-5))
+///
+/// Input: spec [batch, n_fft/2+1, frames] or [n_fft/2+1, frames]
+/// Output: mel [batch, n_mels, frames] or [n_mels, frames]
+///
+/// This is used for computing mel loss in training where we want to use
+/// the original spectrogram (from data preprocessing) rather than recomputing
+/// from audio.
+pub fn spec_to_mel(
+    spec: &Array,
+    config: &MelConfig,
+) -> Result<Array, Exception> {
+    // Create mel filterbank
+    let mel_basis = create_mel_filterbank(config);
+
+    let shape = spec.shape();
+    let is_batched = shape.len() == 3;
+
+    // Apply mel filterbank: [n_mels, n_freqs] @ [n_freqs, frames] = [n_mels, frames]
+    let mel = if is_batched {
+        let batch_size = shape[0];
+        let n_frames = shape[2];
+
+        let mut mels = Vec::new();
+        for b in 0..batch_size as usize {
+            // Extract batch: [n_freqs, frames]
+            let batch_spec = spec.index((b as i32, .., ..));
+            let batch_mel = matmul(&mel_basis, &batch_spec)?;
+            mels.push(batch_mel);
+        }
+
+        let refs: Vec<&Array> = mels.iter().collect();
+        let stacked = concatenate_axis(&refs, 0)?;
+        stacked.reshape(&[batch_size, config.n_mels, n_frames])?
+    } else {
+        // [n_freqs, frames] -> [n_mels, frames]
+        matmul(&mel_basis, spec)?
+    };
+
+    // Log compression (matches Python's spectral_normalize_torch)
+    let mel_log = maximum(&mel, &array!(1e-5f32))?.log()?;
+
+    Ok(mel_log)
+}
+
+/// Slice segments from mel spectrogram at given frame indices
+///
+/// Input: mel [batch, n_mels, frames]
+/// ids_slice: [batch] frame indices
+/// segment_frames: number of frames to extract
+/// Output: mel [batch, n_mels, segment_frames]
+pub fn slice_mel_segments(
+    mel: &Array,
+    ids_slice: &Array,
+    segment_frames: i32,
+) -> Result<Array, Exception> {
+    let batch_size = mel.dim(0) as i32;
+    let n_mels = mel.dim(1) as i32;
+    let total_frames = mel.dim(2) as i32;
+
+    let mut slices = Vec::new();
+    for b in 0..batch_size as usize {
+        let start_frame: i32 = ids_slice.index(b as i32).item();
+        let end_frame = (start_frame + segment_frames).min(total_frames);
+
+        // Slice: [n_mels, segment_frames]
+        let slice = mel.index((b as i32, .., start_frame..end_frame));
+        slices.push(slice);
+    }
+
+    // Stack: [batch, n_mels, segment_frames]
+    let refs: Vec<&Array> = slices.iter().collect();
+    let stacked = concatenate_axis(&refs, 0)?;
+    stacked.reshape(&[batch_size, n_mels, segment_frames])
+}
+
+/// Configuration for spectrogram computation
+#[derive(Debug, Clone)]
+pub struct SpectrogramConfig {
+    /// FFT size (default: 2048)
+    pub n_fft: i32,
+    /// Hop length in samples (default: 640)
+    pub hop_length: i32,
+    /// Window length (default: 2048)
+    pub win_length: i32,
+}
+
+impl Default for SpectrogramConfig {
+    fn default() -> Self {
+        Self {
+            n_fft: 2048,
+            hop_length: 640,
+            win_length: 2048,
+        }
+    }
+}
+
+/// Compute spectrogram (linear STFT magnitude) from audio using MLX
+///
+/// Input: audio [batch, samples] or [samples]
+/// Output: spectrogram [batch, n_fft/2+1, frames] or [n_fft/2+1, frames]
+///
+/// This is the linear spectrogram needed for VITS enc_q input.
+pub fn spectrogram_mlx(
+    audio: &Array,
+    config: &SpectrogramConfig,
+) -> Result<Array, Exception> {
+    stft_mlx(audio, config.n_fft, config.hop_length, config.win_length)
 }
 
 #[cfg(test)]

@@ -811,36 +811,50 @@ pub fn load_t2s_weights(model: &mut T2SModel, weights: &HashMap<String, Array>) 
         Err(Error::Message(format!("Weight not found: {:?}", keys)))
     };
 
-    // Load embeddings - handle both naming conventions
+    // Load embeddings - handle multiple naming conventions:
+    // - Rust saved: phoneme_embedding.weight, semantic_embedding.weight
+    // - PyTorch v1: phoneme_embed.weight, semantic_embed.weight
+    // - PyTorch v2: model.ar_text_embedding.word_embeddings.weight, model.ar_audio_embedding.word_embeddings.weight
     model.phoneme_embedding.weight = Param::new(get_weight(&[
-        "phoneme_embed.weight",
-        "model.ar_text_embedding.word_embeddings.weight",
+        "phoneme_embedding.weight",  // Rust saved
+        "phoneme_embed.weight",       // PyTorch v1
+        "model.ar_text_embedding.word_embeddings.weight",  // PyTorch v2
     ])?);
     model.semantic_embedding.weight = Param::new(get_weight(&[
-        "semantic_embed.weight",
-        "model.ar_audio_embedding.word_embeddings.weight",
+        "semantic_embedding.weight",  // Rust saved
+        "semantic_embed.weight",       // PyTorch v1
+        "model.ar_audio_embedding.word_embeddings.weight",  // PyTorch v2
     ])?);
 
     // Load BERT projection - not present in converted weights, skip if missing
-    if let Ok(w) = get_weight(&["audio_proj.weight", "model.bert_proj.weight"]) {
+    if let Ok(w) = get_weight(&["bert_proj.weight", "audio_proj.weight", "model.bert_proj.weight"]) {
         model.bert_proj.weight = Param::new(w);
     }
-    if let Ok(b) = get_weight(&["audio_proj.bias", "model.bert_proj.bias"]) {
+    if let Ok(b) = get_weight(&["bert_proj.bias", "audio_proj.bias", "model.bert_proj.bias"]) {
         model.bert_proj.bias = Param::new(Some(b));
     }
 
     // Load layers
+    // Supports three naming conventions:
+    // - Rust saved: layers.{i}.self_attn.in_proj.weight, layers.{i}.ffn.linear1.weight, etc.
+    // - PyTorch separate Q/K/V: layers.{i}.self_attn.q_proj.weight, etc.
+    // - PyTorch old: model.h.layers.{i}.self_attn.in_proj_weight, etc.
     for (i, layer) in model.layers.iter_mut().enumerate() {
-        // New naming: layers.{i}.self_attn.{q,k,v}_proj
-        // Old naming: model.h.layers.{i}.self_attn.in_proj_weight
-
-        // Try new naming with separate Q/K/V first
+        // Self-attention in_proj (combined QKV)
+        let rust_in_proj = format!("layers.{}.self_attn.in_proj.weight", i);
         let q_key = format!("layers.{}.self_attn.q_proj.weight", i);
-        let k_key = format!("layers.{}.self_attn.k_proj.weight", i);
-        let v_key = format!("layers.{}.self_attn.v_proj.weight", i);
+        let old_in_proj = format!("model.h.layers.{}.self_attn.in_proj_weight", i);
 
-        if weights.contains_key(&q_key) {
-            // Concatenate Q, K, V into combined QKV
+        if let Some(w) = weights.get(&rust_in_proj) {
+            // Rust saved format - already combined QKV
+            layer.self_attn.in_proj.weight = Param::new(w.clone());
+            if let Some(b) = weights.get(&format!("layers.{}.self_attn.in_proj.bias", i)) {
+                layer.self_attn.in_proj.bias = Param::new(Some(b.clone()));
+            }
+        } else if weights.contains_key(&q_key) {
+            // PyTorch separate Q/K/V - concatenate
+            let k_key = format!("layers.{}.self_attn.k_proj.weight", i);
+            let v_key = format!("layers.{}.self_attn.v_proj.weight", i);
             let q = weights.get(&q_key).unwrap().clone();
             let k = weights.get(&k_key).unwrap().clone();
             let v = weights.get(&v_key).unwrap().clone();
@@ -860,66 +874,78 @@ pub fn load_t2s_weights(model: &mut T2SModel, weights: &HashMap<String, Array>) 
                 layer.self_attn.in_proj.bias = Param::new(Some(qkv_bias));
             }
         } else {
-            // Try old naming
-            let prefix = format!("model.h.layers.{}", i);
-            layer.self_attn.in_proj.weight =
-                Param::new(get_weight(&[&format!("{}.self_attn.in_proj_weight", prefix)])?);
-            if let Ok(bias) = get_weight(&[&format!("{}.self_attn.in_proj_bias", prefix)]) {
+            // PyTorch old format
+            layer.self_attn.in_proj.weight = Param::new(get_weight(&[&old_in_proj])?);
+            let old_in_bias = format!("model.h.layers.{}.self_attn.in_proj_bias", i);
+            if let Ok(bias) = get_weight(&[&old_in_bias]) {
                 layer.self_attn.in_proj.bias = Param::new(Some(bias));
             }
         }
 
         // Output projection
-        let o_key = format!("layers.{}.self_attn.o_proj.weight", i);
-        let o_old = format!("model.h.layers.{}.self_attn.out_proj.weight", i);
-        layer.self_attn.out_proj.weight = Param::new(get_weight(&[&o_key, &o_old])?);
+        layer.self_attn.out_proj.weight = Param::new(get_weight(&[
+            &format!("layers.{}.self_attn.out_proj.weight", i),  // Rust saved
+            &format!("layers.{}.self_attn.o_proj.weight", i),    // PyTorch new
+            &format!("model.h.layers.{}.self_attn.out_proj.weight", i),  // PyTorch old
+        ])?);
         if let Ok(bias) = get_weight(&[
+            &format!("layers.{}.self_attn.out_proj.bias", i),
             &format!("layers.{}.self_attn.o_proj.bias", i),
             &format!("model.h.layers.{}.self_attn.out_proj.bias", i),
         ]) {
             layer.self_attn.out_proj.bias = Param::new(Some(bias));
         }
 
-        // FFN - new naming uses gate_proj/down_proj, old uses linear1/linear2
+        // FFN layer1
         layer.ffn.linear1.weight = Param::new(get_weight(&[
-            &format!("layers.{}.mlp.gate_proj.weight", i),
-            &format!("model.h.layers.{}.linear1.weight", i),
+            &format!("layers.{}.ffn.linear1.weight", i),  // Rust saved
+            &format!("layers.{}.mlp.gate_proj.weight", i),  // PyTorch new
+            &format!("model.h.layers.{}.linear1.weight", i),  // PyTorch old
         ])?);
         if let Ok(bias) = get_weight(&[
+            &format!("layers.{}.ffn.linear1.bias", i),
             &format!("layers.{}.mlp.gate_proj.bias", i),
             &format!("model.h.layers.{}.linear1.bias", i),
         ]) {
             layer.ffn.linear1.bias = Param::new(Some(bias));
         }
 
+        // FFN layer2
         layer.ffn.linear2.weight = Param::new(get_weight(&[
-            &format!("layers.{}.mlp.down_proj.weight", i),
-            &format!("model.h.layers.{}.linear2.weight", i),
+            &format!("layers.{}.ffn.linear2.weight", i),  // Rust saved
+            &format!("layers.{}.mlp.down_proj.weight", i),  // PyTorch new
+            &format!("model.h.layers.{}.linear2.weight", i),  // PyTorch old
         ])?);
         if let Ok(bias) = get_weight(&[
+            &format!("layers.{}.ffn.linear2.bias", i),
             &format!("layers.{}.mlp.down_proj.bias", i),
             &format!("model.h.layers.{}.linear2.bias", i),
         ]) {
             layer.ffn.linear2.bias = Param::new(Some(bias));
         }
 
-        // LayerNorms
+        // LayerNorm 1
         layer.norm1.weight = Param::new(Some(get_weight(&[
-            &format!("layers.{}.input_layernorm.weight", i),
-            &format!("model.h.layers.{}.norm1.weight", i),
+            &format!("layers.{}.norm1.weight", i),  // Rust saved
+            &format!("layers.{}.input_layernorm.weight", i),  // PyTorch new
+            &format!("model.h.layers.{}.norm1.weight", i),  // PyTorch old
         ])?));
         if let Ok(bias) = get_weight(&[
+            &format!("layers.{}.norm1.bias", i),
             &format!("layers.{}.input_layernorm.bias", i),
             &format!("model.h.layers.{}.norm1.bias", i),
         ]) {
             layer.norm1.bias = Param::new(Some(bias));
         }
 
+        // LayerNorm 2
         layer.norm2.weight = Param::new(Some(get_weight(&[
-            &format!("layers.{}.post_attention_layernorm.weight", i),
-            &format!("model.h.layers.{}.norm2.weight", i),
+            &format!("layers.{}.norm2.weight", i),  // Rust saved
+            &format!("layers.{}.post_attention_layernorm.weight", i),  // PyTorch new
+            &format!("model.h.layers.{}.norm2.weight", i),  // PyTorch old
         ])?));
         if let Ok(bias) = get_weight(&[
+            &format!("layers.{}.norm2.bias", i),
             &format!("layers.{}.post_attention_layernorm.bias", i),
             &format!("model.h.layers.{}.norm2.bias", i),
         ]) {
@@ -929,16 +955,23 @@ pub fn load_t2s_weights(model: &mut T2SModel, weights: &HashMap<String, Array>) 
 
     // Load prediction layer
     model.predict_layer.weight = Param::new(get_weight(&[
-        "lm_head.weight",
-        "model.ar_predict_layer.weight",
+        "predict_layer.weight",  // Rust saved
+        "lm_head.weight",        // PyTorch new
+        "model.ar_predict_layer.weight",  // PyTorch old
     ])?);
 
     // Load position encoding alpha values
-    if let Ok(alpha) = get_weight(&["model.ar_text_position.alpha"]) {
+    if let Ok(alpha) = get_weight(&[
+        "text_position.alpha",  // Rust saved
+        "model.ar_text_position.alpha",  // PyTorch
+    ]) {
         let alpha_val: f32 = alpha.item();
         model.text_position.alpha = alpha_val;
     }
-    if let Ok(alpha) = get_weight(&["model.ar_audio_position.alpha"]) {
+    if let Ok(alpha) = get_weight(&[
+        "audio_position.alpha",  // Rust saved
+        "model.ar_audio_position.alpha",  // PyTorch
+    ]) {
         let alpha_val: f32 = alpha.item();
         model.audio_position.alpha = alpha_val;
     }

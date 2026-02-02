@@ -27,6 +27,7 @@ serde_json = { version = "1", optional = true }
 [features]
 default = []
 punctuation = ["ort", "serde_json"]
+convert = ["mlx-rs-core/convert"]
 
 [dev-dependencies]
 # For examples only
@@ -54,3 +55,8 @@ path = "examples/validate_correctness.rs"
 [[example]]
 name = "overall_performance"
 path = "examples/overall_performance.rs"
+
+[[example]]
+name = "convert_model"
+path = "examples/convert_model.rs"
+required-features = ["convert"]

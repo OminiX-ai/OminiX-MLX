@@ -282,6 +282,36 @@ cargo test --release
 
 ---
 
+## Appendix: Translation Pipeline Findings
+
+### Empirical Test: Qwen3-0.6B Translation Capability
+
+**Hypothesis:** The integrated Qwen3-0.6B could be used for both ASR and translation.
+
+**Test Results:**
+| Task | Input | Output | Result |
+|------|-------|--------|--------|
+| ASR | Chinese audio | "开放时间：早上九点至下午五点。" | Works |
+| Text Translation | "今天天气很好" + translate prompt | "!!!!!!!!!!" | FAILS |
+| Audio-to-English | Audio + English prompt | Chinese transcription | FAILS |
+| Custom Prompt | Audio + custom instruction | Chinese transcription | FAILS |
+
+**Conclusion:** The Qwen3-0.6B was fine-tuned EXCLUSIVELY for Chinese ASR. It:
+- Ignores system/user prompts
+- Always outputs Chinese transcription
+- Cannot perform translation or other generative tasks
+
+**Implication:** Cannot consolidate ASR + translation into funasr-nano. Must use:
+1. funasr-nano for ASR (fast, accurate)
+2. Separate translation LLM (Qwen2.5-0.5B-Instruct or similar)
+
+**Optimization Focus:** Instead of unifying models, optimize the pipeline:
+- Stream ASR output to translation LLM
+- Use sentence-boundary detection for early translation start
+- Consider smaller/faster translation models
+
+---
+
 ## Appendix: Lessons Learned
 
 ### 1. Benchmark Before Optimizing

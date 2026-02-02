@@ -189,6 +189,8 @@ pub struct SynthesisOptions {
     pub cancel_token: Option<std::sync::Arc<AtomicBool>>,
     /// Maximum tokens to generate per chunk (None = auto)
     pub max_tokens_per_chunk: Option<usize>,
+    /// Per-call speed override (None = use config.speed)
+    pub speed_override: Option<f32>,
 }
 
 impl SynthesisOptions {
@@ -696,8 +698,17 @@ impl VoiceCloner {
         let timeout = options.timeout;
         let cancel_token = options.cancel_token.clone();
 
+        // Apply speed override if specified
+        let original_speed = self.config.speed;
+        if let Some(speed) = options.speed_override {
+            self.config.speed = speed;
+        }
+
         // Perform synthesis with periodic checks
         let result = self.synthesize(text);
+
+        // Restore original speed
+        self.config.speed = original_speed;
 
         // Check for timeout/cancellation after synthesis
         if let Some(token) = &cancel_token {

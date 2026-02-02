@@ -49,3 +49,11 @@ path = "examples/fair_benchmark.rs"
 [[example]]
 name = "profile_test"
 path = "examples/profile_test.rs"
+
+[[example]]
+name = "translate"
+path = "examples/translate.rs"
+
+[[example]]
+name = "test_instruct_swap"
+path = "examples/test_instruct_swap.rs"

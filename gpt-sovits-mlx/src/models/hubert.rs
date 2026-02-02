@@ -749,10 +749,17 @@ pub fn load_hubert_weights(
 
     // Load positional conv embedding
     // Weight normalized conv has weight_g (magnitude) and weight_v (direction)
-    if let Ok(g) = get_weight("encoder.pos_conv_embed.conv.weight_g") {
+    // PyTorch parametrization uses different key names:
+    //   - weight_g = "encoder.pos_conv_embed.conv.parametrizations.weight.original0" or "weight_g"
+    //   - weight_v = "encoder.pos_conv_embed.conv.parametrizations.weight.original1" or "weight_v"
+    let g = get_weight("encoder.pos_conv_embed.conv.weight_g")
+        .or_else(|_| get_weight("encoder.pos_conv_embed.conv.parametrizations.weight.original0"));
+    if let Ok(g) = g {
         model.pos_conv_embed.weight_g = Param::new(g);
     }
-    if let Ok(v) = get_weight("encoder.pos_conv_embed.conv.weight_v") {
+    let v = get_weight("encoder.pos_conv_embed.conv.weight_v")
+        .or_else(|_| get_weight("encoder.pos_conv_embed.conv.parametrizations.weight.original1"));
+    if let Ok(v) = v {
         model.pos_conv_embed.weight_v = Param::new(v);
     }
     if let Ok(b) = get_weight("encoder.pos_conv_embed.conv.bias") {

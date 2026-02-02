@@ -52,40 +52,48 @@ funasr-mlx = { git = "https://github.com/oxideai/mlx-rs" }
 
 ## Model Download
 
-Download pre-converted MLX model from Hugging Face:
+**Important:** The original FunASR model uses PyTorch format. You must convert it to MLX-compatible safetensors format before use.
+
+### Step 1: Download Original Model
+
+The Paraformer-large model is available from ModelScope:
 
 ```bash
-# Paraformer-large (Chinese ASR)
-huggingface-cli download funaudiollm/paraformer-large-mlx --local-dir ./models/paraformer
+git lfs install
+git clone https://modelscope.cn/models/damo/speech_seaco_paraformer_large_asr_nat-zh-cn-16k-common-vocab8404-pytorch.git ./paraformer-src
 ```
 
-Model directory structure:
+### Step 2: Convert to MLX Format
+
+The converter is **pure Rust** - no Python or libtorch required:
+
+```bash
+cargo run --release --features convert --example convert_model -- ./paraformer-src ./models/paraformer
+```
+
+This will:
+- Load the PyTorch model using candle-core
+- Convert 956 tensors to MLX-compatible format
+- Save as safetensors (smaller and faster to load)
+- Copy auxiliary files (am.mvn, tokens.txt)
+
+### Environment Variables
+
+```bash
+# Set custom model path
+export FUNASR_MODEL_DIR=/path/to/paraformer
+
+# Or specify when running
+FUNASR_MODEL_DIR=./models/paraformer cargo run --example transcribe --release
+```
+
+### Model Directory Structure
+
 ```
 models/paraformer/
-├── paraformer.safetensors   # Model weights
+├── paraformer.safetensors   # Model weights (converted)
 ├── am.mvn                   # CMVN normalization
 └── tokens.txt               # Vocabulary (8404 tokens)
-```
-
-### Converting from FunASR (Alternative)
-
-If you need to convert from the original FunASR checkpoint:
-
-```python
-# scripts/convert_paraformer.py
-import torch
-from safetensors.torch import save_file
-
-# Load FunASR checkpoint
-ckpt = torch.load("model.pb", map_location="cpu")
-
-# Rename and save
-weights = {}
-for name, tensor in ckpt.items():
-    # Apply weight name mapping...
-    weights[new_name] = tensor
-
-save_file(weights, "paraformer.safetensors")
 ```
 
 ## Examples

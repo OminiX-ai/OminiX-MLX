@@ -226,7 +226,8 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
 
     // Encode prompt
     let template = "<|im_start|>system\nDescribe the image by detailing the color, shape, size, texture, quantity, text, spatial relationships of the objects and background:<|im_end|>\n<|im_start|>user\n{}<|im_end|>\n<|im_start|>assistant\n";
-    let max_input_len = 77 + 34;
+    // Support longer prompts - Qwen text encoder can handle up to 512 tokens
+    let max_input_len = 512;
     let drop_idx = 34;
 
     println!("Tokenizing prompt: \"{}\"", args.prompt);

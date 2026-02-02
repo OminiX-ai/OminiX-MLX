@@ -5,6 +5,10 @@ edition = "2021"
 description = "Shared inference infrastructure for MLX Rust crates"
 license = "MIT OR Apache-2.0"
 
+[features]
+default = []
+convert = ["candle-core", "safetensors"]
+
 [dependencies]
 mlx-rs = { path = "../mlx-rs", features = ["metal", "accelerate"] }
 mlx-sys = { path = "../mlx-rs/mlx-sys" }
@@ -15,3 +19,7 @@ tokenizers = "0.21"
 
 # Audio processing dependencies
 rubato = "0.14"  # High-quality audio resampling
+
+# Model conversion dependencies (optional)
+candle-core = { version = "0.8", optional = true }
+safetensors = { version = "0.5", optional = true }

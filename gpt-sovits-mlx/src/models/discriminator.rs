@@ -57,31 +57,33 @@ impl DiscriminatorS {
             .build()
             .map_err(|e| Error::Message(e.to_string()))?;
 
+        // Note: groups disabled temporarily due to weight initialization issue
+        // TODO: Fix grouped convolution weight shapes for proper HiFi-GAN discriminator
         let conv2 = nn::Conv1dBuilder::new(16, 64, 41)
             .stride(4)
             .padding(20)
-            .groups(4)
+            // .groups(4)  // Disabled: weight init doesn't handle groups correctly
             .build()
             .map_err(|e| Error::Message(e.to_string()))?;
 
         let conv3 = nn::Conv1dBuilder::new(64, 256, 41)
             .stride(4)
             .padding(20)
-            .groups(16)
+            // .groups(16)
             .build()
             .map_err(|e| Error::Message(e.to_string()))?;
 
         let conv4 = nn::Conv1dBuilder::new(256, 1024, 41)
             .stride(4)
             .padding(20)
-            .groups(64)
+            // .groups(64)
             .build()
             .map_err(|e| Error::Message(e.to_string()))?;
 
         let conv5 = nn::Conv1dBuilder::new(1024, 1024, 41)
             .stride(4)
             .padding(20)
-            .groups(256)
+            // .groups(256)
             .build()
             .map_err(|e| Error::Message(e.to_string()))?;
 
@@ -109,10 +111,14 @@ impl DiscriminatorS {
     }
 
     /// Forward pass returning (output, feature_maps)
+    /// Input: x in NCL format [batch, channels, length]
     pub fn forward(&mut self, x: &Array) -> Result<(Array, Vec<Array>), Error> {
+        use mlx_rs::ops::swap_axes;
         let mut fmap = Vec::new();
 
-        let mut x = self.conv1.forward(x).map_err(|e| Error::Message(e.to_string()))?;
+        // Convert NCL -> NLC for Conv1d
+        let mut x = swap_axes(x, 1, 2).map_err(|e| Error::Message(e.to_string()))?;
+        x = self.conv1.forward(&x).map_err(|e| Error::Message(e.to_string()))?;
         x = nn::leaky_relu(&x, LRELU_SLOPE).map_err(|e| Error::Message(e.to_string()))?;
         fmap.push(x.clone());
 
@@ -148,10 +154,14 @@ impl DiscriminatorS {
     }
 
     /// Forward pass returning Exception (for use with value_and_grad)
+    /// Input: x in NCL format [batch, channels, length]
     pub fn forward_ex(&mut self, x: &Array) -> Result<(Array, Vec<Array>), mlx_rs::error::Exception> {
+        use mlx_rs::ops::swap_axes;
         let mut fmap = Vec::new();
 
-        let mut x = self.conv1.forward(x)?;
+        // Convert NCL -> NLC for Conv1d
+        let mut x = swap_axes(x, 1, 2)?;
+        x = self.conv1.forward(&x)?;
         x = nn::leaky_relu(&x, LRELU_SLOPE)?;
         fmap.push(x.clone());
 
@@ -286,6 +296,11 @@ impl DiscriminatorP {
         x = x.reshape(&[b, c, t / self.period, self.period])
             .map_err(|e| Error::Message(e.to_string()))?;
 
+        // Convert NCHW -> NHWC for MLX Conv2d
+        // [B, C, H, W] -> [B, H, W, C]
+        x = x.transpose_axes(&[0, 2, 3, 1])
+            .map_err(|e| Error::Message(e.to_string()))?;
+
         // Apply convolutions
         x = self.conv1.forward(&x).map_err(|e| Error::Message(e.to_string()))?;
         x = nn::leaky_relu(&x, LRELU_SLOPE).map_err(|e| Error::Message(e.to_string()))?;
@@ -340,6 +355,10 @@ impl DiscriminatorP {
 
         // Reshape 1D to 2D: [B, C, T] -> [B, C, T//period, period]
         x = x.reshape(&[b, c, t / self.period, self.period])?;
+
+        // Convert NCHW -> NHWC for MLX Conv2d
+        // [B, C, H, W] -> [B, H, W, C]
+        x = x.transpose_axes(&[0, 2, 3, 1])?;
 
         // Apply convolutions
         x = self.conv1.forward(&x)?;

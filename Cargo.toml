@@ -31,6 +31,7 @@ members = [
     "zimage-mlx",
     "funasr-mlx",
     "funasr-nano-mlx",
+    "funasr-qwen4b-mlx",
     "qwen3-mlx",
     "glm4-mlx",
     "glm4-moe-mlx",

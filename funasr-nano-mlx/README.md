@@ -50,14 +50,63 @@ Audio (16kHz)
 
 ## Model Download
 
-Download models from Hugging Face:
+Models download from HuggingFace (no authentication required).
+
+### Download URLs
+
+**MLX-converted models (required for this library):**
+
+| Model | Precision | HuggingFace URL |
+|-------|-----------|-----------------|
+| Fun-ASR-Nano-2512 | fp16 | https://huggingface.co/mlx-community/Fun-ASR-Nano-2512-fp16 |
+| Fun-ASR-MLT-Nano-2512 | fp16 | https://huggingface.co/mlx-community/Fun-ASR-MLT-Nano-2512-fp16 |
+
+
+**Original PyTorch models (for reference):**
+
+| Source | URL |
+|--------|-----|
+| **HuggingFace (Original)** | https://huggingface.co/FunAudioLLM/Fun-ASR-Nano-2512 |
+| **ModelScope (Original)** | https://www.modelscope.cn/models/FunAudioLLM/Fun-ASR-Nano-2512 |
+| **Original FunASR** | https://github.com/modelscope/FunASR |
+
+### Environment Variables
 
 ```bash
-# Fun-ASR-Nano (Chinese, English, Japanese)
-huggingface-cli download FunAudioLLM/Fun-ASR-Nano-2512 --local-dir ./models/Fun-ASR-Nano-2512
+# Set custom model path
+export FUNASR_NANO_MODEL_DIR=/path/to/Fun-ASR-Nano-2512
 
-# Fun-ASR-MLT-Nano (31 languages)
-huggingface-cli download FunAudioLLM/Fun-ASR-MLT-Nano-2512 --local-dir ./models/Fun-ASR-MLT-Nano-2512
+# Set language for SenseVoice (zh, en, ja, ko, auto)
+export ASR_NANO_LANGUAGE=auto
+
+# Or specify when running
+FUNASR_NANO_MODEL_DIR=./models/Fun-ASR-Nano-2512 cargo run --example transcribe --release
+```
+
+### Manual Download
+
+```bash
+# Fun-ASR-Nano MLX (fp16)
+huggingface-cli download mlx-community/Fun-ASR-Nano-2512-fp16 --local-dir ./models/Fun-ASR-Nano-2512
+
+# Fun-ASR-MLT-Nano MLX (31 languages, fp16)
+huggingface-cli download mlx-community/Fun-ASR-MLT-Nano-2512-fp16 --local-dir ./models/Fun-ASR-MLT-Nano-2512
+
+# Using git lfs
+git lfs install
+git clone https://huggingface.co/mlx-community/Fun-ASR-Nano-2512-fp16 ./models/Fun-ASR-Nano-2512
+```
+
+### Model Directory Structure
+
+```
+models/Fun-ASR-Nano-2512/
+├── model.safetensors            # MLX weights (required)
+├── config.json                  # Model configuration
+├── tokenizer.json               # Tokenizer
+├── vocab.json                   # Vocabulary
+├── merges.txt                   # BPE merges
+└── tokenizer_config.json        # Tokenizer settings
 ```
 
 ## CLI Usage

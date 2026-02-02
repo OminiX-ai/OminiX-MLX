@@ -1,0 +1,48 @@
+[package]
+name = "funasr-qwen4b-mlx"
+version = "0.1.0"
+edition = "2021"
+description = "LLM-based ASR with SenseVoice encoder + Qwen3-4B on Apple Silicon MLX"
+license = "MIT"
+
+[dependencies]
+# MLX framework
+mlx-rs = { path = "../mlx-rs", features = ["metal", "accelerate"] }
+mlx-sys = { path = "../mlx-rs/mlx-sys" }
+
+# Shared LLM infrastructure
+mlx-rs-core = { path = "../mlx-rs-core" }
+
+# Qwen3 model (reuse existing implementation)
+qwen3-mlx = { path = "../qwen3-mlx" }
+
+# Serialization
+serde = { version = "1", features = ["derive"] }
+serde_json = "1"
+serde_yaml = "0.9"
+
+# Tokenization
+tokenizers = "0.21"
+
+# Error handling
+thiserror = "2"
+
+# Audio processing
+rubato = "0.16"  # High-quality resampling
+hound = "3.5"    # WAV file reading
+rustfft = "6.2"  # FFT for mel spectrogram
+rand = "0.8"     # Dithering for FunASR-compatible preprocessing
+
+# Path utilities
+dirs = "5"
+
+[dev-dependencies]
+anyhow = "1"
+
+[[example]]
+name = "transcribe"
+path = "examples/transcribe.rs"
+
+[[example]]
+name = "transcribe_translate"
+path = "examples/transcribe_translate.rs"

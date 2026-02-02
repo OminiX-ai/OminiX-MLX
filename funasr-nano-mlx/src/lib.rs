@@ -40,7 +40,7 @@ pub mod whisper_encoder;
 
 // Re-exports
 pub use error::Error;
-pub use model::{FunASRNano, FunASRNanoConfig, SamplingConfig, StreamingContext};
+pub use model::{FunASRNano, FunASRNanoConfig, SamplingConfig, StreamingContext, TaskPrompt};
 pub use audio::{AudioConfig, MelFrontend};
 
 // Re-export from mlx-rs-core

@@ -11,6 +11,7 @@ use mlx_rs::{
     array,
     error::Exception,
     ops::{abs as array_abs, exp, ones_like, square},
+    stop_gradient,
     Array,
 };
 
@@ -67,6 +68,10 @@ pub fn discriminator_loss(
 /// Computes L1 distance between real and fake feature maps from discriminator.
 /// This helps stabilize GAN training by providing additional gradients.
 ///
+/// CRITICAL: Real features must be detached (stop_gradient) so gradients only
+/// flow to the generator through the fake features, not to the discriminator
+/// through the real features. This matches Python: `rl = rl.float().detach()`
+///
 /// Loss = 2 * sum(mean(|real_fmap - fake_fmap|))
 pub fn feature_matching_loss(
     real_fmaps: &[Vec<Array>],
@@ -75,9 +80,13 @@ pub fn feature_matching_loss(
     let mut total_loss = array!(0.0f32);
 
     for (real_fmap, fake_fmap) in real_fmaps.iter().zip(fake_fmaps.iter()) {
-        // Detach real features (stop gradient)
         for (real, fake) in real_fmap.iter().zip(fake_fmap.iter()) {
-            let diff = real.subtract(fake)?;
+            // CRITICAL: Stop gradient on real features!
+            // This ensures gradients only flow to the generator (through fake features),
+            // not back to the discriminator (through real features).
+            // Python: rl = rl.float().detach()
+            let real_detached = stop_gradient(real)?;
+            let diff = real_detached.subtract(fake)?;
             let abs_diff = array_abs(&diff)?;
             let loss = abs_diff.mean(false)?;
             total_loss = total_loss.add(&loss)?;
@@ -102,14 +111,21 @@ pub fn kl_loss(
     logs_p: &Array,   // Prior log-variance
     z_mask: &Array,   // Mask for valid positions
 ) -> Result<Array, Exception> {
+    use mlx_rs::ops::clip;
+
+    // Clamp log-variance to prevent numerical instability
+    // log(sigma) in range [-13, 13] corresponds to sigma in [~2e-6, ~4e5]
+    let logs_p_clamped = clip(logs_p, (-13.0f32, 13.0f32))?;
+    let logs_q_clamped = clip(logs_q, (-13.0f32, 13.0f32))?;
+
     // KL = logs_p - logs_q - 0.5 + 0.5 * ((z_p - m_p)^2) * exp(-2 * logs_p)
     let diff = z_p.subtract(m_p)?;
     let diff_sq = square(&diff)?;
-    let neg_2_logs_p = logs_p.multiply(array!(-2.0f32))?;
+    let neg_2_logs_p = logs_p_clamped.multiply(array!(-2.0f32))?;
     let exp_term = exp(&neg_2_logs_p)?;
 
-    let kl_term = logs_p
-        .subtract(logs_q)?
+    let kl_term = logs_p_clamped
+        .subtract(&logs_q_clamped)?
         .subtract(array!(0.5f32))?
         .add(&diff_sq.multiply(&exp_term)?.multiply(array!(0.5f32))?)?;
 
@@ -118,8 +134,11 @@ pub fn kl_loss(
     let kl_sum = kl_masked.sum(false)?;
     let mask_sum = z_mask.sum(false)?;
 
+    // Add small epsilon to avoid division by zero
+    let mask_sum_safe = mask_sum.add(array!(1e-8f32))?;
+
     // Average over valid positions
-    kl_sum.divide(&mask_sum)
+    kl_sum.divide(&mask_sum_safe)
 }
 
 /// Mel spectrogram L1 loss

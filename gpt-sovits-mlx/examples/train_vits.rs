@@ -1,183 +1,101 @@
-//! VITS Training CLI
+//! VITS Training CLI for Fewshot Voice Cloning
 //!
-//! This example demonstrates how to fine-tune VITS (SoVITS) models on custom voice data.
+//! Train VITS (SoVITS) on preprocessed audio data for voice cloning.
 //!
-//! Usage:
+//! # Usage
+//!
 //! ```bash
-//! cargo run --release --example train_vits -- \
-//!     --data-dir /path/to/training_data \
-//!     --pretrained /path/to/pretrained.safetensors \
-//!     --output /path/to/finetuned.safetensors \
-//!     --lr 0.0002 \
-//!     --batch-size 4 \
-//!     --max-steps 1000
-//! ```
+//! # 1. Preprocess audio with Python GPT-SoVITS
+//! # 2. Convert to training format
+//! python scripts/convert_vits_training_data.py \
+//!   --input /tmp/fewshot_1min \
+//!   --output /tmp/fewshot_1min_vits
 //!
-//! Expected data format:
-//! ```
-//! training_data/
-//! ├── ssl_features/    # HuBERT features [ssl_dim, seq_len] .npy files
-//! ├── spec/            # Linear spectrogram [n_fft/2+1, frames] .npy files
-//! ├── audio/           # Audio waveforms [samples] .npy files
-//! ├── phonemes/        # Phoneme indices [text_len] .npy files
-//! ├── refer_mel/       # Reference mel [mel_channels, time] .npy files
-//! └── metadata.json    # Sample list
+//! # 3. Train VITS
+//! cargo run --release --example train_vits -- \
+//!   --data-dir /tmp/fewshot_1min_vits \
+//!   --pretrained ~/.dora/models/primespeech/gpt-sovits-mlx/vits_pretrained_v2.safetensors \
+//!   --output /tmp/vits_finetuned.safetensors \
+//!   --epochs 4
 //! ```
 
 use std::path::PathBuf;
 
 use clap::Parser;
 use gpt_sovits_mlx::{
-    training::{VITSTrainer, VITSTrainingConfig, VITSBatch},
     error::Error,
+    training::{VITSTrainer, VITSTrainingConfig, VITSDataset},
 };
-use mlx_rs::Array;
 
-/// VITS Training CLI for voice cloning
+/// VITS Training CLI for Fewshot Voice Cloning
 #[derive(Parser, Debug)]
-#[command(author, version, about, long_about = None)]
+#[command(name = "train_vits")]
+#[command(about = "Train VITS model for voice cloning")]
 struct Args {
-    /// Path to training data directory
+    /// Training data directory (converted from GPT-SoVITS format)
     #[arg(long)]
     data_dir: PathBuf,
 
-    /// Path to pretrained model weights (safetensors)
+    /// Pretrained VITS model weights
     #[arg(long)]
     pretrained: Option<PathBuf>,
 
-    /// Path to save finetuned model
-    #[arg(long, default_value = "vits_finetuned.safetensors")]
+    /// Output path for finetuned model
+    #[arg(long)]
     output: PathBuf,
 
-    /// Generator learning rate
-    #[arg(long, default_value = "0.0002")]
-    lr_g: f32,
-
-    /// Discriminator learning rate
-    #[arg(long, default_value = "0.0002")]
-    lr_d: f32,
+    /// Number of training epochs
+    #[arg(long, default_value = "4")]
+    epochs: usize,
 
     /// Batch size
-    #[arg(long, default_value = "4")]
+    #[arg(long, default_value = "2")]
     batch_size: usize,
 
-    /// Maximum training steps
-    #[arg(long, default_value = "1000")]
-    max_steps: usize,
+    /// Generator learning rate (1e-5 recommended for finetuning without weight normalization)
+    #[arg(long, default_value = "0.00001")]
+    lr_g: f32,
 
-    /// Mel loss weight
-    #[arg(long, default_value = "45.0")]
-    c_mel: f32,
+    /// Discriminator learning rate (1e-5 recommended for finetuning)
+    #[arg(long, default_value = "0.00001")]
+    lr_d: f32,
 
-    /// KL loss weight
-    #[arg(long, default_value = "1.0")]
-    c_kl: f32,
+    /// L2 regularization strength towards pretrained weights (prevents drift)
+    #[arg(long, default_value = "0.001")]
+    pretrained_reg: f32,
 
-    /// Feature matching loss weight
-    #[arg(long, default_value = "2.0")]
-    c_fm: f32,
-
-    /// Save checkpoint every N steps
-    #[arg(long, default_value = "500")]
-    save_every: usize,
+    /// Audio segment size for training (samples at 32kHz)
+    #[arg(long, default_value = "20480")]
+    segment_size: i32,
 
     /// Log every N steps
     #[arg(long, default_value = "10")]
     log_every: usize,
+
+    /// Save checkpoint every N steps
+    #[arg(long, default_value = "100")]
+    save_every: usize,
 }
 
-/// Load a single training sample from files
-fn load_sample(
-    data_dir: &PathBuf,
-    sample_id: &str,
-) -> Result<VITSBatch, Error> {
-    // Load SSL features
-    let ssl_path = data_dir.join("ssl_features").join(format!("{}.npy", sample_id));
-    let ssl_features = Array::load_numpy(&ssl_path)
-        .map_err(|e| Error::Message(format!("Failed to load SSL features: {}", e)))?;
-    // Add batch dimension: [dim, seq] -> [1, dim, seq]
-    let ssl_features = ssl_features.reshape(&[1, ssl_features.dim(0) as i32, ssl_features.dim(1) as i32])
-        .map_err(|e| Error::Message(e.to_string()))?;
-
-    // Load spectrogram
-    let spec_path = data_dir.join("spec").join(format!("{}.npy", sample_id));
-    let spec = Array::load_numpy(&spec_path)
-        .map_err(|e| Error::Message(format!("Failed to load spec: {}", e)))?;
-    let spec = spec.reshape(&[1, spec.dim(0) as i32, spec.dim(1) as i32])
-        .map_err(|e| Error::Message(e.to_string()))?;
-
-    // Load audio
-    let audio_path = data_dir.join("audio").join(format!("{}.npy", sample_id));
-    let audio = Array::load_numpy(&audio_path)
-        .map_err(|e| Error::Message(format!("Failed to load audio: {}", e)))?;
-    // Add batch and channel dims: [samples] -> [1, 1, samples]
-    let audio = audio.reshape(&[1, 1, audio.dim(0) as i32])
-        .map_err(|e| Error::Message(e.to_string()))?;
-
-    // Load phonemes
-    let phoneme_path = data_dir.join("phonemes").join(format!("{}.npy", sample_id));
-    let text = Array::load_numpy(&phoneme_path)
-        .map_err(|e| Error::Message(format!("Failed to load phonemes: {}", e)))?;
-    let text = text.reshape(&[1, text.dim(0) as i32])
-        .map_err(|e| Error::Message(e.to_string()))?;
-
-    // Load reference mel
-    let mel_path = data_dir.join("refer_mel").join(format!("{}.npy", sample_id));
-    let refer_mel = Array::load_numpy(&mel_path)
-        .map_err(|e| Error::Message(format!("Failed to load refer_mel: {}", e)))?;
-    let refer_mel = refer_mel.reshape(&[1, refer_mel.dim(0) as i32, refer_mel.dim(1) as i32])
-        .map_err(|e| Error::Message(e.to_string()))?;
-
-    // Spec lengths (full length for single sample)
-    let spec_lengths = Array::from_slice(&[spec.dim(2) as i32], &[1]);
-    let text_lengths = Array::from_slice(&[text.dim(1) as i32], &[1]);
-
-    Ok(VITSBatch {
-        ssl_features,
-        spec,
-        spec_lengths,
-        text,
-        text_lengths,
-        audio,
-        refer_mel,
-    })
-}
-
-/// Load metadata and create batch iterator
-fn load_dataset(
-    data_dir: &PathBuf,
-) -> Result<Vec<String>, Error> {
-    let metadata_path = data_dir.join("metadata.json");
-    let metadata_str = std::fs::read_to_string(&metadata_path)
-        .map_err(|e| Error::Message(format!("Failed to read metadata: {}", e)))?;
-
-    // Parse JSON to get sample IDs
-    let metadata: serde_json::Value = serde_json::from_str(&metadata_str)
-        .map_err(|e| Error::Message(format!("Failed to parse metadata: {}", e)))?;
-
-    let samples = metadata["samples"]
-        .as_array()
-        .ok_or_else(|| Error::Message("metadata.json missing 'samples' array".to_string()))?;
-
-    let sample_ids: Vec<String> = samples
-        .iter()
-        .filter_map(|s| s["id"].as_str().map(|id| id.to_string()))
-        .collect();
-
-    Ok(sample_ids)
-}
-
-fn main() -> Result<(), Box<dyn std::error::Error>> {
+fn main() -> Result<(), Error> {
     let args = Args::parse();
 
-    println!("VITS Training");
-    println!("=============");
-    println!("Data dir: {:?}", args.data_dir);
+    println!("VITS Fewshot Training");
+    println!("=====================");
+    println!("Data directory: {:?}", args.data_dir);
     println!("Pretrained: {:?}", args.pretrained);
     println!("Output: {:?}", args.output);
-    println!("LR (G/D): {}/{}", args.lr_g, args.lr_d);
+    println!("Epochs: {}", args.epochs);
     println!("Batch size: {}", args.batch_size);
-    println!("Max steps: {}", args.max_steps);
+    println!("Learning rate (G/D): {}/{}", args.lr_g, args.lr_d);
+    println!("Segment size: {} samples (~{:.1}ms)", args.segment_size, args.segment_size as f32 / 32.0);
+    println!();
+
+    // Load dataset
+    println!("Loading dataset...");
+    let mut dataset = VITSDataset::load(&args.data_dir)?;
+    println!("  Loaded {} samples", dataset.len());
+    println!("  Sample rate: {} Hz", dataset.sample_rate());
     println!();
 
     // Create training config
@@ -185,45 +103,115 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
         learning_rate_g: args.lr_g,
         learning_rate_d: args.lr_d,
         batch_size: args.batch_size,
-        c_mel: args.c_mel,
-        c_kl: args.c_kl,
-        c_fm: args.c_fm,
-        max_steps: args.max_steps,
-        save_every: args.save_every,
+        segment_size: args.segment_size,
         log_every: args.log_every,
+        save_every: args.save_every,
+        pretrained_reg_strength: args.pretrained_reg,
         ..Default::default()
     };
+    println!("Pretrained regularization: {}", args.pretrained_reg);
 
     // Create trainer
-    println!("Creating VITS trainer...");
+    println!("Creating trainer...");
     let mut trainer = VITSTrainer::new(config)?;
 
-    // Load pretrained weights if provided
-    if let Some(ref pretrained_path) = args.pretrained {
-        println!("Loading pretrained weights from {:?}", pretrained_path);
-        trainer.load_generator_weights(pretrained_path)?;
+    // Load pretrained weights if specified
+    if let Some(pretrained_path) = &args.pretrained {
+        println!("Loading pretrained weights from {:?}...", pretrained_path);
+        // Use regularization-aware loading to prevent weight drift during finetuning
+        // This stores a copy of pretrained weights for L2 regularization
+        trainer.load_generator_weights_with_regularization(pretrained_path)?;
+
+        // For fewshot training: freeze encoder/flow, only train decoder
+        // This preserves the learned phoneme representations and only adapts the voice timbre
+        println!("Freezing encoder/flow layers (fewshot mode)...");
+        trainer.freeze_non_decoder_layers();
     }
 
-    // Load dataset
-    println!("Loading dataset...");
-    let sample_ids = load_dataset(&args.data_dir)?;
-    println!("Found {} samples", sample_ids.len());
+    // Compute total steps
+    let steps_per_epoch = (dataset.len() + args.batch_size - 1) / args.batch_size;
+    let total_steps = steps_per_epoch * args.epochs;
+    println!("  Steps per epoch: {}", steps_per_epoch);
+    println!("  Total steps: {}", total_steps);
+    println!();
 
-    // Create batch iterator
-    let batches = sample_ids
-        .iter()
-        .cycle()  // Repeat dataset
-        .take(args.max_steps)
-        .filter_map(|id| load_sample(&args.data_dir, id).ok());
+    // Training loop
+    println!("Starting training...");
+    println!("-------------------");
 
-    // Train
-    println!("\nStarting training...\n");
-    trainer.train(batches)?;
+    let hop_length = 640; // Default for 32kHz audio
 
-    // Save final checkpoint
-    println!("\nSaving final model to {:?}", args.output);
+    for epoch in 0..args.epochs {
+        println!("\nEpoch {}/{}", epoch + 1, args.epochs);
+
+        // Shuffle at start of each epoch
+        dataset.shuffle(Some(epoch as u64 * 42));
+
+        let mut epoch_loss_d = 0.0;
+        let mut epoch_loss_g = 0.0;
+        let mut epoch_loss_mel = 0.0;
+        let mut epoch_steps = 0;
+
+        // Iterate over batches
+        for (batch_idx, batch_result) in dataset
+            .iter_batches(args.batch_size, args.segment_size, hop_length)
+            .enumerate()
+        {
+            let batch = batch_result?;
+
+            // Training step
+            let losses = trainer.train_step(&batch)?;
+
+            epoch_loss_d += losses.loss_d;
+            epoch_loss_g += losses.loss_gen;
+            epoch_loss_mel += losses.loss_mel;
+            epoch_steps += 1;
+
+            // Log progress
+            let global_step = epoch * steps_per_epoch + batch_idx;
+            if global_step % args.log_every == 0 || batch_idx == steps_per_epoch - 1 {
+                println!(
+                    "  Step {:4} | D: {:.4} | G: {:.4} | FM: {:.4} | Mel: {:.4} | KL: {:.4} | Reg: {:.4}",
+                    global_step,
+                    losses.loss_d,
+                    losses.loss_gen,
+                    losses.loss_fm,
+                    losses.loss_mel,
+                    losses.loss_kl,
+                    losses.loss_reg,
+                );
+            }
+
+            // Save checkpoint
+            if global_step > 0 && global_step % args.save_every == 0 {
+                let checkpoint_path = args.output.with_extension(format!("step{}.safetensors", global_step));
+                trainer.save_checkpoint(&checkpoint_path)?;
+                println!("  Saved checkpoint: {:?}", checkpoint_path);
+            }
+        }
+
+        // Print epoch summary
+        if epoch_steps > 0 {
+            println!(
+                "\n  Epoch {} Summary: D={:.4}, G={:.4}, Mel={:.4}",
+                epoch + 1,
+                epoch_loss_d / epoch_steps as f32,
+                epoch_loss_g / epoch_steps as f32,
+                epoch_loss_mel / epoch_steps as f32,
+            );
+        }
+    }
+
+    // Save final model (full checkpoint with discriminator)
+    println!("\nSaving final checkpoint to {:?}...", args.output);
     trainer.save_checkpoint(&args.output)?;
 
-    println!("\nTraining complete!");
+    // Save generator-only for inference
+    let gen_output = args.output.with_extension("generator.safetensors");
+    println!("Saving generator weights to {:?}...", gen_output);
+    trainer.save_generator(&gen_output)?;
+
+    println!("Training complete!");
+
     Ok(())
 }

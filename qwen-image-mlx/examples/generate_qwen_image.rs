@@ -44,7 +44,7 @@ struct Args {
     width: i32,
 
     /// Number of inference steps
-    #[arg(long, default_value_t = 20)]
+    #[arg(long, default_value_t = 50)]
     steps: i32,
 
     /// Guidance scale for CFG
@@ -229,7 +229,7 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
     // Load transformer weights from HuggingFace model (4-bit or 8-bit)
     let transformer_dir = model_dir.join("transformer");
     let mut transformer_files: Vec<PathBuf> = Vec::new();
-    for i in 0..10 {  // Check up to 10 shards
+    for i in 0..20 {  // Check up to 20 shards (8-bit has 11 shards: 0-10)
         let path = transformer_dir.join(format!("{}.safetensors", i));
         if path.exists() {
             transformer_files.push(path);
@@ -735,14 +735,44 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
     let key = mlx_rs::random::key(seed)?;
     let mut latents = mlx_rs::random::normal::<f32>(&[1, num_patches, 64], None, None, Some(&key))?;
 
-    // Flow matching schedule with shift
-    // Formula: shifted_sigma = shift * sigma / (1 + (shift - 1) * sigma)
-    let shift = 1.0f32;  // No shift (linear)
+    // Dynamic flow matching schedule (Qwen-Image-2512 scheduler config)
+    // Uses exponential time shift with resolution-dependent mu
+    const BASE_SHIFT: f32 = 0.5;
+    const MAX_SHIFT: f32 = 0.9;
+    const BASE_IMAGE_SEQ_LEN: f32 = 256.0;
+    const MAX_IMAGE_SEQ_LEN: f32 = 8192.0;
+
+    // Calculate mu (shift amount) based on image sequence length
+    // Linear interpolation: smaller images -> base_shift, larger images -> max_shift
+    fn calculate_shift(image_seq_len: i32) -> f32 {
+        let image_seq_len = image_seq_len as f32;
+        let m = (MAX_SHIFT - BASE_SHIFT) / (MAX_IMAGE_SEQ_LEN - BASE_IMAGE_SEQ_LEN);
+        let b = BASE_SHIFT - m * BASE_IMAGE_SEQ_LEN;
+        image_seq_len * m + b
+    }
+
+    // Exponential time shift (Qwen-Image uses "exponential" type)
+    // Formula: exp(mu) / (exp(mu) + (1/t - 1)^sigma)
+    fn time_shift_exponential(mu: f32, sigma: f32, t: f32) -> f32 {
+        if t <= 0.0 || t >= 1.0 {
+            return t;  // Don't shift endpoints
+        }
+        let exp_mu = mu.exp();
+        exp_mu / (exp_mu + (1.0 / t - 1.0).powf(sigma))
+    }
+
+    // Calculate dynamic shift based on number of patches
+    let mu = calculate_shift(num_patches);
+    println!("Dynamic scheduler: mu = {:.4} for {} patches", mu, num_patches);
+
+    // Generate sigmas with dynamic exponential shift
     let sigmas: Vec<f32> = (0..=num_steps).map(|i| {
-        let sigma = 1.0 - (i as f32 / num_steps as f32);
-        // Apply shift transformation
-        shift * sigma / (1.0 + (shift - 1.0) * sigma)
+        let t = 1.0 - (i as f32 / num_steps as f32);  // Linear from 1.0 to 0.0
+        time_shift_exponential(mu, 1.0, t)
     }).collect();
+
+    // Debug: print first few sigmas
+    println!("Sigma schedule (first 5): {:?}", &sigmas[..5.min(sigmas.len())]);
 
     println!("\nRunning diffusion loop...");
     let start = std::time::Instant::now();

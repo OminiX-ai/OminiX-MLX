@@ -4,6 +4,7 @@
 //! MLX-native audio processing for training.
 
 mod mel;
+mod stft_gpu;
 
 // Re-export everything from mlx-rs-core::audio
 pub use mlx_rs_core::audio::{
@@ -24,7 +25,18 @@ pub use mlx_rs_core::audio::{
 // MLX-native mel computation for training
 pub use mel::{
     MelConfig,
+    SpectrogramConfig,
     mel_spectrogram_mlx,
+    spectrogram_mlx,
     stft_mlx,
     create_mel_filterbank,
+    spec_to_mel,
+    slice_mel_segments,
+};
+
+// GPU-accelerated STFT using MLX rfft (O(N log N) instead of O(N²))
+pub use stft_gpu::{
+    stft_rfft,
+    stft_rfft_for_reference,
+    load_reference_mel_gpu,
 };
