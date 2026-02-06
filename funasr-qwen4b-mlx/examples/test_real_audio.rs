@@ -22,8 +22,8 @@ const MAX_ASR_TOKENS: usize = 100;
 const TEMPERATURE: f32 = 0.6;  // Qwen3 recommended (DO NOT use 0.0 — causes endless repetition)
 const TOP_K: usize = 20;       // Qwen3 recommended: keep top 20 tokens
 const PRESENCE_PENALTY: f32 = 1.0;  // Conservative for ASR (Qwen3 suggests 1.5 general)
-const ENTROPY_THRESHOLD: f32 = 0.5;  // Low entropy = degenerate state
-const ENTROPY_WINDOW: usize = 5;     // Consecutive low-entropy steps before stopping
+const ENTROPY_THRESHOLD: f32 = 0.05;  // Much lower - only catch truly degenerate states
+const ENTROPY_WINDOW: usize = 15;     // Require many consecutive low-entropy steps
 const EOS_TOKEN: i32 = 151643;
 const IM_END_TOKEN: i32 = 151645;
 const SILENCE_THRESHOLD_DB: f32 = -40.0;
@@ -175,7 +175,7 @@ fn clean_transcription(text: &str) -> String {
 
 /// Build multimodal embeddings with ChatML template (ASR-specific system prompt):
 ///
-/// <|im_start|>system\n你是语音转写系统。直接输出语音内容的中文文字，不要添加任何解释、评论或格式。<|im_end|>\n
+/// <|im_start|>system\n{domain_context}<|im_end|>\n
 /// <|im_start|>user\n<|startofspeech|>[AUDIO]<|endofspeech|><|im_end|>\n
 /// <|im_start|>assistant\n<think>\n\n</think>\n\n
 fn build_multimodal_embeddings(
@@ -185,8 +185,50 @@ fn build_multimodal_embeddings(
 ) -> Result<mlx_rs::Array> {
     let audio_len = audio_features.shape()[1] as usize;
 
-    // ASR-specific system prompt (Chinese, constrains output to transcription only)
-    let system_prompt = "你是语音转写系统。直接输出语音内容的中文文字，不要添加任何解释、评论或格式。";
+    // Domain-specific system prompt for Rust + trading system talks
+    // Provides context for technical terms that may be misheard
+    let system_prompt = r#"你是专业的技术演讲语音转写系统。这是一场关于Rust编程语言在量化交易系统开发中应用的技术演讲。
+
+演讲中的两个核心crate名称（必须用英文）：
+- "strategy" - 策略crate，包含交易策略代码
+- "faucet" - 执行引擎crate，处理下单等
+
+当听到类似"法萨特/发萨/fission/fascade"的发音时，应写成 "faucet"。
+当听到"策略"相关内容作为crate名时，应写成 "strategy"。
+
+示例正确转写：
+- "一个目录叫strategy，另一个叫faucet"
+- "把strategy和faucet放在同一个workspace"
+- "faucet这个crate负责执行"
+
+常见术语对照（正确写法）：
+- Rust相关：Rust、Cargo、crate、trait、impl、struct、enum、match、Option、Result、unwrap、clone、borrow、lifetime、async、await、tokio、FFI、unsafe、macro、workspace、Cargo.toml、lib.rs、main.rs、pub、mod、use、extern、#[derive]、Vec、HashMap、Arc、Mutex、RefCell、Box、Rc、dyn、where、Send、Sync、rlib、dylib、cdylib、staticlib
+- 交易相关：量化交易、高频交易、策略、行情、下单、撮合、延迟、吞吐、回测、实盘、API、TCP/IP、UDP、FIX协议、交易所、订单簿、K线、tick数据
+- 项目相关：workspace、binary、library、dependency、编译器、链接器、静态链接、动态链接
+
+Rust项目结构常见概念：
+- 一个workspace包含多个crate，每个crate有自己的目录和Cargo.toml
+- 常见目录名：src、lib、bin、examples、tests、benches
+- crate类型：lib（库）、bin（可执行文件）、proc-macro（过程宏）
+- 项目可以从单一package转换为workspace结构
+- 常见crate/模块名：strategy、market、order、engine、core、utils、common、faucet、facade、factory
+
+重要：英文人名必须保留英文原文，不要音译成中文：
+- Alice、Bob、Josh、Richard、Mike、David、John、Steve、Alex、Chris、Tom、Jack、Ryan、Kevin、Brian、Andrew、Daniel、James、William、Michael、Matthew、Peter、Paul、George、Henry、Edward、Frank、Gary、Eric、Mark、Nick、Tony、Ben、Sam、Max、Luke、Adam、Carl、Dean、Jeff、Ken、Larry、Leo、Neil、Oscar、Patrick、Phil、Ray、Rick、Roger、Scott、Sean、Ted、Tim、Victor、Wayne、Zach
+- 韩东 是中文名，保持中文
+
+常见误听纠正（注意：本演讲中提到的两个crate名是strategy和faucet）：
+- "fission/fascade/法萨特/法萨/发萨/发萨德" 在本演讲中都是指 "faucet"（一个crate名）
+- "contraption" 应该是 "contribution"
+- "payson/paging" 应该是 "Python"
+- "cgra/c加加" 应该是 "C++"
+- "沙拉德/萨拉德" 可能是 "src" 或 "strategy"
+- "卡狗/卡沟" 应该是 "Cargo"
+- "克瑞特" 应该是 "crate"
+- "特瑞特" 应该是 "trait"
+- "function" 保持英文，不要写成 "fission"
+
+直接输出语音内容的中文文字，保留英文技术术语和英文人名的原始拼写，不要添加解释或评论。"#;
     let system_encoding = tokenizer.encode(system_prompt, false)
         .map_err(|e| funasr_qwen4b_mlx::error::Error::Tokenizer(format!("{}", e)))?;
 
@@ -568,10 +610,13 @@ fn main() -> Result<()> {
 
     let mode_name = if template_mode == TemplateMode::Raw { "raw (training-matched)" } else { "ChatML" };
 
-    // Prefer 4-bit quantized model for ~3x faster inference
+    // Prefer quantized models for faster inference
     let qwen_path = if std::path::Path::new("models/Qwen3-4B-4bit/config.json").exists() {
         eprintln!("Using 4-bit quantized model");
         "models/Qwen3-4B-4bit"
+    } else if std::path::Path::new("models/Qwen3-4B-8bit/config.json").exists() {
+        eprintln!("Using 8-bit quantized model");
+        "models/Qwen3-4B-8bit"
     } else {
         eprintln!("Using BF16 model (quantize with scripts for 3x speedup)");
         "models/Qwen3-4B"

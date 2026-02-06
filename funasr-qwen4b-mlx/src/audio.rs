@@ -124,20 +124,11 @@ impl MelFrontend {
             samples
         };
 
-        // Upscale to 16-bit PCM range (FunASR: waveform * (1 << 15))
-        let mut audio: Vec<f32> = audio_slice.iter().map(|&s| s * 32768.0).collect();
-
-        // Dithering (FunASR/Kaldi default: dither=1.0)
-        use rand::Rng;
-        let mut rng = rand::thread_rng();
-        for s in audio.iter_mut() {
-            *s += rng.gen::<f32>() - 0.5;
-        }
-
-        // Pre-emphasis (Kaldi default: 0.97)
-        for i in (1..audio.len()).rev() {
-            audio[i] -= 0.97 * audio[i - 1];
-        }
+        // Audio is already normalized to [-1, 1], use as-is
+        // NO 32768 scaling (FunASR SenseVoice doesn't use this)
+        // NO dithering (training didn't use it)
+        // NO pre-emphasis (FunASR SenseVoice doesn't use this for inference)
+        let audio: Vec<f32> = audio_slice.to_vec();
 
         let window_size = self.window.len();
 
@@ -394,26 +385,12 @@ impl MelFrontendMLX {
         let max_samples = (self.config.max_length * self.config.sample_rate as f32) as usize;
         let audio_len = samples.len().min(max_samples);
 
-        // Upscale audio to 16-bit PCM range (FunASR: waveform * (1 << 15))
-        let mut audio: Vec<f32> = samples[..audio_len]
-            .iter()
-            .map(|&s| s * 32768.0)
-            .collect();
-
-        // Apply dithering (FunASR/Kaldi default: dither=1.0)
-        // Adds small random noise to prevent log(0)
-        use rand::Rng;
-        let mut rng = rand::thread_rng();
-        for s in audio.iter_mut() {
-            *s += rng.gen::<f32>() - 0.5;
-        }
-
-        // Apply pre-emphasis (Kaldi default: preemphasis_coefficient=0.97)
-        // y[n] = x[n] - coef * x[n-1]
-        let preemph_coef = 0.97f32;
-        for i in (1..audio.len()).rev() {
-            audio[i] -= preemph_coef * audio[i - 1];
-        }
+        // FunASR SenseVoice preprocessing:
+        // - Audio is already normalized to [-1, 1], use as-is
+        // - NO 32768 scaling (FunASR SenseVoice doesn't use this)
+        // - NO dithering (training didn't use it)
+        // - NO pre-emphasis (FunASR SenseVoice doesn't use this for inference)
+        let audio: Vec<f32> = samples[..audio_len].to_vec();
 
         let window_size = self.config.window_size;
 
