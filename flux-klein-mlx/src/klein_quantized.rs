@@ -15,12 +15,15 @@
 //! let quantized_flux = QuantizedFluxKlein::from_unquantized(flux, 64, 8)?;
 //! ```
 
+use std::collections::HashMap;
+use std::path::Path;
+
 use mlx_rs::{
     array,
     builder::Builder,
     error::Exception,
-    module::Module,
-    nn::{LayerNorm, LayerNormBuilder, Linear, LinearBuilder, RmsNorm, QuantizedLinear},
+    module::{Module, Param},
+    nn::{LayerNorm, LayerNormBuilder, Linear, RmsNorm, QuantizedLinear},
     ops,
     ops::indexing::IndexOp,
     Array,
@@ -631,6 +634,274 @@ impl QuantizedFluxKlein {
         let (rope_cos, rope_sin) = Self::compute_rope(txt_ids, img_ids)?;
         self.forward_with_rope(img, txt, timesteps, &rope_cos, &rope_sin)
     }
+}
+
+// ============================================================================
+// Direct Loading from Pre-Quantized Weights
+// ============================================================================
+
+/// Create a QuantizedLinear from pre-quantized weight/scales/biases arrays
+///
+/// Expects the weights HashMap to contain:
+/// - `{prefix}.weight` - U32 packed quantized weights
+/// - `{prefix}.scales` - quantization scales
+/// - `{prefix}.biases` - quantization biases
+pub fn create_quantized_linear(
+    weights: &HashMap<String, Array>,
+    prefix: &str,
+    group_size: i32,
+    bits: i32,
+) -> Result<QuantizedLinear, Exception> {
+    let weight_key = format!("{}.weight", prefix);
+    let scales_key = format!("{}.scales", prefix);
+    let biases_key = format!("{}.biases", prefix);
+
+    let weight = weights.get(&weight_key)
+        .unwrap_or_else(|| panic!("Missing quantized weight: {}", weight_key))
+        .clone();
+    let scales = weights.get(&scales_key)
+        .unwrap_or_else(|| panic!("Missing quantized scales: {}", scales_key))
+        .clone();
+    let biases = weights.get(&biases_key)
+        .unwrap_or_else(|| panic!("Missing quantized biases: {}", biases_key))
+        .clone();
+
+    let inner = Linear {
+        weight: Param::new(weight),
+        bias: Param::new(None),
+    };
+
+    Ok(QuantizedLinear {
+        group_size,
+        bits,
+        scales: Param::new(scales),
+        biases: Param::new(biases),
+        inner,
+    })
+}
+
+/// Load an RmsNorm from weights
+fn load_rms_norm(
+    weights: &HashMap<String, Array>,
+    key: &str,
+    dim: i32,
+) -> Result<RmsNorm, Exception> {
+    let weight = weights.get(key)
+        .unwrap_or_else(|| panic!("Missing norm weight: {}", key))
+        .clone();
+    let mut norm = RmsNorm::new(dim)?;
+    norm.weight = Param::new(weight);
+    Ok(norm)
+}
+
+/// Load a complete quantized FLUX.2-klein transformer from pre-quantized weights
+///
+/// The weights should already be sanitized (using `sanitize_klein_quantized_weights()`
+/// or `sanitize_klein_model_weights()` for the base keys).
+///
+/// # Arguments
+/// * `weights` - HashMap of sanitized weight name -> Array
+/// * `group_size` - Quantization group size (typically 64)
+/// * `bits` - Quantization bits (typically 8)
+pub fn load_quantized_flux_klein(
+    weights: HashMap<String, Array>,
+    group_size: i32,
+    bits: i32,
+) -> Result<QuantizedFluxKlein, Exception> {
+    let params = FluxKleinParams::default();
+    let hidden = params.hidden_size;
+    let head_dim = params.head_dim;
+
+    // Input embeddings
+    let x_embedder = create_quantized_linear(&weights, "x_embedder", group_size, bits)?;
+    let context_embedder = create_quantized_linear(&weights, "context_embedder", group_size, bits)?;
+
+    // txt_norm (RmsNorm, not quantized)
+    let txt_norm = load_rms_norm(&weights, "txt_norm.weight", hidden)?;
+
+    // Time embedding
+    let time_embed_1 = create_quantized_linear(&weights, "time_embed_1", group_size, bits)?;
+    let time_embed_2 = create_quantized_linear(&weights, "time_embed_2", group_size, bits)?;
+
+    // Shared modulation layers
+    let double_mod_img = QuantizedSharedModulation {
+        linear: create_quantized_linear(&weights, "double_mod_img.linear", group_size, bits)?,
+        num_params: 6,
+    };
+    let double_mod_txt = QuantizedSharedModulation {
+        linear: create_quantized_linear(&weights, "double_mod_txt.linear", group_size, bits)?,
+        num_params: 6,
+    };
+    let single_mod = QuantizedSharedModulation {
+        linear: create_quantized_linear(&weights, "single_mod.linear", group_size, bits)?,
+        num_params: 3,
+    };
+
+    // Double blocks
+    let mut double_blocks = Vec::with_capacity(params.depth as usize);
+    for i in 0..params.depth as usize {
+        let prefix = format!("double_blocks.{}", i);
+        let block = QuantizedKleinDoubleBlock {
+            hidden_size: hidden,
+            num_heads: params.num_heads,
+            head_dim,
+            mlp_hidden: params.mlp_hidden,
+
+            // LayerNorm (not quantized, no learnable affine)
+            img_norm1: LayerNormBuilder::new(hidden).affine(false).eps(1e-6).build()?,
+            img_norm2: LayerNormBuilder::new(hidden).affine(false).eps(1e-6).build()?,
+            txt_norm1: LayerNormBuilder::new(hidden).affine(false).eps(1e-6).build()?,
+            txt_norm2: LayerNormBuilder::new(hidden).affine(false).eps(1e-6).build()?,
+
+            // Post-residual norms
+            txt_post_attn_norm: load_rms_norm(&weights, &format!("{}.txt_post_attn_norm.weight", prefix), hidden)?,
+            txt_post_mlp_norm: load_rms_norm(&weights, &format!("{}.txt_post_mlp_norm.weight", prefix), hidden)?,
+
+            // Image attention
+            img_to_q: create_quantized_linear(&weights, &format!("{}.img_to_q", prefix), group_size, bits)?,
+            img_to_k: create_quantized_linear(&weights, &format!("{}.img_to_k", prefix), group_size, bits)?,
+            img_to_v: create_quantized_linear(&weights, &format!("{}.img_to_v", prefix), group_size, bits)?,
+            img_norm_q: load_rms_norm(&weights, &format!("{}.img_norm_q.weight", prefix), head_dim)?,
+            img_norm_k: load_rms_norm(&weights, &format!("{}.img_norm_k.weight", prefix), head_dim)?,
+            img_to_out: create_quantized_linear(&weights, &format!("{}.img_to_out", prefix), group_size, bits)?,
+
+            // Text attention
+            txt_to_q: create_quantized_linear(&weights, &format!("{}.txt_to_q", prefix), group_size, bits)?,
+            txt_to_k: create_quantized_linear(&weights, &format!("{}.txt_to_k", prefix), group_size, bits)?,
+            txt_to_v: create_quantized_linear(&weights, &format!("{}.txt_to_v", prefix), group_size, bits)?,
+            txt_norm_q: load_rms_norm(&weights, &format!("{}.txt_norm_q.weight", prefix), head_dim)?,
+            txt_norm_k: load_rms_norm(&weights, &format!("{}.txt_norm_k.weight", prefix), head_dim)?,
+            txt_to_out: create_quantized_linear(&weights, &format!("{}.txt_to_out", prefix), group_size, bits)?,
+
+            // MLPs
+            img_mlp_in: create_quantized_linear(&weights, &format!("{}.img_mlp_in", prefix), group_size, bits)?,
+            img_mlp_out: create_quantized_linear(&weights, &format!("{}.img_mlp_out", prefix), group_size, bits)?,
+            txt_mlp_in: create_quantized_linear(&weights, &format!("{}.txt_mlp_in", prefix), group_size, bits)?,
+            txt_mlp_out: create_quantized_linear(&weights, &format!("{}.txt_mlp_out", prefix), group_size, bits)?,
+        };
+        double_blocks.push(block);
+    }
+
+    // Single blocks
+    let mut single_blocks = Vec::with_capacity(params.depth_single as usize);
+    for i in 0..params.depth_single as usize {
+        let prefix = format!("single_blocks.{}", i);
+        let block = QuantizedKleinSingleBlock {
+            hidden_size: hidden,
+            num_heads: params.num_heads,
+            head_dim,
+            mlp_hidden: params.mlp_hidden,
+
+            norm: LayerNormBuilder::new(hidden).affine(false).eps(1e-6).build()?,
+            to_qkv_mlp: create_quantized_linear(&weights, &format!("{}.to_qkv_mlp", prefix), group_size, bits)?,
+            to_out: create_quantized_linear(&weights, &format!("{}.to_out", prefix), group_size, bits)?,
+            norm_q: load_rms_norm(&weights, &format!("{}.norm_q.weight", prefix), head_dim)?,
+            norm_k: load_rms_norm(&weights, &format!("{}.norm_k.weight", prefix), head_dim)?,
+            post_norm: load_rms_norm(&weights, &format!("{}.post_norm.weight", prefix), hidden)?,
+        };
+        single_blocks.push(block);
+    }
+
+    // Final layer
+    let final_norm = load_rms_norm(&weights, "final_norm.weight", hidden)?;
+    let norm_out = create_quantized_linear(&weights, "norm_out", group_size, bits)?;
+    let proj_out = create_quantized_linear(&weights, "proj_out", group_size, bits)?;
+
+    Ok(QuantizedFluxKlein {
+        params,
+        x_embedder,
+        context_embedder,
+        txt_norm,
+        time_embed_1,
+        time_embed_2,
+        double_mod_img,
+        double_mod_txt,
+        single_mod,
+        double_blocks,
+        single_blocks,
+        final_norm,
+        norm_out,
+        proj_out,
+    })
+}
+
+/// Quantize bf16/f32 FLUX.2-klein weights and save as pre-quantized safetensors
+///
+/// This is a one-time operation. Run on a machine with enough RAM to hold the
+/// full bf16 model (~30GB peak). The output file will be ~4-5GB.
+///
+/// # Arguments
+/// * `input_path` - Path to the bf16 transformer safetensors file
+/// * `output_path` - Path to save the quantized safetensors file (must end in .safetensors)
+/// * `group_size` - Quantization group size (default: 64)
+/// * `bits` - Quantization bits (default: 8)
+pub fn quantize_and_save_flux_klein(
+    input_path: &Path,
+    output_path: &Path,
+    group_size: i32,
+    bits: i32,
+) -> Result<(), Exception> {
+    println!("Loading bf16 weights from {:?}...", input_path);
+    let raw_weights = crate::weights::load_safetensors(input_path)
+        .map_err(|e| Exception::custom(format!("Failed to load weights: {}", e)))?;
+
+    println!("Sanitizing {} weight keys...", raw_weights.len());
+    let weights = crate::weights::sanitize_klein_model_weights(raw_weights);
+
+    println!("Quantizing {} weights to {}bit (group_size={})...", weights.len(), bits, group_size);
+    let mut quantized_tensors: HashMap<String, Array> = HashMap::new();
+
+    // Determine if a key is a norm weight (should NOT be quantized)
+    let is_norm_weight = |key: &str| -> bool {
+        if !key.ends_with(".weight") {
+            return false;
+        }
+        // Top-level norms
+        if key == "txt_norm.weight" || key == "final_norm.weight" {
+            return true;
+        }
+        // Block norms: img_norm_q, img_norm_k, txt_norm_q, txt_norm_k, norm_q, norm_k, post_norm
+        // txt_post_attn_norm, txt_post_mlp_norm
+        key.contains("_norm_q.") || key.contains("_norm_k.") ||
+        key.contains(".norm_q.") || key.contains(".norm_k.") ||
+        key.contains("post_norm.") || key.contains("post_attn_norm.") ||
+        key.contains("post_mlp_norm.")
+    };
+
+    for (key, value) in &weights {
+        if is_norm_weight(key) {
+            // Keep norm weights as f32
+            let v32 = value.as_type::<f32>().unwrap_or_else(|_| value.clone());
+            quantized_tensors.insert(key.clone(), v32);
+        } else if key.ends_with(".weight") {
+            // Quantize linear weights
+            let v32 = value.as_type::<f32>().unwrap_or_else(|_| value.clone());
+            let (q_weight, scales, biases) = ops::quantize(&v32, group_size, bits, None::<&str>)?;
+            q_weight.eval()?;
+            scales.eval()?;
+            biases.eval()?;
+
+            let base = &key[..key.len() - 7]; // strip ".weight"
+            quantized_tensors.insert(key.clone(), q_weight);
+            quantized_tensors.insert(format!("{}.scales", base), scales);
+            quantized_tensors.insert(format!("{}.biases", base), biases);
+        }
+    }
+
+    // Save using MLX's native safetensors saving
+    println!("Saving {} tensors to {:?}...", quantized_tensors.len(), output_path);
+
+    if let Some(parent) = output_path.parent() {
+        std::fs::create_dir_all(parent)
+            .map_err(|e| Exception::custom(format!("Failed to create directory: {}", e)))?;
+    }
+
+    Array::save_safetensors(quantized_tensors, None::<&HashMap<String, String>>, output_path)
+        .map_err(|e| Exception::custom(format!("Failed to save safetensors: {}", e)))?;
+
+    println!("Quantized weights saved to {:?}", output_path);
+
+    Ok(())
 }
 
 // ============================================================================

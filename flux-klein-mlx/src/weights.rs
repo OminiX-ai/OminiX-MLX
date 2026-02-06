@@ -596,6 +596,143 @@ pub fn sanitize_klein_model_weights(weights: HashMap<String, Array>) -> HashMap<
     sanitized
 }
 
+/// Sanitize pre-quantized FLUX.2-klein weights for loading into QuantizedFluxKlein
+///
+/// Same key mappings as `sanitize_klein_model_weights()` but handles all suffixes:
+/// `.weight`, `.scales`, `.biases` for quantized linear layers.
+///
+/// Norm layers only have `.weight` (they are not quantized).
+pub fn sanitize_klein_quantized_weights(weights: HashMap<String, Array>) -> HashMap<String, Array> {
+    let mut sanitized = HashMap::new();
+
+    for (key, value) in &weights {
+        // Determine the suffix (.weight, .scales, or .biases)
+        let (base_key, suffix) = if key.ends_with(".weight") {
+            (&key[..key.len() - 7], ".weight")
+        } else if key.ends_with(".scales") {
+            (&key[..key.len() - 7], ".scales")
+        } else if key.ends_with(".biases") {
+            (&key[..key.len() - 7], ".biases")
+        } else {
+            // Unknown suffix, pass through
+            sanitized.insert(key.clone(), value.clone());
+            continue;
+        };
+
+        // Apply the same key mapping as sanitize_klein_model_weights
+        // Input embeddings
+        if base_key == "x_embedder" {
+            sanitized.insert(format!("x_embedder{}", suffix), value.clone());
+            continue;
+        }
+        if base_key == "context_embedder" {
+            sanitized.insert(format!("context_embedder{}", suffix), value.clone());
+            continue;
+        }
+
+        // Time embedder
+        if base_key == "time_guidance_embed.timestep_embedder.linear_1" {
+            sanitized.insert(format!("time_embed_1{}", suffix), value.clone());
+            continue;
+        }
+        if base_key == "time_guidance_embed.timestep_embedder.linear_2" {
+            sanitized.insert(format!("time_embed_2{}", suffix), value.clone());
+            continue;
+        }
+
+        // Shared modulation layers
+        if base_key == "double_stream_modulation_img.linear" {
+            sanitized.insert(format!("double_mod_img.linear{}", suffix), value.clone());
+            continue;
+        }
+        if base_key == "double_stream_modulation_txt.linear" {
+            sanitized.insert(format!("double_mod_txt.linear{}", suffix), value.clone());
+            continue;
+        }
+        if base_key == "single_stream_modulation.linear" {
+            sanitized.insert(format!("single_mod.linear{}", suffix), value.clone());
+            continue;
+        }
+
+        // Final layer
+        if base_key == "norm_out.linear" {
+            sanitized.insert(format!("norm_out{}", suffix), value.clone());
+            continue;
+        }
+        if base_key == "proj_out" {
+            sanitized.insert(format!("proj_out{}", suffix), value.clone());
+            continue;
+        }
+
+        // Double stream transformer blocks
+        if base_key.starts_with("transformer_blocks.") {
+            let parts: Vec<&str> = base_key.split('.').collect();
+            if parts.len() >= 3 {
+                if let Ok(block_idx) = parts[1].parse::<usize>() {
+                    let rest = parts[2..].join(".");
+
+                    // Image attention
+                    let mapped = match rest.as_str() {
+                        "attn.to_q" => Some(format!("double_blocks.{}.img_to_q", block_idx)),
+                        "attn.to_k" => Some(format!("double_blocks.{}.img_to_k", block_idx)),
+                        "attn.to_v" => Some(format!("double_blocks.{}.img_to_v", block_idx)),
+                        "attn.norm_q" => Some(format!("double_blocks.{}.img_norm_q", block_idx)),
+                        "attn.norm_k" => Some(format!("double_blocks.{}.img_norm_k", block_idx)),
+                        "attn.to_out.0" => Some(format!("double_blocks.{}.img_to_out", block_idx)),
+                        // Text attention
+                        "attn.add_q_proj" => Some(format!("double_blocks.{}.txt_to_q", block_idx)),
+                        "attn.add_k_proj" => Some(format!("double_blocks.{}.txt_to_k", block_idx)),
+                        "attn.add_v_proj" => Some(format!("double_blocks.{}.txt_to_v", block_idx)),
+                        "attn.norm_added_q" => Some(format!("double_blocks.{}.txt_norm_q", block_idx)),
+                        "attn.norm_added_k" => Some(format!("double_blocks.{}.txt_norm_k", block_idx)),
+                        "attn.to_add_out" => Some(format!("double_blocks.{}.txt_to_out", block_idx)),
+                        // Image MLP
+                        "ff.linear_in" => Some(format!("double_blocks.{}.img_mlp_in", block_idx)),
+                        "ff.linear_out" => Some(format!("double_blocks.{}.img_mlp_out", block_idx)),
+                        // Text MLP
+                        "ff_context.linear_in" => Some(format!("double_blocks.{}.txt_mlp_in", block_idx)),
+                        "ff_context.linear_out" => Some(format!("double_blocks.{}.txt_mlp_out", block_idx)),
+                        _ => None,
+                    };
+
+                    if let Some(new_base) = mapped {
+                        sanitized.insert(format!("{}{}", new_base, suffix), value.clone());
+                    }
+                }
+            }
+            continue;
+        }
+
+        // Single transformer blocks
+        if base_key.starts_with("single_transformer_blocks.") {
+            let parts: Vec<&str> = base_key.split('.').collect();
+            if parts.len() >= 3 {
+                if let Ok(block_idx) = parts[1].parse::<usize>() {
+                    let rest = parts[2..].join(".");
+
+                    let mapped = match rest.as_str() {
+                        "attn.norm_q" => Some(format!("single_blocks.{}.norm_q", block_idx)),
+                        "attn.norm_k" => Some(format!("single_blocks.{}.norm_k", block_idx)),
+                        "attn.to_qkv_mlp_proj" => Some(format!("single_blocks.{}.to_qkv_mlp", block_idx)),
+                        "attn.to_out" => Some(format!("single_blocks.{}.to_out", block_idx)),
+                        _ => None,
+                    };
+
+                    if let Some(new_base) = mapped {
+                        sanitized.insert(format!("{}{}", new_base, suffix), value.clone());
+                    }
+                }
+            }
+            continue;
+        }
+
+        // Pass through any unrecognized keys
+        sanitized.insert(key.clone(), value.clone());
+    }
+
+    sanitized
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
