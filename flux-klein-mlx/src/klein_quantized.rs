@@ -716,8 +716,8 @@ pub fn load_quantized_flux_klein(
     let x_embedder = create_quantized_linear(&weights, "x_embedder", group_size, bits)?;
     let context_embedder = create_quantized_linear(&weights, "context_embedder", group_size, bits)?;
 
-    // txt_norm (RmsNorm, not quantized)
-    let txt_norm = load_rms_norm(&weights, "txt_norm.weight", hidden)?;
+    // txt_norm (RmsNorm, default-initialized — not present in diffusers weights)
+    let txt_norm = RmsNorm::new(hidden)?;
 
     // Time embedding
     let time_embed_1 = create_quantized_linear(&weights, "time_embed_1", group_size, bits)?;
@@ -753,9 +753,9 @@ pub fn load_quantized_flux_klein(
             txt_norm1: LayerNormBuilder::new(hidden).affine(false).eps(1e-6).build()?,
             txt_norm2: LayerNormBuilder::new(hidden).affine(false).eps(1e-6).build()?,
 
-            // Post-residual norms
-            txt_post_attn_norm: load_rms_norm(&weights, &format!("{}.txt_post_attn_norm.weight", prefix), hidden)?,
-            txt_post_mlp_norm: load_rms_norm(&weights, &format!("{}.txt_post_mlp_norm.weight", prefix), hidden)?,
+            // Post-residual norms (default-initialized — not present in diffusers weights)
+            txt_post_attn_norm: RmsNorm::new(hidden)?,
+            txt_post_mlp_norm: RmsNorm::new(hidden)?,
 
             // Image attention
             img_to_q: create_quantized_linear(&weights, &format!("{}.img_to_q", prefix), group_size, bits)?,
@@ -797,13 +797,13 @@ pub fn load_quantized_flux_klein(
             to_out: create_quantized_linear(&weights, &format!("{}.to_out", prefix), group_size, bits)?,
             norm_q: load_rms_norm(&weights, &format!("{}.norm_q.weight", prefix), head_dim)?,
             norm_k: load_rms_norm(&weights, &format!("{}.norm_k.weight", prefix), head_dim)?,
-            post_norm: load_rms_norm(&weights, &format!("{}.post_norm.weight", prefix), hidden)?,
+            post_norm: RmsNorm::new(hidden)?,  // default-initialized — not present in diffusers weights
         };
         single_blocks.push(block);
     }
 
     // Final layer
-    let final_norm = load_rms_norm(&weights, "final_norm.weight", hidden)?;
+    let final_norm = RmsNorm::new(hidden)?;  // default-initialized — not present in diffusers weights
     let norm_out = create_quantized_linear(&weights, "norm_out", group_size, bits)?;
     let proj_out = create_quantized_linear(&weights, "proj_out", group_size, bits)?;
 
@@ -856,16 +856,10 @@ pub fn quantize_and_save_flux_klein(
         if !key.ends_with(".weight") {
             return false;
         }
-        // Top-level norms
-        if key == "txt_norm.weight" || key == "final_norm.weight" {
-            return true;
-        }
-        // Block norms: img_norm_q, img_norm_k, txt_norm_q, txt_norm_k, norm_q, norm_k, post_norm
-        // txt_post_attn_norm, txt_post_mlp_norm
+        // Block norms: img_norm_q, img_norm_k, txt_norm_q, txt_norm_k, norm_q, norm_k
+        // These are small RmsNorm weights that exist in the diffusers model
         key.contains("_norm_q.") || key.contains("_norm_k.") ||
-        key.contains(".norm_q.") || key.contains(".norm_k.") ||
-        key.contains("post_norm.") || key.contains("post_attn_norm.") ||
-        key.contains("post_mlp_norm.")
+        key.contains(".norm_q.") || key.contains(".norm_k.")
     };
 
     for (key, value) in &weights {
