@@ -26,7 +26,7 @@ tokenizers = "0.21"
 thiserror = "2"
 
 # Audio processing
-rubato = "0.16"  # High-quality resampling
+rubato = "1.0"  # High-quality resampling
 hound = "3.5"    # WAV file reading
 rustfft = "6.2"  # FFT for mel spectrogram (45x faster than manual DFT)
 
