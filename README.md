@@ -3,7 +3,6 @@
 
 High-performance ML inference on Apple Silicon: LLMs, ASR, TTS, and Image Generation in pure Rust.
 
-[![Discord](https://img.shields.io/discord/1176807732473495552.svg?color=7289da&&logo=discord)](https://discord.gg/jZvTsxDX49)
 [![Rust Version](https://img.shields.io/badge/Rust-1.82.0+-blue)](https://releases.rs/docs/1.82.0)
 ![license](https://shields.io/badge/license-MIT%2FApache--2.0-blue)
 
@@ -340,10 +339,6 @@ Benchmarks on Apple M3 Max (128GB):
 |------|-------------|---------|
 | `metal` | Enable Metal GPU acceleration | On |
 | `accelerate` | Use Accelerate framework | On |
-
-## Contributing
-
-We welcome contributions! Join our [Discord](https://discord.gg/jZvTsxDX49) to get started.
 
 ## License
 
