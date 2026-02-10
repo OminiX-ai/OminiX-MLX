@@ -1,5 +1,8 @@
 <div align="center">
-<h1><b>OminiX-MLX</b></h1>
+<img width="500" alt="OminiX-MLX" src="https://github.com/user-attachments/assets/b168cf1c-8e2f-4969-bffa-b57ee33950c0" />
+
+  
+  <h1><b>OminiX-MLX</b></h1>
 
 High-performance ML inference on Apple Silicon: LLMs, ASR, TTS, and Image Generation in pure Rust.
 
