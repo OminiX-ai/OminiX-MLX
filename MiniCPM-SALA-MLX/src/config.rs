@@ -67,6 +67,7 @@ pub struct ModelArgs {
 }
 
 #[derive(Debug, Clone, Deserialize)]
+#[serde(default)]
 pub struct SparseConfig {
     #[serde(default = "default_32")]
     pub kernel_size: i32,
@@ -84,6 +85,21 @@ pub struct SparseConfig {
     pub use_nope: bool,
     #[serde(default = "default_8192")]
     pub dense_len: i32,
+}
+
+impl Default for SparseConfig {
+    fn default() -> Self {
+        Self {
+            kernel_size: 32,
+            kernel_stride: 16,
+            init_blocks: 1,
+            block_size: 64,
+            window_size: 2048,
+            topk: 64,
+            use_nope: false,
+            dense_len: 8192,
+        }
+    }
 }
 
 #[derive(Debug, Clone, Deserialize, Default)]

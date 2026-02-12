@@ -2,7 +2,7 @@ pub mod lightning;
 pub mod sparse;
 
 pub use lightning::{LightningAttention, LightningCache};
-pub use sparse::SparseAttention;
+pub use sparse::{SparseAttention, SparseKVCache};
 
 use mlx_rs::{
     error::Exception,
@@ -11,15 +11,14 @@ use mlx_rs::{
     },
     Array,
 };
-use mlx_rs_core::cache::{KVCache, KeyValueCache};
 
 use crate::config::ModelArgs;
 
-/// Per-layer cache: either a standard KV cache (sparse layers) or a recurrent
+/// Per-layer cache: either a SparseKVCache (sparse layers) or a recurrent
 /// state (lightning layers).
 #[derive(Debug)]
 pub enum LayerCache {
-    Sparse(KVCache),
+    Sparse(SparseKVCache),
     Lightning(LightningCache),
 }
 
@@ -126,10 +125,13 @@ impl ModuleParametersTrait for HybridAttention {
 
 /// Create the per-layer cache vector based on mixer_types.
 pub fn create_layer_caches(args: &ModelArgs) -> Vec<LayerCache> {
+    let default_sparse_config = crate::config::SparseConfig::default();
+    let sparse_config = args.sparse_config.as_ref().unwrap_or(&default_sparse_config);
+
     (0..args.num_hidden_layers as usize)
         .map(|i| {
             if args.is_sparse_layer(i) {
-                LayerCache::Sparse(KVCache::default())
+                LayerCache::Sparse(SparseKVCache::new(sparse_config.clone()))
             } else {
                 LayerCache::Lightning(LightningCache::new(
                     args.lightning_num_heads(),

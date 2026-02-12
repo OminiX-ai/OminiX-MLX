@@ -1,20 +1,26 @@
+use std::cmp::min;
+
 use mlx_rs::{
     array,
     builder::Builder,
     error::Exception,
-    macros::ModuleParameters,
+    macros::{ModuleParameters, Quantizable},
     module::Module,
     nn,
     ops::indexing::IndexOp,
+    quantization::MaybeQuantized,
     Array,
 };
 
 use crate::config::ModelArgs;
 
+/// Default chunk size for chunked GLA prefill.
+const DEFAULT_CHUNK_SIZE: i32 = 64;
+
 /// Recurrent state cache for lightning (GLA) attention layers.
 #[derive(Debug)]
 pub struct LightningCache {
-    /// Recurrent state: [1, n_heads, head_dim, head_dim]
+    /// Recurrent state: [B, n_heads, head_dim, head_dim]
     pub state: Option<Array>,
     pub n_heads: i32,
     pub head_dim: i32,
@@ -31,6 +37,10 @@ impl LightningCache {
         }
     }
 }
+
+// ============================================================================
+// ALiBi Slopes
+// ============================================================================
 
 /// Build ALiBi slopes (negated) for GLA decay.
 /// These are NOT learnable — they are derived from the number of heads.
@@ -64,8 +74,98 @@ fn build_alibi_slopes(n_heads: i32) -> Vec<f32> {
     get_slopes(n_heads).into_iter().map(|s| -s).collect()
 }
 
+/// Public wrapper for `build_alibi_slopes`, used by quantized loading.
+pub fn build_alibi_slopes_pub(n_heads: i32) -> Vec<f32> {
+    build_alibi_slopes(n_heads)
+}
+
+// ============================================================================
+// Decay Tensor Builders (computed on CPU, cached for reuse)
+// ============================================================================
+
+/// Build intra-chunk causal decay mask: [1, H, C, C]
+/// mask[h, i, j] = exp(slope_h * (i - j)) for j <= i, 0 otherwise
+fn build_intra_decay_mask(c: i32, slopes: &[f32]) -> Array {
+    let h = slopes.len();
+    let c_us = c as usize;
+    let mut data = vec![0.0f32; h * c_us * c_us];
+    for head in 0..h {
+        let s = slopes[head];
+        for i in 0..c_us {
+            for j in 0..=i {
+                data[head * c_us * c_us + i * c_us + j] = (s * (i as f32 - j as f32)).exp();
+            }
+        }
+    }
+    Array::from_slice(&data, &[1, h as i32, c, c])
+}
+
+/// Build query decay for inter-chunk state lookup: [1, H, C, 1]
+/// query_decay[h, t] = exp(slope_h * (t + 1)) for t = 0..C-1
+fn build_query_decay(c: i32, slopes: &[f32]) -> Array {
+    let h = slopes.len();
+    let c_us = c as usize;
+    let mut data = vec![0.0f32; h * c_us];
+    for head in 0..h {
+        let s = slopes[head];
+        for t in 0..c_us {
+            data[head * c_us + t] = (s * (t as f32 + 1.0)).exp();
+        }
+    }
+    Array::from_slice(&data, &[1, h as i32, c, 1])
+}
+
+/// Build reverse decay for key weighting in state update: [1, H, C, 1]
+/// reverse_decay[h, t] = exp(slope_h * (C - 1 - t)) for t = 0..C-1
+fn build_reverse_decay(c: i32, slopes: &[f32]) -> Array {
+    let h = slopes.len();
+    let c_us = c as usize;
+    let mut data = vec![0.0f32; h * c_us];
+    for head in 0..h {
+        let s = slopes[head];
+        for t in 0..c_us {
+            data[head * c_us + t] = (s * (c_us as f32 - 1.0 - t as f32)).exp();
+        }
+    }
+    Array::from_slice(&data, &[1, h as i32, c, 1])
+}
+
+/// Build chunk decay factor for state propagation: [1, H, 1, 1]
+/// chunk_decay[h] = exp(slope_h * C)
+fn build_chunk_decay(c: i32, slopes: &[f32]) -> Array {
+    let scaled: Vec<f32> = slopes.iter().map(|&s| (s * c as f32).exp()).collect();
+    Array::from_slice(&scaled, &[1, slopes.len() as i32, 1, 1])
+}
+
+/// Build all four decay tensors for a given chunk size.
+fn build_decay_tensors(c: i32, slopes: &[f32]) -> (Array, Array, Array, Array) {
+    (
+        build_intra_decay_mask(c, slopes),
+        build_query_decay(c, slopes),
+        build_reverse_decay(c, slopes),
+        build_chunk_decay(c, slopes),
+    )
+}
+
+/// Zero-pad a 4D tensor along axis 2 (sequence dimension).
+/// Input: [B, H, L, D] → Output: [B, H, L + pad, D]
+#[allow(non_snake_case)]
+fn pad_seq_dim(x: &Array, pad: i32) -> Result<Array, Exception> {
+    let shape = x.shape();
+    let zeros = Array::zeros::<f32>(&[shape[0], shape[1], pad, shape[3]])?;
+    let refs: Vec<&Array> = vec![x, &zeros];
+    mlx_rs::ops::concatenate_axis(&refs, 2)
+}
+
+// ============================================================================
+// Lightning Attention
+// ============================================================================
+
 /// Lightning attention using Gated Linear Attention (GLA) with recurrent state.
-#[derive(Debug, ModuleParameters)]
+///
+/// Uses chunked prefill for L > 1 (batched matmul within chunks of size C)
+/// and single-step recurrence for decode (L = 1).
+#[derive(Debug, ModuleParameters, Quantizable)]
 #[module(root = mlx_rs)]
 pub struct LightningAttention {
     pub n_heads: i32,
@@ -75,28 +175,39 @@ pub struct LightningAttention {
     pub use_rope: bool,
     pub use_output_gate: bool,
     pub use_output_norm: bool,
+    pub chunk_size: i32,
 
+    #[quantizable]
     #[param]
-    pub q_proj: nn::Linear,
+    pub q_proj: MaybeQuantized<nn::Linear>,
+    #[quantizable]
     #[param]
-    pub k_proj: nn::Linear,
+    pub k_proj: MaybeQuantized<nn::Linear>,
+    #[quantizable]
     #[param]
-    pub v_proj: nn::Linear,
+    pub v_proj: MaybeQuantized<nn::Linear>,
+    #[quantizable]
     #[param]
-    pub o_proj: nn::Linear,
+    pub o_proj: MaybeQuantized<nn::Linear>,
     #[param]
     pub q_norm: Option<nn::RmsNorm>,
     #[param]
     pub k_norm: Option<nn::RmsNorm>,
     #[param]
     pub o_norm: Option<nn::RmsNorm>,
+    #[quantizable]
     #[param]
-    pub z_proj: Option<nn::Linear>,
+    pub z_proj: Option<MaybeQuantized<nn::Linear>>,
     #[param]
     pub rope: Option<nn::Rope>,
 
     /// ALiBi decay slopes (not a learned parameter)
     pub decay_slopes: Vec<f32>,
+    /// Cached decay tensors for chunked prefill (lazily initialized)
+    pub intra_decay_mask: Option<Array>,
+    pub query_decay: Option<Array>,
+    pub reverse_decay: Option<Array>,
+    pub chunk_decay: Option<Array>,
 }
 
 impl LightningAttention {
@@ -151,11 +262,11 @@ impl LightningAttention {
         };
 
         let z_proj = if args.use_output_gate {
-            Some(
+            Some(MaybeQuantized::Original(
                 nn::LinearBuilder::new(dim, n_heads * head_dim)
                     .bias(bias)
                     .build()?,
-            )
+            ))
         } else {
             None
         };
@@ -182,22 +293,37 @@ impl LightningAttention {
             use_rope: args.lightning_use_rope,
             use_output_gate: args.use_output_gate,
             use_output_norm: args.use_output_norm,
-            q_proj,
-            k_proj,
-            v_proj,
-            o_proj,
+            chunk_size: DEFAULT_CHUNK_SIZE,
+            q_proj: MaybeQuantized::Original(q_proj),
+            k_proj: MaybeQuantized::Original(k_proj),
+            v_proj: MaybeQuantized::Original(v_proj),
+            o_proj: MaybeQuantized::Original(o_proj),
             q_norm,
             k_norm,
             o_norm,
             z_proj,
             rope,
             decay_slopes,
+            intra_decay_mask: None,
+            query_decay: None,
+            reverse_decay: None,
+            chunk_decay: None,
         })
     }
 
-    /// Forward pass using naive GLA recurrent attention.
-    /// For decode (L=1): single recurrent step.
-    /// For prefill (L>1): loop over tokens.
+    /// Ensure cached decay tensors are built for the configured chunk_size.
+    fn ensure_decay_tensors(&mut self) {
+        if self.intra_decay_mask.is_none() {
+            let (mask, q_decay, r_decay, c_decay) =
+                build_decay_tensors(self.chunk_size, &self.decay_slopes);
+            self.intra_decay_mask = Some(mask);
+            self.query_decay = Some(q_decay);
+            self.reverse_decay = Some(r_decay);
+            self.chunk_decay = Some(c_decay);
+        }
+    }
+
+    /// Forward pass: chunked GLA for prefill (L>1), single recurrent step for decode (L=1).
     #[allow(non_snake_case)]
     pub fn forward(
         &mut self,
@@ -231,16 +357,36 @@ impl LightningAttention {
             keys = kn.forward(&keys)?;
         }
 
-        // RoPE
+        // RoPE with workaround for MLX fast::rope bug (B>1 && L=1 produces
+        // different rotations for different batch elements). Fix: merge B into H
+        // dimension so B=1, apply RoPE, then reshape back.
         if let Some(rope) = &mut self.rope {
-            let q_input = nn::RopeInputBuilder::new(&queries)
-                .offset(cache.offset)
-                .build()?;
-            queries = rope.forward(q_input)?;
-            let k_input = nn::RopeInputBuilder::new(&keys)
-                .offset(cache.offset)
-                .build()?;
-            keys = rope.forward(k_input)?;
+            if B > 1 && L == 1 {
+                let qh = queries.shape()[1]; // n_heads
+                let kh = keys.shape()[1]; // n_kv_heads
+                let d = queries.shape()[3]; // head_dim
+
+                let q_flat = queries.reshape(&[1, B * qh, L, d])?;
+                let q_input = nn::RopeInputBuilder::new(&q_flat)
+                    .offset(cache.offset)
+                    .build()?;
+                queries = rope.forward(q_input)?.reshape(&[B, qh, L, d])?;
+
+                let k_flat = keys.reshape(&[1, B * kh, L, d])?;
+                let k_input = nn::RopeInputBuilder::new(&k_flat)
+                    .offset(cache.offset)
+                    .build()?;
+                keys = rope.forward(k_input)?.reshape(&[B, kh, L, d])?;
+            } else {
+                let q_input = nn::RopeInputBuilder::new(&queries)
+                    .offset(cache.offset)
+                    .build()?;
+                queries = rope.forward(q_input)?;
+                let k_input = nn::RopeInputBuilder::new(&keys)
+                    .offset(cache.offset)
+                    .build()?;
+                keys = rope.forward(k_input)?;
+            }
         }
 
         // Repeat KV heads if GQA (lightning uses n_heads == n_kv_heads typically)
@@ -267,11 +413,15 @@ impl LightningAttention {
         // Apply scale
         let queries = queries.multiply(array!(self.scale))?;
 
-        // Build decay tensor: [1, n_heads, 1, 1]
-        let decay = Array::from_slice(&self.decay_slopes, &[1, self.n_heads, 1, 1]);
-
-        // Run GLA recurrent: process all tokens
-        let output = self.gla_recurrent(&queries, &keys, &values, &decay, cache)?;
+        // Dispatch: chunked prefill vs single-step decode
+        let output = if L == 1 {
+            // Decode: single recurrent step
+            let decay = Array::from_slice(&self.decay_slopes, &[1, self.n_heads, 1, 1]);
+            self.gla_recurrent_step(&queries, &keys, &values, &decay, cache)?
+        } else {
+            // Prefill: chunked GLA
+            self.gla_chunked(&queries, &keys, &values, cache)?
+        };
 
         // output: [B, n_heads, L, head_dim] -> [B, L, n_heads * head_dim]
         let mut output = output
@@ -292,14 +442,11 @@ impl LightningAttention {
         self.o_proj.forward(&output)
     }
 
-    /// Naive GLA recurrent attention.
-    /// state_{t+1} = exp(decay) * state_t + k_t^T @ v_t
-    /// output_t = q_t @ state_t
-    ///
-    /// q, k, v: [B, n_heads, L, head_dim]
-    /// decay: [1, n_heads, 1, 1]
+    /// Single recurrent step for decode (L=1).
+    /// state = exp(decay) * state + k^T @ v
+    /// output = q @ state
     #[allow(non_snake_case)]
-    fn gla_recurrent(
+    fn gla_recurrent_step(
         &self,
         q: &Array,
         k: &Array,
@@ -310,44 +457,119 @@ impl LightningAttention {
         let shape = q.shape();
         let B = shape[0];
         let H = shape[1];
-        let L = shape[2];
         let D = shape[3];
 
-        // exp(decay) for state decay — decay_slopes are negative, so exp gives < 1
         let decay_factor = mlx_rs::ops::exp(decay)?;
 
-        // Initialize or retrieve state: [B, H, D, D]
         let mut state = match &cache.state {
             Some(s) => s.clone(),
             None => Array::zeros::<f32>(&[B, H, D, D])?,
         };
 
-        let mut outputs = Vec::with_capacity(L as usize);
+        // k: [B, H, 1, D] -> k_t: [B, H, D, 1]
+        let k_t = k.transpose_axes(&[0, 1, 3, 2])?;
+        // kv: [B, H, D, D]
+        let kv = mlx_rs::ops::matmul(&k_t, v)?;
+        // state = decay * state + kv
+        state = state.multiply(&decay_factor)?.add(kv)?;
 
-        for t in 0..L {
-            // q_t: [B, H, 1, D]
-            let q_t = q.index((.., .., t..t + 1, ..));
-            // k_t: [B, H, D, 1]
-            let k_t = k.index((.., .., t..t + 1, ..)).transpose_axes(&[0, 1, 3, 2])?;
-            // v_t: [B, H, 1, D]
-            let v_t = v.index((.., .., t..t + 1, ..));
+        // output = q @ state: [B, H, 1, D]
+        let output = mlx_rs::ops::matmul(q, &state)?;
 
-            // outer product: k_t^T @ v_t -> [B, H, D, D]
-            let kv = mlx_rs::ops::matmul(&k_t, &v_t)?;
+        cache.state = Some(state);
+        cache.offset += 1;
 
-            // state = decay * state + kv
-            state = state.multiply(&decay_factor)?.add(kv)?;
+        Ok(output)
+    }
 
-            // output_t = q_t @ state -> [B, H, 1, D]
-            let o_t = mlx_rs::ops::matmul(&q_t, &state)?;
-            outputs.push(o_t);
+    /// Chunked GLA prefill for L > 1.
+    ///
+    /// Splits Q/K/V into chunks of size C and processes each with:
+    /// - Intra-chunk: quadratic attention with decay mask  (Q_c @ K_c^T) * mask @ V_c
+    /// - Inter-chunk: query against accumulated state       Q_c_scaled @ state
+    /// - State update: state = chunk_decay * state + K_weighted^T @ V_c
+    #[allow(non_snake_case)]
+    fn gla_chunked(
+        &mut self,
+        q: &Array,
+        k: &Array,
+        v: &Array,
+        cache: &mut LightningCache,
+    ) -> Result<Array, Exception> {
+        let shape = q.shape();
+        let B = shape[0];
+        let H = shape[1];
+        let L = shape[2];
+        let D = shape[3];
+        let C = self.chunk_size;
+
+        // Ensure cached decay tensors exist
+        self.ensure_decay_tensors();
+
+        let mut state = match cache.state.take() {
+            Some(s) => s,
+            None => Array::zeros::<f32>(&[B, H, D, D])?,
+        };
+
+        let num_chunks = (L + C - 1) / C;
+        let mut outputs = Vec::with_capacity(num_chunks as usize);
+
+        // Cached decay tensors are always for full chunk size C
+        let mask = self.intra_decay_mask.as_ref().unwrap().clone();
+        let q_decay = self.query_decay.as_ref().unwrap().clone();
+        let r_decay = self.reverse_decay.as_ref().unwrap().clone();
+        let c_decay = self.chunk_decay.as_ref().unwrap().clone();
+
+        for chunk_idx in 0..num_chunks {
+            let start = chunk_idx * C;
+            let end = min((chunk_idx + 1) * C, L);
+            let actual_c = end - start;
+
+            // Slice chunk: [B, H, actual_c, D]
+            let q_c = q.index((.., .., start..end, ..));
+            let k_c = k.index((.., .., start..end, ..));
+            let v_c = v.index((.., .., start..end, ..));
+
+            // For partial last chunk, zero-pad to full C so the fused kernel
+            // can use fixed template parameters (avoids recompilation).
+            let (q_pad, k_pad, v_pad) = if actual_c < C {
+                (
+                    pad_seq_dim(&q_c, C - actual_c)?,
+                    pad_seq_dim(&k_c, C - actual_c)?,
+                    pad_seq_dim(&v_c, C - actual_c)?,
+                )
+            } else {
+                (q_c.clone(), k_c.clone(), v_c.clone())
+            };
+
+            // 1. Fused intra-chunk attention (was 4 ops, now 1 Metal kernel)
+            let intra_out = crate::metal_kernels::fused_intra_chunk_attn(
+                &q_pad, &k_pad, &v_pad, &mask, B, H, C, D,
+            )?;
+
+            // 2. Inter-chunk: Q_c_scaled @ state (standard MLX ops, already optimized)
+            let q_scaled = q_pad.multiply(&q_decay)?;
+            let inter_out = mlx_rs::ops::matmul(&q_scaled, &state)?;
+
+            // 3. Combine and trim to actual_c if padded
+            let combined = intra_out.add(inter_out)?;
+            let out_c = if actual_c < C {
+                combined.index((.., .., ..actual_c, ..))
+            } else {
+                combined
+            };
+            outputs.push(out_c);
+
+            // 4. Fused state update (was 4 ops, now 1 Metal kernel)
+            state = crate::metal_kernels::fused_state_update(
+                &k_pad, &v_pad, &state, &r_decay, &c_decay, B, H, C, D,
+            )?;
         }
 
-        // Update cache
         cache.state = Some(state);
         cache.offset += L as i32;
 
-        // Concat along seq dim: [B, H, L, D]
+        // Concat chunk outputs: [B, H, L, D]
         if outputs.len() == 1 {
             Ok(outputs.into_iter().next().unwrap())
         } else {

@@ -7,16 +7,20 @@ use mlx_rs::{
     argmax_axis, array, categorical,
     builder::Builder,
     error::Exception,
-    macros::ModuleParameters,
-    module::{Module, ModuleParametersExt},
+    macros::{ModuleParameters, Quantizable},
+    module::{Module, ModuleParameters as ModuleParametersTrait, ModuleParametersExt, Param},
     nn,
+    quantization::MaybeQuantized,
     Array,
 };
 use serde::Deserialize;
 use serde_json::Value;
 use tokenizers::Tokenizer;
 
-use mlx_rs_core::error::Error;
+use mlx_rs_core::{
+    error::Error,
+    utils::initialize_rope,
+};
 
 use crate::attention::{
     HybridAttention, LayerCache, LightningAttention, SparseAttention,
@@ -27,15 +31,18 @@ use crate::config::ModelArgs;
 // MLP
 // ============================================================================
 
-#[derive(Debug, ModuleParameters)]
+#[derive(Debug, ModuleParameters, Quantizable)]
 #[module(root = mlx_rs)]
 pub struct Mlp {
+    #[quantizable]
     #[param]
-    pub gate_proj: nn::Linear,
+    pub gate_proj: MaybeQuantized<nn::Linear>,
+    #[quantizable]
     #[param]
-    pub down_proj: nn::Linear,
+    pub down_proj: MaybeQuantized<nn::Linear>,
+    #[quantizable]
     #[param]
-    pub up_proj: nn::Linear,
+    pub up_proj: MaybeQuantized<nn::Linear>,
 }
 
 impl Mlp {
@@ -44,9 +51,9 @@ impl Mlp {
         let down_proj = nn::LinearBuilder::new(hidden_dim, dim).bias(false).build()?;
         let up_proj = nn::LinearBuilder::new(dim, hidden_dim).bias(false).build()?;
         Ok(Self {
-            gate_proj,
-            down_proj,
-            up_proj,
+            gate_proj: MaybeQuantized::Original(gate_proj),
+            down_proj: MaybeQuantized::Original(down_proj),
+            up_proj: MaybeQuantized::Original(up_proj),
         })
     }
 
@@ -173,7 +180,6 @@ impl MiniCPMSALAModel {
             let L = h.shape()[1];
             if L > 1 {
                 // For prefill, create causal mask
-                // We need an explicit array mask since some layers are sparse and some aren't
                 let mask = create_additive_causal_mask(L, &caches[0])?;
                 Some(mask)
             } else {
@@ -222,7 +228,7 @@ pub struct Model {
     #[param]
     pub model: MiniCPMSALAModel,
     #[param]
-    pub lm_head: Option<nn::Linear>,
+    pub lm_head: Option<MaybeQuantized<nn::Linear>>,
 }
 
 impl Model {
@@ -231,11 +237,11 @@ impl Model {
         let logits_scale = args.logits_scale();
 
         let lm_head = if !args.tie_word_embeddings {
-            Some(
+            Some(MaybeQuantized::Original(
                 nn::LinearBuilder::new(args.hidden_size, args.vocab_size)
                     .bias(false)
                     .build()?,
-            )
+            ))
         } else {
             None
         };
@@ -303,6 +309,10 @@ pub fn load_model(model_dir: impl AsRef<Path>) -> Result<Model, Error> {
     let model_dir = model_dir.as_ref();
     let model_args = get_model_args(model_dir)?;
 
+    if model_args.quantization.is_some() {
+        return load_model_quantized(model_dir, &model_args);
+    }
+
     let mut model = Model::new(model_args).map_err(Error::Mlx)?;
 
     let weights_index = model_dir.join("model.safetensors.index.json");
@@ -321,6 +331,278 @@ pub fn load_model(model_dir: impl AsRef<Path>) -> Result<Model, Error> {
         let path = model_dir.join("model.safetensors");
         model.load_safetensors(&path)?;
     }
+
+    Ok(model)
+}
+
+// ============================================================================
+// Quantized Weight Loading
+// ============================================================================
+
+fn load_all_weights(model_dir: &Path) -> Result<HashMap<String, Array>, Error> {
+    let weights_index = model_dir.join("model.safetensors.index.json");
+
+    if weights_index.exists() {
+        let json = std::fs::read_to_string(&weights_index)?;
+        let weight_map: WeightMap = serde_json::from_str(&json)?;
+        let weight_files: HashSet<&String> = weight_map.weight_map.values().collect();
+
+        let mut all_weights: HashMap<String, Array> = HashMap::new();
+        for weight_file in weight_files {
+            let path = model_dir.join(weight_file);
+            let loaded = Array::load_safetensors(&path)?;
+            all_weights.extend(loaded);
+        }
+        Ok(all_weights)
+    } else {
+        let path = model_dir.join("model.safetensors");
+        Ok(Array::load_safetensors(&path)?)
+    }
+}
+
+fn get_weight(weights: &HashMap<String, Array>, key: &str) -> Result<Array, Error> {
+    weights.get(key)
+        .cloned()
+        .ok_or_else(|| Error::Model(format!("Weight not found: {}", key)))
+}
+
+fn make_quantized_linear(
+    weights: &HashMap<String, Array>,
+    prefix: &str,
+    group_size: i32,
+    bits: i32,
+) -> Result<nn::QuantizedLinear, Error> {
+    let weight = get_weight(weights, &format!("{}.weight", prefix))?;
+    let scales = get_weight(weights, &format!("{}.scales", prefix))?;
+    let biases = get_weight(weights, &format!("{}.biases", prefix))?;
+
+    let inner = nn::Linear {
+        weight: Param::new(weight),
+        bias: Param::new(None),
+    };
+
+    let mut ql = nn::QuantizedLinear {
+        group_size,
+        bits,
+        scales: Param::new(scales),
+        biases: Param::new(biases),
+        inner,
+    };
+    ql.freeze_parameters(true);
+
+    Ok(ql)
+}
+
+fn load_model_quantized(model_dir: &Path, args: &ModelArgs) -> Result<Model, Error> {
+    let quant_config = args.quantization.as_ref()
+        .ok_or_else(|| Error::Model("No quantization config".to_string()))?;
+    let group_size = quant_config.group_size;
+    let bits = quant_config.bits;
+
+    let weights = load_all_weights(model_dir)?;
+
+    let mut layers = Vec::with_capacity(args.num_hidden_layers as usize);
+
+    for i in 0..args.num_hidden_layers {
+        let prefix = format!("model.layers.{}", i);
+
+        // MLP — same for all layer types
+        let mlp = Mlp {
+            gate_proj: MaybeQuantized::Quantized(make_quantized_linear(
+                &weights, &format!("{}.mlp.gate_proj", prefix), group_size, bits,
+            )?),
+            down_proj: MaybeQuantized::Quantized(make_quantized_linear(
+                &weights, &format!("{}.mlp.down_proj", prefix), group_size, bits,
+            )?),
+            up_proj: MaybeQuantized::Quantized(make_quantized_linear(
+                &weights, &format!("{}.mlp.up_proj", prefix), group_size, bits,
+            )?),
+        };
+
+        let input_layernorm = nn::RmsNorm {
+            weight: Param::new(get_weight(&weights, &format!("{}.input_layernorm.weight", prefix))?),
+            eps: args.rms_norm_eps,
+        };
+        let post_attention_layernorm = nn::RmsNorm {
+            weight: Param::new(get_weight(&weights, &format!("{}.post_attention_layernorm.weight", prefix))?),
+            eps: args.rms_norm_eps,
+        };
+
+        let self_attn = if args.is_sparse_layer(i as usize) {
+            // Sparse attention: q/k/v/o_proj + o_gate, NO q_norm/k_norm/o_norm/z_proj
+            let q_proj = MaybeQuantized::Quantized(make_quantized_linear(
+                &weights, &format!("{}.self_attn.q_proj", prefix), group_size, bits,
+            )?);
+            let k_proj = MaybeQuantized::Quantized(make_quantized_linear(
+                &weights, &format!("{}.self_attn.k_proj", prefix), group_size, bits,
+            )?);
+            let v_proj = MaybeQuantized::Quantized(make_quantized_linear(
+                &weights, &format!("{}.self_attn.v_proj", prefix), group_size, bits,
+            )?);
+            let o_proj = MaybeQuantized::Quantized(make_quantized_linear(
+                &weights, &format!("{}.self_attn.o_proj", prefix), group_size, bits,
+            )?);
+
+            let o_gate = if args.attn_use_output_gate {
+                Some(MaybeQuantized::Quantized(make_quantized_linear(
+                    &weights, &format!("{}.self_attn.o_gate", prefix), group_size, bits,
+                )?))
+            } else {
+                None
+            };
+
+            let rope = if args.attn_use_rope {
+                Some(initialize_rope(
+                    args.head_dim,
+                    args.rope_theta,
+                    false,
+                    &None,
+                    args.max_position_embeddings,
+                )?)
+            } else {
+                None
+            };
+
+            HybridAttention::Sparse(SparseAttention {
+                n_heads: args.num_attention_heads,
+                n_kv_heads: args.num_key_value_heads,
+                scale: (args.head_dim as f32).sqrt().recip(),
+                use_rope: args.attn_use_rope,
+                q_proj,
+                k_proj,
+                v_proj,
+                o_proj,
+                o_gate,
+                rope,
+            })
+        } else {
+            // Lightning attention: q/k/v/o_proj + q_norm/k_norm/o_norm/z_proj, NO o_gate
+            let n_heads = args.lightning_num_heads();
+            let n_kv_heads = args.lightning_num_kv_heads();
+            let head_dim = args.lightning_head_dim();
+
+            let q_proj = MaybeQuantized::Quantized(make_quantized_linear(
+                &weights, &format!("{}.self_attn.q_proj", prefix), group_size, bits,
+            )?);
+            let k_proj = MaybeQuantized::Quantized(make_quantized_linear(
+                &weights, &format!("{}.self_attn.k_proj", prefix), group_size, bits,
+            )?);
+            let v_proj = MaybeQuantized::Quantized(make_quantized_linear(
+                &weights, &format!("{}.self_attn.v_proj", prefix), group_size, bits,
+            )?);
+            let o_proj = MaybeQuantized::Quantized(make_quantized_linear(
+                &weights, &format!("{}.self_attn.o_proj", prefix), group_size, bits,
+            )?);
+
+            let q_norm = if args.qk_norm {
+                Some(nn::RmsNorm {
+                    weight: Param::new(get_weight(&weights, &format!("{}.self_attn.q_norm.weight", prefix))?),
+                    eps: args.rms_norm_eps,
+                })
+            } else {
+                None
+            };
+            let k_norm = if args.qk_norm {
+                Some(nn::RmsNorm {
+                    weight: Param::new(get_weight(&weights, &format!("{}.self_attn.k_norm.weight", prefix))?),
+                    eps: args.rms_norm_eps,
+                })
+            } else {
+                None
+            };
+            let o_norm = if args.use_output_norm {
+                Some(nn::RmsNorm {
+                    weight: Param::new(get_weight(&weights, &format!("{}.self_attn.o_norm.weight", prefix))?),
+                    eps: args.rms_norm_eps,
+                })
+            } else {
+                None
+            };
+            let z_proj = if args.use_output_gate {
+                Some(MaybeQuantized::Quantized(make_quantized_linear(
+                    &weights, &format!("{}.self_attn.z_proj", prefix), group_size, bits,
+                )?))
+            } else {
+                None
+            };
+
+            let rope = if args.lightning_use_rope {
+                Some(initialize_rope(
+                    head_dim,
+                    args.rope_theta,
+                    false,
+                    &None,
+                    args.max_position_embeddings,
+                )?)
+            } else {
+                None
+            };
+
+            let decay_slopes = crate::attention::lightning::build_alibi_slopes_pub(n_heads);
+
+            HybridAttention::Lightning(LightningAttention {
+                n_heads,
+                n_kv_heads,
+                head_dim,
+                scale: args.lightning_scale_value(),
+                use_rope: args.lightning_use_rope,
+                use_output_gate: args.use_output_gate,
+                use_output_norm: args.use_output_norm,
+                chunk_size: 64,
+                q_proj,
+                k_proj,
+                v_proj,
+                o_proj,
+                q_norm,
+                k_norm,
+                o_norm,
+                z_proj,
+                rope,
+                decay_slopes,
+                intra_decay_mask: None,
+                query_decay: None,
+                reverse_decay: None,
+                chunk_decay: None,
+            })
+        };
+
+        layers.push(DecoderLayer {
+            residual_scale: args.residual_scale(),
+            self_attn,
+            mlp,
+            input_layernorm,
+            post_attention_layernorm,
+        });
+    }
+
+    let minicpm_model = MiniCPMSALAModel {
+        vocab_size: args.vocab_size,
+        num_hidden_layers: args.num_hidden_layers,
+        scale_emb: args.scale_emb,
+        embed_tokens: nn::Embedding {
+            weight: Param::new(get_weight(&weights, "model.embed_tokens.weight")?),
+        },
+        layers,
+        norm: nn::RmsNorm {
+            weight: Param::new(get_weight(&weights, "model.norm.weight")?),
+            eps: args.rms_norm_eps,
+        },
+    };
+
+    let lm_head = if !args.tie_word_embeddings {
+        Some(MaybeQuantized::Quantized(make_quantized_linear(
+            &weights, "lm_head", group_size, bits,
+        )?))
+    } else {
+        None
+    };
+
+    let model = Model {
+        args: args.clone(),
+        logits_scale: args.logits_scale(),
+        model: minicpm_model,
+        lm_head,
+    };
 
     Ok(model)
 }
