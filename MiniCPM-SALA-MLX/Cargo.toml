@@ -16,6 +16,12 @@ tokenizers = "0.21"
 anyhow = "1"
 clap = { version = "4", features = ["derive"] }
 
+[dev-dependencies]
+hyper = { version = "1", features = ["full"] }
+hyper-util = { version = "0.1", features = ["tokio"] }
+http-body-util = "0.1"
+tokio = { version = "1", features = ["full"] }
+
 [[example]]
 name = "generate"
 path = "examples/generate.rs"
@@ -35,6 +41,10 @@ path = "examples/chat.rs"
 [[example]]
 name = "speculative_generate"
 path = "examples/speculative_generate.rs"
+
+[[example]]
+name = "server"
+path = "examples/server.rs"
 
 [[example]]
 name = "test_rope_batch"
