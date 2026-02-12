@@ -145,10 +145,10 @@ impl Default for VoiceClonerConfig {
             vits_pretrained_base: None,  // Not using finetuned weights by default
             hubert_weights: format!("{}/hubert.safetensors", model_dir),
             sample_rate: 32000,
-            top_k: 5,  // Match Python TTS.py default
-            top_p: 1.0,  // Match Python TTS.py default (no nucleus sampling)
-            temperature: 1.0,  // Match Python TTS.py default
-            repetition_penalty: 1.35,  // Match Python TTS.py default
+            top_k: 15,  // Wider candidate pool avoids breathing tokens when rep-penalty culls top choices
+            top_p: 1.0,  // No nucleus sampling (Python default)
+            temperature: 1.0,  // No scaling (Python default)
+            repetition_penalty: 1.2,  // Lighter penalty — 1.35 was too aggressive, forcing silence/breathing tokens
             noise_scale: 0.5,
             speed: 1.0,
             // ONNX VITS is default for best quality (batched decode, matches Python)
@@ -335,18 +335,24 @@ impl VoiceCloner {
             eprintln!("Using MLX VITS (per-chunk decode) - may have chunk boundary artifacts");
             None
         } else if let Some(ref onnx_path) = config.vits_onnx_path {
-            match crate::models::vits_onnx::VitsOnnx::load(std::path::Path::new(onnx_path)) {
-                Ok(v) => {
-                    eprintln!("Using ONNX VITS (batched decode) for best quality");
-                    Some(v)
-                },
-                Err(e) => {
-                    eprintln!("Warning: Failed to load ONNX VITS: {}. Falling back to MLX.", e);
-                    None
+            let onnx_exists = std::path::Path::new(onnx_path).exists();
+            if !onnx_exists {
+                // ONNX file simply not present — silently fall back to MLX VITS
+                debug!("ONNX VITS not found at {}, using MLX VITS", onnx_path);
+                None
+            } else {
+                match crate::models::vits_onnx::VitsOnnx::load(std::path::Path::new(onnx_path)) {
+                    Ok(v) => {
+                        eprintln!("Using ONNX VITS (batched decode) for best quality");
+                        Some(v)
+                    },
+                    Err(e) => {
+                        warn!("Failed to load ONNX VITS: {}. Using MLX VITS instead.", e);
+                        None
+                    }
                 }
             }
         } else {
-            eprintln!("No ONNX VITS path configured. Using MLX VITS (per-chunk decode).");
             None
         };
 
@@ -897,7 +903,7 @@ impl VoiceCloner {
         // Each chunk is decoded individually to avoid VITS attention artifacts from
         // concatenating independent T2S sequences.
         let sr = self.config.sample_rate as f32;
-        let silence_duration = 0.3f32; // seconds of silence between chunks
+        let silence_duration = 0.08f32; // 80ms — just enough for natural pause between clauses
         let silence_samples = (sr * silence_duration) as usize;
         let crossfade_samples = (sr * 0.05) as usize; // 50ms crossfade
 
@@ -912,6 +918,80 @@ impl VoiceCloner {
             if max_abs > 1.0 {
                 for s in samples.iter_mut() {
                     *s /= max_abs;
+                }
+            }
+
+            // Compress internal silence gaps within the chunk.
+            // The T2S model sometimes generates semantic tokens that decode to silence
+            // mid-sentence, creating 500-900ms dead gaps. We detect these and compress
+            // them down to a short natural pause.
+            {
+                let gap_win = (sr * 0.05) as usize; // 50ms analysis window
+                let n_gap_wins = samples.len() / gap_win;
+                let gap_silence_thresh = 0.015f32;
+                let max_gap_ms = 120; // compress any gap longer than this (in ms)
+                let target_gap_ms = 50; // compress down to this length
+                let max_gap_wins = max_gap_ms / 50;
+                let target_gap_wins = target_gap_ms / 50;
+
+                if n_gap_wins > 4 {
+                    // Find RMS per window
+                    let rms_wins: Vec<f32> = (0..n_gap_wins).map(|w| {
+                        let s = w * gap_win;
+                        let e = (s + gap_win).min(samples.len());
+                        let sl = &samples[s..e];
+                        (sl.iter().map(|v| v * v).sum::<f32>() / sl.len() as f32).sqrt()
+                    }).collect();
+
+                    // Find silence runs (consecutive windows below threshold)
+                    let mut compressed = Vec::with_capacity(samples.len());
+                    let mut w = 0;
+                    while w < n_gap_wins {
+                        if rms_wins[w] < gap_silence_thresh {
+                            // Start of a silence run
+                            let run_start = w;
+                            while w < n_gap_wins && rms_wins[w] < gap_silence_thresh {
+                                w += 1;
+                            }
+                            let run_len = w - run_start;
+
+                            if run_len > max_gap_wins {
+                                // This gap is too long — compress it
+                                // Keep only target_gap_wins worth of silence
+                                let keep_wins = target_gap_wins.min(run_len);
+                                // Take from the middle of the gap for smoother transition
+                                let mid = run_start + run_len / 2;
+                                let keep_start = mid.saturating_sub(keep_wins / 2);
+                                let keep_end = (keep_start + keep_wins).min(n_gap_wins);
+                                let sample_start = keep_start * gap_win;
+                                let sample_end = (keep_end * gap_win).min(samples.len());
+                                compressed.extend_from_slice(&samples[sample_start..sample_end]);
+                                eprintln!("   [COMPRESS] Chunk {}: internal silence at {:.1}s-{:.1}s ({}ms) -> {}ms",
+                                         i, run_start as f32 * 0.05, w as f32 * 0.05,
+                                         run_len * 50, keep_wins * 50);
+                            } else {
+                                // Short gap — keep as-is
+                                let sample_start = run_start * gap_win;
+                                let sample_end = (w * gap_win).min(samples.len());
+                                compressed.extend_from_slice(&samples[sample_start..sample_end]);
+                            }
+                        } else {
+                            // Speech window — keep
+                            let sample_start = w * gap_win;
+                            let sample_end = ((w + 1) * gap_win).min(samples.len());
+                            compressed.extend_from_slice(&samples[sample_start..sample_end]);
+                            w += 1;
+                        }
+                    }
+                    // Keep any remaining samples after last full window
+                    let last_full = n_gap_wins * gap_win;
+                    if last_full < samples.len() {
+                        compressed.extend_from_slice(&samples[last_full..]);
+                    }
+
+                    if compressed.len() < samples.len() {
+                        samples = compressed;
+                    }
                 }
             }
 
@@ -940,8 +1020,8 @@ impl VoiceCloner {
                 // Walk backwards to find the last "real speech" window
                 // Real speech: RMS > 0.03, and it's part of the main content
                 // (not an isolated burst after silence)
-                let speech_thresh = 0.03f32;
-                let silence_thresh = 0.01f32;
+                let speech_thresh = 0.05f32;  // Raised: breathing (0.02-0.04) now classified as non-speech
+                let silence_thresh = 0.02f32; // Raised: catches breathing sounds that were slipping through
 
                 // Find the cut point by detecting "silence gap after speech"
                 // Walk backwards: skip trailing silence, skip any burst, find silence gap
@@ -1002,6 +1082,43 @@ impl VoiceCloner {
                     samples[j] = 0.0;
                 }
                 trim_pos = trim_pos_new;
+            }
+
+            // Second pass: trim trailing breathing/low-energy tail from the end
+            // Walk backwards from trim_pos and remove windows that are below speech threshold
+            // but above silence (i.e., breathing artifacts that the burst detector didn't catch)
+            {
+                let breath_thresh = 0.04f32; // breathing is typically 0.02-0.04 RMS
+                let min_speech_windows = 4; // keep at least 200ms of audio
+                let n_windows_trimmed = trim_pos / win;
+                if n_windows_trimmed > min_speech_windows {
+                    let rms_trimmed: Vec<f32> = (0..n_windows_trimmed).map(|w| {
+                        let start = w * win;
+                        let end = (start + win).min(trim_pos);
+                        let slice = &samples[start..end];
+                        (slice.iter().map(|s| s * s).sum::<f32>() / slice.len() as f32).sqrt()
+                    }).collect();
+
+                    // Walk backwards, trimming windows below breath threshold
+                    let mut new_end = n_windows_trimmed;
+                    while new_end > min_speech_windows && rms_trimmed[new_end - 1] < breath_thresh {
+                        new_end -= 1;
+                    }
+                    if new_end < n_windows_trimmed {
+                        let new_trim = (new_end * win).min(trim_pos);
+                        // Fade out
+                        let fadeout_len = (sr * 0.03) as usize;
+                        let fade_start = new_trim.saturating_sub(fadeout_len);
+                        for j in fade_start..new_trim {
+                            let t = (new_trim - j) as f32 / fadeout_len as f32;
+                            samples[j] *= t;
+                        }
+                        for j in new_trim..trim_pos {
+                            samples[j] = 0.0;
+                        }
+                        trim_pos = new_trim;
+                    }
+                }
             }
 
             let trimmed = &samples[..trim_pos];
@@ -1393,7 +1510,9 @@ impl VoiceCloner {
                 let seg_w2p_count = if seg.is_english {
                     count_english_word2ph_entries(&seg.text)
                 } else {
-                    seg.text.chars().count()
+                    // chinese_g2p skips whitespace entirely (no word2ph entry),
+                    // so we must not count spaces here either.
+                    seg.text.chars().filter(|c| !c.is_whitespace()).count()
                 };
 
                 let end_idx = (w2p_idx + seg_w2p_count).min(word2ph.len());
@@ -1414,7 +1533,12 @@ impl VoiceCloner {
                              &seg.text.chars().take(20).collect::<String>(), seg_phoneme_count);
                 } else {
                     // Chinese: real BERT
-                    let bert_raw = self.bert.extract_features(&seg.text, seg_word2ph)?;
+                    // Strip whitespace from segment text since chinese_g2p skips spaces
+                    // and word2ph entries don't include them
+                    let seg_text_no_ws: String = seg.text.chars()
+                        .filter(|c| !c.is_whitespace())
+                        .collect();
+                    let bert_raw = self.bert.extract_features(&seg_text_no_ws, seg_word2ph)?;
                     eval([&bert_raw]).map_err(|e| Error::Message(e.to_string()))?;
                     let bert_len = bert_raw.shape()[1] as i32;
                     let bert = if bert_len < seg_phoneme_count {

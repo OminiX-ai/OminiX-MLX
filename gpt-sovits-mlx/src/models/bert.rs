@@ -945,7 +945,15 @@ pub fn load_bert_model(weights_path: impl AsRef<Path>) -> Result<BertModel, Erro
 
     let mut model = BertModel::new(config)?;
 
-    let weights = Array::load_safetensors(path)?;
+    // Convert float16 → float32 for numerical stability
+    let raw_weights = Array::load_safetensors(path)?;
+    let weights: HashMap<String, Array> = raw_weights
+        .into_iter()
+        .map(|(k, v)| {
+            let v32 = v.as_type::<f32>().unwrap_or(v);
+            (k, v32)
+        })
+        .collect();
     load_bert_weights(&mut model, &weights)?;
 
     Ok(model)

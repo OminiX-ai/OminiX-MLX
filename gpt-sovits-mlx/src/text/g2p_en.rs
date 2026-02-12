@@ -72,9 +72,10 @@ pub fn word_to_phonemes(word: &str) -> Vec<String> {
 
     // Neural network for OOV words
     let mutex = G2P_EN.get_or_init(|| {
+        let home = std::env::var("HOME").unwrap_or_else(|_| "/tmp".to_string());
+        let home_g2p = format!("{}/.dora/models/g2p_en_onnx", home);
         let model_paths = [
-            "/tmp/g2p_en_onnx",
-            "/Users/yuechen/.dora/models/g2p_en_onnx",
+            home_g2p.as_str(),
         ];
 
         for path in model_paths {

@@ -631,8 +631,17 @@ impl T2SModel {
     pub fn load_weights(&mut self, path: impl AsRef<Path>) -> Result<(), Error> {
         let path = path.as_ref();
 
-        // Load weights from safetensors
-        let weights = Array::load_safetensors(path)?;
+        // Load weights from safetensors and convert to float32
+        // Models are stored as float16 but computation requires float32 precision
+        // (softmax overflow, layer norm instability)
+        let raw_weights = Array::load_safetensors(path)?;
+        let weights: HashMap<String, Array> = raw_weights
+            .into_iter()
+            .map(|(k, v)| {
+                let v32 = v.as_type::<f32>().unwrap_or(v);
+                (k, v32)
+            })
+            .collect();
 
         // Apply weights to model
         load_t2s_weights(self, &weights)?;

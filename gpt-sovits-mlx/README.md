@@ -10,12 +10,41 @@ Pure Rust implementation of GPT-SoVITS voice cloning with MLX acceleration.
 - **Pure Rust**: No Python dependencies at inference time
 - **GPU accelerated**: Metal GPU via MLX for all operations
 
-## Installation
+## Prerequisites
 
-```toml
-[dependencies]
-gpt-sovits-mlx = { path = "../gpt-sovits-mlx/rust" }
+- **Rust** (stable, 1.75+)
+- **Python 3.10+** (for one-time model setup only)
+- **macOS** with Apple Silicon (M1/M2/M3/M4)
+
+## First-Time Setup
+
+Download and convert all required model weights (~2GB download):
+
+```bash
+python scripts/setup_models.py
 ```
+
+This automatically:
+1. Installs Python dependencies (torch CPU, safetensors, transformers, huggingface_hub)
+2. Downloads pretrained checkpoints from HuggingFace
+3. Converts everything to MLX-compatible safetensors format
+4. Places output in `~/.dora/models/primespeech/gpt-sovits-mlx/`
+
+After setup, the model directory will contain:
+
+```
+~/.dora/models/primespeech/gpt-sovits-mlx/
+├── doubao_mixed_gpt_new.safetensors         # GPT T2S model
+├── doubao_mixed_sovits_new.safetensors      # SoVITS VITS decoder
+├── hubert.safetensors                       # CNHubert audio encoder
+├── bert.safetensors                         # Chinese BERT
+└── chinese-roberta-tokenizer/
+    └── tokenizer.json                       # BERT tokenizer
+```
+
+> **Note:** The ONNX VITS model (`vits.onnx`) is not included in setup.
+> The Rust code automatically falls back to MLX VITS when ONNX is not available.
+> You can also pass `--mlx-vits` explicitly.
 
 ## Quick Start
 
@@ -44,46 +73,14 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
 ### Voice Cloning
 
 ```bash
-# Basic voice cloning
+# Basic voice cloning (uses MLX VITS automatically when ONNX is absent)
 cargo run --release --example voice_clone -- \
-    --reference ./audio/reference.wav \
-    --text "Hello, this is a voice clone test."
+    --mlx-vits --ref ./audio/reference.wav "Hello, this is a voice clone test."
 
-# With custom model paths
+# With custom model directory
 cargo run --release --example voice_clone -- \
     --model-dir ./models/gpt-sovits \
-    --reference ./audio/speaker.wav \
-    --text "你好，世界！"
-```
-
-### Model Download
-
-Download pre-converted MLX models:
-
-```bash
-# GPT-SoVITS model pack (includes all required files)
-huggingface-cli download lj1995/GPT-SoVITS-MLX --local-dir ./models/gpt-sovits
-
-# Or download individual components:
-# CNHubert encoder
-huggingface-cli download TencentGameMate/chinese-hubert-base --local-dir ./models/hubert
-
-# Chinese BERT
-huggingface-cli download hfl/chinese-roberta-wwm-ext --local-dir ./models/bert
-```
-
-### Model Files
-
-A complete model setup requires:
-
-```
-models/gpt-sovits/
-├── gpt.safetensors          # GPT-SoVITS T2S model
-├── sovits.safetensors       # SoVITS VITS decoder
-├── cnhubert.safetensors     # CNHubert audio encoder
-├── bert.safetensors         # Chinese BERT
-├── g2pw.onnx                # G2PW polyphone model
-└── tokenizer.json           # BERT tokenizer
+    --mlx-vits --ref ./audio/speaker.wav "你好，世界！"
 ```
 
 ## API Reference
