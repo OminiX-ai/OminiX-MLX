@@ -16,7 +16,7 @@ use crate::config::ModelArgs;
 
 /// Per-layer cache: either a SparseKVCache (sparse layers) or a recurrent
 /// state (lightning layers).
-#[derive(Debug)]
+#[derive(Debug, Clone)]
 pub enum LayerCache {
     Sparse(SparseKVCache),
     Lightning(LightningCache),

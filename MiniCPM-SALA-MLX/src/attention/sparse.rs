@@ -25,7 +25,7 @@ use crate::config::{ModelArgs, SparseConfig};
 /// Stores the full key/value history and provides methods for:
 /// - Dense SDPA when total_len <= dense_len
 /// - InfLLMv2 sparse attention when total_len > dense_len
-#[derive(Debug)]
+#[derive(Debug, Clone)]
 pub struct SparseKVCache {
     /// Full key history: [B, n_kv_heads, total_len, head_dim]
     pub keys: Option<Array>,
@@ -82,6 +82,25 @@ impl SparseKVCache {
     /// Get all cached values: [B, n_kv_heads, total_len, head_dim]
     pub fn all_values(&self) -> &Array {
         self.values.as_ref().unwrap()
+    }
+
+    /// Remove the last `n` entries from the cache (for speculative decoding rollback).
+    pub fn trim(&mut self, n: i32) {
+        if n <= 0 {
+            return;
+        }
+        if let (Some(ref keys), Some(ref values)) = (&self.keys, &self.values) {
+            let total = keys.shape()[2];
+            let keep = total - n;
+            if keep > 0 {
+                self.keys = Some(keys.index((.., .., ..keep, ..)));
+                self.values = Some(values.index((.., .., ..keep, ..)));
+            } else {
+                self.keys = None;
+                self.values = None;
+            }
+            self.offset -= n;
+        }
     }
 }
 

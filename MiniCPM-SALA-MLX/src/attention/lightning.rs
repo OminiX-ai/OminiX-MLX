@@ -18,7 +18,7 @@ use crate::config::ModelArgs;
 const DEFAULT_CHUNK_SIZE: i32 = 64;
 
 /// Recurrent state cache for lightning (GLA) attention layers.
-#[derive(Debug)]
+#[derive(Debug, Clone)]
 pub struct LightningCache {
     /// Recurrent state: [B, n_heads, head_dim, head_dim]
     pub state: Option<Array>,

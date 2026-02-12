@@ -167,6 +167,18 @@ impl MiniCPMSALAModel {
         mask: Option<&Array>,
         caches: &mut [LayerCache],
     ) -> Result<Array, Exception> {
+        self.forward_partial(inputs, mask, caches, self.num_hidden_layers as usize)
+    }
+
+    /// Forward through only the first `num_layers` layers (for draft speculation).
+    #[allow(non_snake_case)]
+    pub fn forward_partial(
+        &mut self,
+        inputs: &Array,
+        mask: Option<&Array>,
+        caches: &mut [LayerCache],
+        num_layers: usize,
+    ) -> Result<Array, Exception> {
         // Embed with muP scaling
         let mut h = self
             .embed_tokens
@@ -187,7 +199,10 @@ impl MiniCPMSALAModel {
             }
         };
 
-        for (layer, cache) in self.layers.iter_mut().zip(caches.iter_mut()) {
+        for (layer, cache) in self.layers[..num_layers]
+            .iter_mut()
+            .zip(caches[..num_layers].iter_mut())
+        {
             h = layer.forward(&h, mask.as_ref(), cache)?;
         }
 
@@ -264,6 +279,22 @@ impl Model {
         // muP logits scaling: lm_head(hidden / logits_scale)
         let scaled = out.multiply(array!(1.0 / self.logits_scale))?;
 
+        match self.lm_head.as_mut() {
+            Some(lm_head) => lm_head.forward(&scaled),
+            None => self.model.embed_tokens.as_linear(&scaled),
+        }
+    }
+
+    /// Draft forward: process through only the first `num_layers` layers.
+    /// Used for self-speculative decoding where early layers act as a draft model.
+    pub fn forward_draft(
+        &mut self,
+        inputs: &Array,
+        caches: &mut [LayerCache],
+        num_layers: usize,
+    ) -> Result<Array, Exception> {
+        let out = self.model.forward_partial(inputs, None, caches, num_layers)?;
+        let scaled = out.multiply(array!(1.0 / self.logits_scale))?;
         match self.lm_head.as_mut() {
             Some(lm_head) => lm_head.forward(&scaled),
             None => self.model.embed_tokens.as_linear(&scaled),

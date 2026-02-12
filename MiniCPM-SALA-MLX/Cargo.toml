@@ -29,5 +29,13 @@ name = "batch_generate"
 path = "examples/batch_generate.rs"
 
 [[example]]
+name = "chat"
+path = "examples/chat.rs"
+
+[[example]]
+name = "speculative_generate"
+path = "examples/speculative_generate.rs"
+
+[[example]]
 name = "test_rope_batch"
 path = "examples/test_rope_batch.rs"
