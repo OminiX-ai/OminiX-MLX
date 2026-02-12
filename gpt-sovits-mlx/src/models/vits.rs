@@ -2764,7 +2764,15 @@ pub fn load_vits_model(weights_path: impl AsRef<Path>) -> Result<SynthesizerTrn,
     let path = weights_path.as_ref();
 
     // Load weights first to detect semantic_frame_rate
-    let weights = Array::load_safetensors(path)?;
+    // Convert float16 → float32 for numerical stability (attention softmax, layer norm, flow)
+    let raw_weights = Array::load_safetensors(path)?;
+    let weights: HashMap<String, Array> = raw_weights
+        .into_iter()
+        .map(|(k, v)| {
+            let v32 = v.as_type::<f32>().unwrap_or(v);
+            (k, v32)
+        })
+        .collect();
 
     // Auto-detect semantic_frame_rate from ssl_proj.weight shape
     // - 25hz models: ssl_proj.weight is [768, 768, 2] (kernel=2, after transpose)
@@ -2807,7 +2815,14 @@ pub fn load_vits_model_with_finetuned(
     let mut model = load_vits_model(&pretrained_path)?;
 
     // Then overlay finetuned weights (only dec, ref_enc, ssl_proj will be present)
-    let finetuned_weights = Array::load_safetensors(finetuned_path.as_ref())?;
+    let raw_ft = Array::load_safetensors(finetuned_path.as_ref())?;
+    let finetuned_weights: HashMap<String, Array> = raw_ft
+        .into_iter()
+        .map(|(k, v)| {
+            let v32 = v.as_type::<f32>().unwrap_or(v);
+            (k, v32)
+        })
+        .collect();
     load_vits_weights(&mut model, &finetuned_weights)?;
 
     Ok(model)

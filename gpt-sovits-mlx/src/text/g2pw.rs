@@ -18,14 +18,13 @@ static G2PW: OnceLock<Mutex<Option<G2PWConverter>>> = OnceLock::new();
 /// Returns a vector of Option<String> for each character (None for non-Chinese or unknown chars)
 pub fn get_pinyin_with_g2pw(sentence: &str) -> Vec<Option<String>> {
     let mutex = G2PW.get_or_init(|| {
+        // Build dynamic home-based path
+        let home = std::env::var("HOME").unwrap_or_else(|_| "/tmp".to_string());
+        let home_dora = format!("{}/.dora/models/primespeech/G2PWModel", home);
+
         // Try to load G2PW model from common locations
         let model_paths = [
-            // Primary location - user's .dora models directory
-            "/Users/yuechen/.dora/models/primespeech/G2PWModel",
-            // Alternative locations
-            "/Users/yuechen/home/mofa-studio/node-hub/dora-primespeech/dora_primespeech/moyoyo_tts/text/G2PWModel",
-            "/Users/yuechen/home/conversation/dora/node-hub/dora-primespeech/dora_primespeech/moyoyo_tts/text/G2PWModel",
-            "/Users/yuechen/home/VoiceDialogue11/third_party/moyoyo_tts/text/G2PWModel",
+            home_dora.as_str(),
         ];
 
         for path in model_paths {
