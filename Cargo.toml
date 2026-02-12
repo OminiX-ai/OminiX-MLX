@@ -40,6 +40,9 @@ members = [
     "qwen-image-mlx",
     "gpt-sovits-mlx",
     "step-audio2-mlx",
+    "glm-4.7-flash-mlx",
+    "moxin-vlm-mlx",
+    "MiniCPM-SALA-MLX",
     "xtask",
 ]
 
