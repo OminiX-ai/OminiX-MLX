@@ -17,6 +17,10 @@ tokenizers = "0.21"
 [dev-dependencies]
 mlx-lm-utils = { path = "../mlx-rs/mlx-lm-utils" }
 anyhow = "1"
+tokio = { version = "1", features = ["full"] }
+hyper = { version = "1", features = ["full"] }
+hyper-util = { version = "0.1", features = ["tokio"] }
+http-body-util = "0.1"
 
 [[example]]
 name = "generate_qwen3"
@@ -25,3 +29,7 @@ path = "examples/generate_qwen3.rs"
 [[example]]
 name = "chat_qwen3"
 path = "examples/chat_qwen3.rs"
+
+[[example]]
+name = "a2ui_bridge"
+path = "examples/a2ui_bridge.rs"

@@ -1,7 +1,7 @@
 //! Qwen-Image generation example (4-bit quantized)
 //!
 //! Model path can be set via environment variable:
-//!   export DORA_MODELS_PATH=~/.dora/models
+//!   export DORA_MODELS_PATH=~/.OminiX/models
 //!
 //! Expected directory structure:
 //!   $DORA_MODELS_PATH/qwen-image-2512-4bit/
@@ -106,7 +106,7 @@ fn get_model_dir(repo_id: &str) -> std::io::Result<PathBuf> {
 
     // Check default dora location
     if let Some(home) = dirs::home_dir() {
-        let dora_path = home.join(".dora").join("models").join(dora_model_name);
+        let dora_path = home.join(".OminiX").join("models").join(dora_model_name);
         if dora_path.join("transformer").exists() {
             return Ok(dora_path);
         }
@@ -149,7 +149,7 @@ fn get_model_dir(repo_id: &str) -> std::io::Result<PathBuf> {
         format!(
             "Model not found. Please either:\n  \
              1. Set DORA_MODELS_PATH and place model in $DORA_MODELS_PATH/{}/\n  \
-             2. Place model in ~/.dora/models/{}/\n  \
+             2. Place model in ~/.OminiX/models/{}/\n  \
              3. Download with: huggingface-cli download {}",
             dora_model_name, dora_model_name, repo_id
         ),

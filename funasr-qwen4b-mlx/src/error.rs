@@ -1,9 +1,9 @@
-//! Error types for funasr-nano-mlx.
+//! Error types for funasr-qwen4b-mlx.
 
 use std::path::PathBuf;
 use thiserror::Error;
 
-/// Error type for Fun-ASR-Nano operations.
+/// Error type for FunASR-Qwen4B operations.
 #[derive(Debug, Error)]
 pub enum Error {
     /// MLX operation error
@@ -90,7 +90,7 @@ pub enum Error {
     Streaming(String),
 }
 
-/// Result type alias for Fun-ASR-Nano operations.
+/// Result type alias for FunASR-Qwen4B operations.
 pub type Result<T> = std::result::Result<T, Error>;
 
 impl Error {

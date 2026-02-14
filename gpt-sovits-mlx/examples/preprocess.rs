@@ -71,19 +71,19 @@ struct Args {
     output: PathBuf,
 
     /// Path to HuBERT weights
-    #[arg(long, default_value = "~/.dora/models/primespeech/gpt-sovits-mlx/hubert.safetensors")]
+    #[arg(long, default_value = "~/.OminiX/models/gpt-sovits-mlx/hubert.safetensors")]
     hubert_weights: String,
 
     /// Path to VITS weights (for quantizer codebook)
-    #[arg(long, default_value = "~/.dora/models/primespeech/gpt-sovits-mlx/vits_pretrained_v2.safetensors")]
+    #[arg(long, default_value = "~/.OminiX/models/gpt-sovits-mlx/vits_pretrained_v2.safetensors")]
     vits_weights: String,
 
     /// Path to BERT weights
-    #[arg(long, default_value = "~/.dora/models/primespeech/gpt-sovits-mlx/bert.safetensors")]
+    #[arg(long, default_value = "~/.OminiX/models/gpt-sovits-mlx/bert.safetensors")]
     bert_weights: String,
 
     /// Path to BERT tokenizer
-    #[arg(long, default_value = "~/.dora/models/primespeech/gpt-sovits-mlx/chinese-roberta-tokenizer/tokenizer.json")]
+    #[arg(long, default_value = "~/.OminiX/models/gpt-sovits-mlx/chinese-roberta-tokenizer/tokenizer.json")]
     bert_tokenizer: String,
 
     /// Also save HuBERT features (for VITS training)
@@ -368,7 +368,7 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
     println!("To train T2S:");
     println!("  cargo run --release --example train_t2s -- \\");
     println!("      --data-dir {:?} \\", args.output);
-    println!("      --pretrained ~/.dora/models/primespeech/gpt-sovits-mlx/t2s.safetensors \\");
+    println!("      --pretrained ~/.OminiX/models/gpt-sovits-mlx/t2s.safetensors \\");
     println!("      --output t2s_finetuned.safetensors");
 
     Ok(())

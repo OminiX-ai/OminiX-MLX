@@ -1,4 +1,4 @@
-//! Audio processing utilities for Fun-ASR-Nano.
+//! Audio processing utilities for FunASR-Qwen4B.
 //!
 //! This module provides:
 //! - Audio file loading (WAV)
@@ -547,7 +547,7 @@ pub fn apply_cmvn(features: &Array, cmvn_path: &str) -> Result<Array> {
 /// Input: [batch, n_mels, n_frames]
 /// Output: [batch, n_frames/n, n_mels * m]
 ///
-/// For Fun-ASR-Nano: m=7, n=6, producing 560-dim features (80 * 7).
+/// For FunASR-Qwen4B: m=7, n=6, producing 560-dim features (80 * 7).
 pub fn apply_lfr(mel: &Array, lfr_m: usize, lfr_n: usize) -> Result<Array> {
     let shape = mel.shape();
     let batch = shape[0] as usize;
@@ -645,7 +645,7 @@ mod tests {
     fn test_mel_frontend_creation() {
         let config = AudioConfig::default();
         let frontend = MelFrontend::new(config);
-        assert_eq!(frontend.n_freqs, 201);  // 400/2 + 1
+        assert_eq!(frontend.n_freqs, 257);  // 512/2 + 1
     }
 
     #[test]
@@ -710,7 +710,7 @@ mod tests {
         let config = AudioConfig::default();
         assert_eq!(config.sample_rate, 16000);
         assert_eq!(config.n_mels, 80);
-        assert_eq!(config.n_fft, 400);
+        assert_eq!(config.n_fft, 512);
         assert_eq!(config.hop_length, 160);
         assert_eq!(config.max_length, 30.0);
     }

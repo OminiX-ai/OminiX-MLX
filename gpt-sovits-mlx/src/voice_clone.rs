@@ -121,13 +121,13 @@ pub struct VoiceClonerConfig {
 }
 
 /// Get the default model directory path
-/// Uses $GPT_SOVITS_MODEL_DIR if set, otherwise ~/.dora/models/primespeech/gpt-sovits-mlx
+/// Uses $GPT_SOVITS_MODEL_DIR if set, otherwise ~/.OminiX/models/gpt-sovits-mlx
 fn default_model_dir() -> String {
     if let Ok(dir) = std::env::var("GPT_SOVITS_MODEL_DIR") {
         return dir;
     }
     if let Some(home) = std::env::var_os("HOME") {
-        return format!("{}/.dora/models/primespeech/gpt-sovits-mlx", home.to_string_lossy());
+        return format!("{}/.OminiX/models/gpt-sovits-mlx", home.to_string_lossy());
     }
     // Fallback
     "/tmp/gpt-sovits-mlx".to_string()

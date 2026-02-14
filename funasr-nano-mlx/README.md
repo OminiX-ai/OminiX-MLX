@@ -165,6 +165,14 @@ On Apple M3 Max:
 | Memory (4-bit) | ~2-3 GB |
 | Real-time factor | < 0.1 |
 
+## Troubleshooting
+
+If transcription produces garbage output, see [MLX Inference Fixes](docs/MLX_INFERENCE_FIXES.md) for common issues:
+
+- Audio preprocessing mismatch (most common)
+- Float16 precision drift in deep encoders
+- Model path case sensitivity
+
 ## References
 
 - [Fun-ASR GitHub](https://github.com/FunAudioLLM/Fun-ASR)

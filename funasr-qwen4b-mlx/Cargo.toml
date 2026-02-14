@@ -36,6 +36,13 @@ rand = "0.8"     # Dithering for FunASR-compatible preprocessing
 # Path utilities
 dirs = "5"
 
+# Punctuation restoration (CT-Transformer via ONNX)
+funasr-mlx = { path = "../funasr-mlx", features = ["punctuation"], optional = true }
+
+[features]
+default = ["punctuation"]
+punctuation = ["funasr-mlx"]
+
 [dev-dependencies]
 anyhow = "1"
 

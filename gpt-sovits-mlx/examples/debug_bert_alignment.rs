@@ -7,7 +7,7 @@ use tokenizers::Tokenizer;
 
 fn main() {
     // Load the BERT tokenizer
-    let tokenizer_path = "~/.dora/models/primespeech/gpt-sovits-mlx/chinese-roberta-tokenizer/tokenizer.json";
+    let tokenizer_path = "~/.OminiX/models/gpt-sovits-mlx/chinese-roberta-tokenizer/tokenizer.json";
 
     if !Path::new(tokenizer_path).exists() {
         eprintln!("Tokenizer not found at {}", tokenizer_path);

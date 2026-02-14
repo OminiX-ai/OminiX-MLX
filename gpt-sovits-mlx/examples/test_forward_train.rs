@@ -9,7 +9,7 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
     println!("Testing T2S forward_train...\n");
 
     // Load pretrained model
-    let model_path = "~/.dora/models/primespeech/gpt-sovits-mlx/doubao_mixed_gpt_new.safetensors";
+    let model_path = "~/.OminiX/models/gpt-sovits-mlx/doubao_mixed_gpt_new.safetensors";
     println!("Loading model from: {}", model_path);
 
     let mut model = load_t2s_model(model_path)?;

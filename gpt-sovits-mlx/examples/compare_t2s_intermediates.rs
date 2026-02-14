@@ -35,7 +35,7 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
     }
 
     // Load T2S model
-    let t2s_path = "~/.dora/models/primespeech/gpt-sovits-mlx/doubao_mixed_gpt_new.safetensors";
+    let t2s_path = "~/.OminiX/models/gpt-sovits-mlx/doubao_mixed_gpt_new.safetensors";
     let mut t2s = load_t2s_model(t2s_path)?;
     let config = T2SConfig::default();
     println!("\nT2S config: hidden_size={}, num_layers={}", config.hidden_size, config.num_layers);

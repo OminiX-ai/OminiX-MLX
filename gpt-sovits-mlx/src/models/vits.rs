@@ -292,10 +292,11 @@ impl RVQCodebook {
     /// Input: features [batch, dim, seq]
     /// Output: codes [batch, 1, seq]
     ///
-    /// This finds the nearest codebook entry for each feature vector.
+    /// Uses cosine similarity (L2-normalized dot product) to match
+    /// Python GPT-SoVITS VectorQuantize(use_cosine_sim=True).
     pub fn encode(&self, features: &Array) -> Result<Array, Exception> {
         use mlx_rs::transforms::eval;
-        use mlx_rs::ops::{sum_axis, indexing::argmin_axis};
+        use mlx_rs::ops::{sum_axis, maximum, indexing::argmax_axis_device};
 
         let shape = features.shape();
         let batch = shape[0] as i32;
@@ -307,33 +308,25 @@ impl RVQCodebook {
         // Reshape to [batch * seq, dim]
         let flat_features = features_t.reshape(&[batch * seq, dim])?;
 
-        // Compute L2 distances to each codebook entry
-        // embed: [codebook_size, dim]
-        // flat_features: [batch * seq, dim]
-        //
-        // ||a - b||^2 = ||a||^2 + ||b||^2 - 2 * a . b
-        //
-        // features_sq: [batch * seq, 1]
-        let features_sq = sum_axis(&flat_features.multiply(&flat_features)?, -1, true)?;
+        // L2-normalize features: feat / ||feat||
+        let feat_norm = sum_axis(&flat_features.multiply(&flat_features)?, -1, true)?;
+        let eps = array!(1e-8f32);
+        let feat_norm = maximum(&feat_norm.sqrt()?, &eps)?;
+        let flat_normed = flat_features.divide(&feat_norm)?;
 
-        // embed_sq: [1, codebook_size]
-        let embed_sq = sum_axis(&self.embed.multiply(&self.embed)?, -1, true)?;
-        let embed_sq = embed_sq.transpose()?;
+        // L2-normalize codebook embeddings: embed / ||embed||
+        let embed_norm = sum_axis(&self.embed.multiply(&self.embed)?, -1, true)?;
+        let embed_norm = maximum(&embed_norm.sqrt()?, &eps)?;
+        let embed_normed = self.embed.divide(&embed_norm)?;
 
-        // dot product: [batch * seq, dim] @ [dim, codebook_size] = [batch * seq, codebook_size]
-        let embed_t = self.embed.transpose()?;
-        let dot = matmul(&flat_features, &embed_t)?;
+        // Cosine similarity: [batch * seq, dim] @ [dim, codebook_size]
+        let embed_t = embed_normed.transpose()?;
+        let similarity = matmul(&flat_normed, &embed_t)?;
 
-        // distances: [batch * seq, codebook_size]
-        let distances = features_sq
-            .add(&embed_sq)?
-            .subtract(&dot.multiply(array!(2.0f32))?)?;
+        eval([&similarity])?;
 
-        eval([&distances])?;
-
-        // Find argmin for each position
-        // codes: [batch * seq]
-        let codes = argmin_axis(&distances, -1, false)?;
+        // Find argmax (highest cosine similarity)
+        let codes = argmax_axis_device(&similarity, -1, false, mlx_rs::StreamOrDevice::default())?;
         let codes = codes.as_type::<i32>()?;
 
         // Reshape to [batch, 1, seq]

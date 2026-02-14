@@ -94,7 +94,7 @@ fn main() {
     eprintln!();
 
     // Stage 4: BERT features
-    let bert_model_dir = "~/.dora/models/primespeech/gpt-sovits-mlx";
+    let bert_model_dir = "~/.OminiX/models/gpt-sovits-mlx";
     let tokenizer_path = format!("{}/chinese-roberta-tokenizer/tokenizer.json", bert_model_dir);
     eprintln!("[Stage 4] BERT Features:");
     let bert_features = if Path::new(&tokenizer_path).exists() {

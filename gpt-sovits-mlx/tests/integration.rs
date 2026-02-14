@@ -20,7 +20,7 @@ fn models_available() -> bool {
 
 /// Test helper: check if reference audio exists
 fn reference_audio_available() -> bool {
-    Path::new("/Users/yuechen/.dora/models/primespeech/moyoyo/ref_audios/doubao_ref_mix_new.wav").exists()
+    Path::new("/Users/yuechen/.OminiX/models/moyoyo/ref_audios/doubao_ref_mix_new.wav").exists()
 }
 
 // ============================================================================
@@ -143,7 +143,7 @@ fn test_synthesize_chinese() {
     let mut cloner = VoiceCloner::new(config).expect("Failed to create VoiceCloner");
 
     cloner.set_reference_audio(
-        "/Users/yuechen/.dora/models/primespeech/moyoyo/ref_audios/doubao_ref_mix_new.wav"
+        "/Users/yuechen/.OminiX/models/moyoyo/ref_audios/doubao_ref_mix_new.wav"
     ).expect("Failed to set reference audio");
 
     let audio = cloner.synthesize("你好世界").expect("Synthesis failed");
@@ -176,7 +176,7 @@ fn test_synthesize_mixed_language() {
     let mut cloner = VoiceCloner::new(config).expect("Failed to create VoiceCloner");
 
     cloner.set_reference_audio(
-        "/Users/yuechen/.dora/models/primespeech/moyoyo/ref_audios/doubao_ref_mix_new.wav"
+        "/Users/yuechen/.OminiX/models/moyoyo/ref_audios/doubao_ref_mix_new.wav"
     ).expect("Failed to set reference audio");
 
     // Mixed Chinese and English
@@ -198,7 +198,7 @@ fn test_synthesize_with_cancellation() {
     let mut cloner = VoiceCloner::new(config).expect("Failed to create VoiceCloner");
 
     cloner.set_reference_audio(
-        "/Users/yuechen/.dora/models/primespeech/moyoyo/ref_audios/doubao_ref_mix_new.wav"
+        "/Users/yuechen/.OminiX/models/moyoyo/ref_audios/doubao_ref_mix_new.wav"
     ).expect("Failed to set reference audio");
 
     // Create a pre-cancelled token

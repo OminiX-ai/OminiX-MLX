@@ -48,13 +48,14 @@ Built for production use with zero Python dependencies at inference time.
         │                           │                           │
         ▼                           ▼                           ▼
 ┌───────────────┐         ┌─────────────────┐         ┌─────────────────┐
-│   LLM Crates  │         │   Audio Crates  │         │  Image Crates   │
+│  LLM / VLM    │         │   Audio Crates  │         │  Image Crates   │
 ├───────────────┤         ├─────────────────┤         ├─────────────────┤
 │ qwen3-mlx     │         │ funasr-mlx      │         │ flux-klein-mlx  │
 │ glm4-mlx      │         │ funasr-nano-mlx │         │ zimage-mlx      │
 │ glm4-moe-mlx  │         │ gpt-sovits-mlx  │         │ qwen-image-mlx  │
 │ mixtral-mlx   │         │                 │         │                 │
 │ mistral-mlx   │         │                 │         │                 │
+│ moxin-vlm-mlx │         │                 │         │                 │
 └───────┬───────┘         └────────┬────────┘         └────────┬────────┘
         │                          │                           │
         └──────────────────────────┼───────────────────────────┘
@@ -155,6 +156,7 @@ OminiX-MLX/
 ├── glm4-moe-mlx/        # GLM4-MoE (45 experts)
 ├── mixtral-mlx/         # Mixtral 8x7B/8x22B
 ├── mistral-mlx/         # Mistral 7B
+├── moxin-vlm-mlx/       # Moxin-7B VLM (vision-language)
 │
 ├── gpt-sovits-mlx/      # GPT-SoVITS voice cloning
 ├── funasr-mlx/          # FunASR Paraformer ASR
@@ -177,6 +179,12 @@ OminiX-MLX/
 | GLM-4-MoE | `glm4-moe-mlx` | 9B | 45 expert MoE |
 | Mixtral | `mixtral-mlx` | 8x7B, 8x22B | MoE architecture |
 | Mistral | `mistral-mlx` | 7B | Sliding window attention |
+
+### Vision-Language Models (VLMs)
+
+| Model | Crate | Sizes | Notes |
+|-------|-------|-------|-------|
+| Moxin-7B VLM | `moxin-vlm-mlx` | 7B | DINOv2 + SigLIP + Mistral-7B, 8-bit quantization, 30 tok/s |
 
 ### Speech Recognition (ASR)
 
@@ -295,6 +303,41 @@ let audio = cloner.synthesize("Hello, world!")?;
 cloner.save_wav(&audio, "output.wav")?;
 ```
 
+### Vision-Language Model
+
+```bash
+# Download 8-bit quantized Moxin-7B VLM
+huggingface-cli download moxin-org/Moxin-7B-VLM-8bit-mlx --local-dir ./models/Moxin-7B-VLM-8bit-mlx
+
+# Run VLM inference with 8-bit quantization
+cargo run --release -p moxin-vlm-mlx --example generate -- \
+    --model ./models/Moxin-7B-VLM-hf \
+    --image ./photo.jpg \
+    --prompt "What is in this image?" \
+    --quantize 8
+```
+
+```rust
+use moxin_vlm_mlx::{load_model, load_tokenizer, normalize_dino, normalize_siglip, Generate, KVCache};
+
+let mut vlm = load_model("./models/Moxin-7B-VLM-hf")?;
+let vlm = vlm.quantize(64, 8)?; // 8-bit quantization
+let tokenizer = load_tokenizer("./models/Moxin-7B-VLM-hf")?;
+
+// Preprocess image to [1, 224, 224, 3] and normalize
+let dino_img = normalize_dino(&tensor)?;
+let siglip_img = normalize_siglip(&tensor)?;
+
+// Generate
+let mut cache: Vec<KVCache> = Vec::new();
+let generator = Generate::new(&mut vlm, &mut cache, 0.0, dino_img, siglip_img, input_ids);
+
+for token in generator.take(256) {
+    let token = token?;
+    print!("{}", tokenizer.decode(&[token.item::<u32>()], true)?);
+}
+```
+
 ### Image Generation
 
 ```bash
@@ -320,6 +363,7 @@ Benchmarks on Apple M3 Max (128GB):
 | LLM | Qwen3-4B | 45 tok/s | 8GB |
 | LLM | GLM4-9B-4bit | 35 tok/s | 6GB |
 | LLM | Mixtral-8x7B-4bit | 25 tok/s | 26GB |
+| VLM | Moxin-7B-8bit | 30 tok/s | 10GB |
 | ASR | Paraformer | 18x real-time | 500MB |
 | TTS | GPT-SoVITS | 4x real-time | 2GB |
 | Image | Z-Image | ~3s/image | 8GB |
@@ -335,6 +379,7 @@ Benchmarks on Apple M3 Max (128GB):
 | glm4-moe-mlx | [README](glm4-moe-mlx/README.md) | GLM4-MoE |
 | mixtral-mlx | [README](mixtral-mlx/README.md) | Mixtral MoE |
 | mistral-mlx | [README](mistral-mlx/README.md) | Mistral 7B |
+| moxin-vlm-mlx | [README](moxin-vlm-mlx/README.md) | Moxin-7B VLM |
 | funasr-mlx | [README](funasr-mlx/README.md) | Paraformer ASR |
 | funasr-nano-mlx | [README](funasr-nano-mlx/README.md) | FunASR-Nano |
 | gpt-sovits-mlx | [README](gpt-sovits-mlx/README.md) | Voice cloning |

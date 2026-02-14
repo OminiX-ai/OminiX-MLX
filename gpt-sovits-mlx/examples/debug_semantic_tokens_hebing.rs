@@ -19,7 +19,7 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
     let mut cloner = VoiceCloner::new(config)?;
 
     // Reference audio is required for voice cloning
-    let ref_audio_path = "~/.dora/models/primespeech/gpt-sovits-mlx/doubao_ref.wav";
+    let ref_audio_path = "~/.OminiX/models/gpt-sovits-mlx/doubao_ref.wav";
     let ref_text = "今天天气真好啊！";
 
     if !Path::new(ref_audio_path).exists() {

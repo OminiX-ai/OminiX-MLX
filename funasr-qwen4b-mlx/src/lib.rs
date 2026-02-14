@@ -11,7 +11,6 @@ pub mod audio;
 pub mod error;
 pub mod sensevoice_encoder;
 pub mod adaptor;
-pub mod qwen4b;  // Keep for backward compatibility, but prefer qwen3-mlx
 pub mod model;
 
 pub use error::{Error, Result};

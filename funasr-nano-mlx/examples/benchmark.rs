@@ -3,7 +3,7 @@
 //! Usage:
 //!   cargo run --release --example benchmark -- <audio.wav> [iterations]
 //!
-//! Model path: Uses FUNASR_NANO_MODEL_PATH env var or ~/.dora/models/funasr-nano
+//! Model path: Uses FUNASR_NANO_MODEL_PATH env var or ~/.OminiX/models/funasr-nano
 
 use std::env;
 use std::time::Instant;

@@ -106,3 +106,7 @@ path = "examples/export_vits_onnx.rs"
 [[example]]
 name = "preprocess_audio"
 path = "examples/preprocess_audio.rs"
+
+[[example]]
+name = "finetune_clone"
+path = "examples/finetune_clone.rs"

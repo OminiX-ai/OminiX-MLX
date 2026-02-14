@@ -6,7 +6,7 @@
 //! Model path resolution:
 //!   1. Command line argument (if provided)
 //!   2. FUNASR_NANO_MODEL_PATH environment variable
-//!   3. ~/.dora/models/funasr-nano (default)
+//!   3. ~/.OminiX/models/funasr-nano (default)
 
 use funasr_nano_mlx::{FunASRNano, default_model_path};
 use std::time::Instant;

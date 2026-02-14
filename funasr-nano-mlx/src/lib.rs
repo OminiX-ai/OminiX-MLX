@@ -15,7 +15,7 @@
 //!
 //! The model path can be configured via:
 //! 1. Environment variable `FUNASR_NANO_MODEL_PATH`
-//! 2. Default location: `~/.dora/models/funasr-nano`
+//! 2. Default location: `~/.OminiX/models/funasr-nano`
 //!
 //! ## Example
 //!
@@ -49,14 +49,14 @@ pub use mlx_rs_core::{KVCache, ConcatKeyValueCache};
 /// Environment variable name for model path
 pub const MODEL_PATH_ENV: &str = "FUNASR_NANO_MODEL_PATH";
 
-/// Default model directory under ~/.dora/models
+/// Default model directory under ~/.OminiX/models
 pub const DEFAULT_MODEL_DIR: &str = "funasr-nano";
 
 /// Get the default model path.
 ///
 /// Resolution order:
 /// 1. `FUNASR_NANO_MODEL_PATH` environment variable
-/// 2. `~/.dora/models/funasr-nano`
+/// 2. `~/.OminiX/models/funasr-nano`
 ///
 /// # Example
 ///
@@ -71,9 +71,9 @@ pub fn default_model_path() -> std::path::PathBuf {
         return std::path::PathBuf::from(path);
     }
 
-    // Fall back to ~/.dora/models/funasr-nano
+    // Fall back to ~/.OminiX/models/funasr-nano
     if let Some(home) = dirs::home_dir() {
-        return home.join(".dora").join("models").join(DEFAULT_MODEL_DIR);
+        return home.join(".OminiX").join("models").join(DEFAULT_MODEL_DIR);
     }
 
     // Last resort: current directory

@@ -10,8 +10,11 @@ fn main() -> Result<()> {
     println!("=== SenseVoice Encoder Weight Loading Test ===\n");
 
     // Path to funasr-nano model weights
-    let weights_path = std::env::var("SENSEVOICE_WEIGHTS")
-        .unwrap_or_else(|_| "/Users/yuechen/.dora/models/funasr-nano/model.safetensors".to_string());
+    let weights_path = std::env::var("SENSEVOICE_WEIGHTS").unwrap_or_else(|_| {
+        dirs::home_dir().unwrap_or_default()
+            .join(".OminiX/models/funasr-nano/model.safetensors")
+            .to_string_lossy().to_string()
+    });
 
     if !std::path::Path::new(&weights_path).exists() {
         println!("Weights not found: {}", weights_path);

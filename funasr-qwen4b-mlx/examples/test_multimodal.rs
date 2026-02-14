@@ -19,7 +19,11 @@ fn main() -> Result<()> {
 
     // Paths
     let qwen_path = "models/Qwen3-4B";
-    let sensevoice_path = "/Users/yuechen/.dora/models/funasr-nano/model.safetensors";
+    let sensevoice_path = std::env::var("SENSEVOICE_WEIGHTS").unwrap_or_else(|_| {
+        dirs::home_dir().unwrap_or_default()
+            .join(".OminiX/models/funasr-nano/model.safetensors")
+            .to_string_lossy().to_string()
+    });
     let adaptor_path = "adaptor_phase2_final.safetensors";
 
     // Check Qwen3 model exists
@@ -38,8 +42,8 @@ fn main() -> Result<()> {
     println!("   Qwen3-4B loaded");
 
     let mut encoder = SenseVoiceEncoder::new(SenseVoiceEncoderConfig::default())?;
-    if std::path::Path::new(sensevoice_path).exists() {
-        encoder.load_weights(sensevoice_path)?;
+    if std::path::Path::new(&sensevoice_path).exists() {
+        encoder.load_weights(&sensevoice_path)?;
         println!("   SenseVoice encoder loaded");
     }
 

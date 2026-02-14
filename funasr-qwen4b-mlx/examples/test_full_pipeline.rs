@@ -11,11 +11,15 @@ fn main() -> Result<()> {
     println!("=== Full ASR Pipeline Test ===\n");
 
     // Paths
-    let sensevoice_path = "/Users/yuechen/.dora/models/funasr-nano/model.safetensors";
+    let sensevoice_path = std::env::var("SENSEVOICE_WEIGHTS").unwrap_or_else(|_| {
+        dirs::home_dir().unwrap_or_default()
+            .join(".OminiX/models/funasr-nano/model.safetensors")
+            .to_string_lossy().to_string()
+    });
     let adaptor_path = "adaptor_phase2_final.safetensors";
 
     // Check paths
-    if !std::path::Path::new(sensevoice_path).exists() {
+    if !std::path::Path::new(&sensevoice_path).exists() {
         println!("SenseVoice weights not found: {}", sensevoice_path);
         return Ok(());
     }
@@ -23,7 +27,7 @@ fn main() -> Result<()> {
     // 1. Load SenseVoice Encoder
     println!("1. Loading SenseVoice Encoder...");
     let mut encoder = SenseVoiceEncoder::new(SenseVoiceEncoderConfig::default())?;
-    encoder.load_weights(sensevoice_path)?;
+    encoder.load_weights(&sensevoice_path)?;
     println!("   SenseVoice encoder loaded (70 layers, 512-dim output)");
 
     // 2. Load Adaptor

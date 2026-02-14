@@ -33,7 +33,7 @@ use serde::Deserialize;
 use tracing::{debug, error, info, warn};
 
 // Default config file location (can be overridden by VOICES_CONFIG env var)
-const DEFAULT_VOICES_CONFIG: &str = "~/.dora/models/primespeech/voices.json";
+const DEFAULT_VOICES_CONFIG: &str = "~/.OminiX/models/voices.json";
 const VOICES_CONFIG_ENV: &str = "VOICES_CONFIG";
 
 /// Voice configuration from JSON
@@ -72,7 +72,7 @@ fn default_voice() -> String {
 }
 
 fn default_base_path() -> String {
-    "~/.dora/models/primespeech".to_string()
+    "~/.OminiX/models".to_string()
 }
 
 impl VoicesConfig {

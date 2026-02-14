@@ -19,7 +19,20 @@ clap = { version = "4", features = ["derive"] }
 hf-hub = "0.4"
 anyhow = "1"
 image = "0.25"
+hyper = { version = "1", features = ["full"] }
+hyper-util = { version = "0.1", features = ["tokio"] }
+http-body-util = "0.1"
+tokio = { version = "1", features = ["full"] }
+base64 = "0.22"
 
 [[example]]
 name = "generate"
 path = "examples/generate.rs"
+
+[[example]]
+name = "save_quantized"
+path = "examples/save_quantized.rs"
+
+[[example]]
+name = "server"
+path = "examples/server.rs"

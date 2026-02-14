@@ -9,7 +9,7 @@
 //!   python scripts/merge_instruct_weights.py
 //!
 //!   # Then run this test:
-//!   FUNASR_NANO_MODEL_PATH=~/.dora/models/funasr-nano-instruct \
+//!   FUNASR_NANO_MODEL_PATH=~/.OminiX/models/funasr-nano-instruct \
 //!     cargo run --release --example test_instruct_swap
 
 use std::env;

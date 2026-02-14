@@ -5,7 +5,7 @@ use mlx_rs::{Array, transforms::eval, module::ModuleParameters};
 fn main() {
     println!("Testing VITS weight normalization statistics...\n");
 
-    let pre_path = "/Users/yuechen/.dora/models/primespeech/gpt-sovits-mlx/vits_pretrained_v2.safetensors";
+    let pre_path = "/Users/yuechen/.OminiX/models/gpt-sovits-mlx/vits_pretrained_v2.safetensors";
     let ft_path = "/tmp/vits_weightnorm.generator.safetensors";
 
     // Load pretrained

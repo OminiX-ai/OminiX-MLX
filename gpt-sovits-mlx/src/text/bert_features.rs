@@ -212,7 +212,7 @@ mod tests {
     #[test]
     fn test_tokenize_chinese() {
         // This test requires the tokenizer file
-        let tokenizer_path = "~/.dora/models/primespeech/gpt-sovits-mlx/chinese-roberta-tokenizer/tokenizer.json";
+        let tokenizer_path = "~/.OminiX/models/gpt-sovits-mlx/chinese-roberta-tokenizer/tokenizer.json";
         if !Path::new(tokenizer_path).exists() {
             println!("Skipping test: tokenizer not found at {}", tokenizer_path);
             return;
@@ -232,8 +232,8 @@ mod tests {
 
     #[test]
     fn test_word2ph_validation() {
-        let tokenizer_path = "~/.dora/models/primespeech/gpt-sovits-mlx/chinese-roberta-tokenizer/tokenizer.json";
-        let model_path = "~/.dora/models/primespeech/gpt-sovits-mlx/bert.safetensors";
+        let tokenizer_path = "~/.OminiX/models/gpt-sovits-mlx/chinese-roberta-tokenizer/tokenizer.json";
+        let model_path = "~/.OminiX/models/gpt-sovits-mlx/bert.safetensors";
 
         if !Path::new(tokenizer_path).exists() || !Path::new(model_path).exists() {
             println!("Skipping test: required files not found");

@@ -14,7 +14,7 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
 
     // Initialize with doubao model
     let config = VoiceClonerConfig {
-        model_path: "/Users/yuechen/.dora/models/primespeech/moyoyo".to_string(),
+        model_path: "/Users/yuechen/.OminiX/models/moyoyo".to_string(),
         voice_name: "doubao".to_string(),
         debug: true,
         ..Default::default()
@@ -25,7 +25,7 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
     println!("Initialized in {:?}\n", start.elapsed());
 
     // Load reference
-    let ref_audio = "/Users/yuechen/.dora/models/primespeech/moyoyo/ref_audios/doubao_ref_mix_new.wav";
+    let ref_audio = "/Users/yuechen/.OminiX/models/moyoyo/ref_audios/doubao_ref_mix_new.wav";
     let ref_text = "这家resturant的steak很有名，但是vegetable salad的price有点贵";
     cloner.load_reference_with_python_codes(ref_audio, ref_text, None)?;
 

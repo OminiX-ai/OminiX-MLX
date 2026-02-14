@@ -1,4 +1,4 @@
-//! SenseVoice encoder for Fun-ASR-Nano.
+//! SenseVoice encoder for FunASR-Qwen4B.
 //!
 //! This encoder uses SAN-M (Self-Attention with Memory) attention,
 //! which combines multi-head self-attention with FSMN memory blocks.
@@ -535,21 +535,21 @@ impl SenseVoiceEncoder {
 
         // Load after_norm
         if let Some(w) = weights.get("encoder.after_norm.weight") {
-            *self.after_norm.weight = Some(w.clone());
+            *self.after_norm.weight = Some(Self::to_f32(w));
             loaded_count += 1;
         }
         if let Some(w) = weights.get("encoder.after_norm.bias") {
-            *self.after_norm.bias = Some(w.clone());
+            *self.after_norm.bias = Some(Self::to_f32(w));
             loaded_count += 1;
         }
 
         // Load tp_norm
         if let Some(w) = weights.get("encoder.tp_norm.weight") {
-            *self.tp_norm.weight = Some(w.clone());
+            *self.tp_norm.weight = Some(Self::to_f32(w));
             loaded_count += 1;
         }
         if let Some(w) = weights.get("encoder.tp_norm.bias") {
-            *self.tp_norm.bias = Some(w.clone());
+            *self.tp_norm.bias = Some(Self::to_f32(w));
             loaded_count += 1;
         }
 
@@ -562,6 +562,15 @@ impl SenseVoiceEncoder {
         Ok(())
     }
 
+    /// Convert weight to float32 for numerical precision
+    fn to_f32(w: &Array) -> Array {
+        if w.dtype() == mlx_rs::Dtype::Float32 {
+            w.clone()
+        } else {
+            w.as_dtype(mlx_rs::Dtype::Float32).unwrap_or_else(|_| w.clone())
+        }
+    }
+
     /// Load weights for a single encoder layer.
     fn load_encoder_layer(
         weights: &HashMap<String, Array>,
@@ -571,67 +580,67 @@ impl SenseVoiceEncoder {
     ) -> Result<()> {
         // Attention QKV
         if let Some(w) = weights.get(&format!("{}.attn.qkv.weight", prefix)) {
-            *layer.self_attn.linear_q_k_v.weight = w.clone();
+            *layer.self_attn.linear_q_k_v.weight = Self::to_f32(w);
             *loaded_count += 1;
         }
         if let Some(w) = weights.get(&format!("{}.attn.qkv.bias", prefix)) {
-            *layer.self_attn.linear_q_k_v.bias = Some(w.clone());
+            *layer.self_attn.linear_q_k_v.bias = Some(Self::to_f32(w));
             *loaded_count += 1;
         }
 
         // FSMN weight
         if let Some(w) = weights.get(&format!("{}.attn.fsmn.weight", prefix)) {
-            *layer.self_attn.fsmn.weight = w.clone();
+            *layer.self_attn.fsmn.weight = Self::to_f32(w);
             *loaded_count += 1;
         }
 
         // Attention output projection
         if let Some(w) = weights.get(&format!("{}.attn.out.weight", prefix)) {
-            *layer.self_attn.linear_out.weight = w.clone();
+            *layer.self_attn.linear_out.weight = Self::to_f32(w);
             *loaded_count += 1;
         }
         if let Some(w) = weights.get(&format!("{}.attn.out.bias", prefix)) {
-            *layer.self_attn.linear_out.bias = Some(w.clone());
+            *layer.self_attn.linear_out.bias = Some(Self::to_f32(w));
             *loaded_count += 1;
         }
 
         // FFN w1
         if let Some(w) = weights.get(&format!("{}.ffn.w1.weight", prefix)) {
-            *layer.feed_forward.w_1.weight = w.clone();
+            *layer.feed_forward.w_1.weight = Self::to_f32(w);
             *loaded_count += 1;
         }
         if let Some(w) = weights.get(&format!("{}.ffn.w1.bias", prefix)) {
-            *layer.feed_forward.w_1.bias = Some(w.clone());
+            *layer.feed_forward.w_1.bias = Some(Self::to_f32(w));
             *loaded_count += 1;
         }
 
         // FFN w2
         if let Some(w) = weights.get(&format!("{}.ffn.w2.weight", prefix)) {
-            *layer.feed_forward.w_2.weight = w.clone();
+            *layer.feed_forward.w_2.weight = Self::to_f32(w);
             *loaded_count += 1;
         }
         if let Some(w) = weights.get(&format!("{}.ffn.w2.bias", prefix)) {
-            *layer.feed_forward.w_2.bias = Some(w.clone());
+            *layer.feed_forward.w_2.bias = Some(Self::to_f32(w));
             *loaded_count += 1;
         }
 
         // Norm1
         if let Some(w) = weights.get(&format!("{}.norm1.weight", prefix)) {
-            *layer.norm1.weight = Some(w.clone());
+            *layer.norm1.weight = Some(Self::to_f32(w));
             *loaded_count += 1;
         }
         if let Some(w) = weights.get(&format!("{}.norm1.bias", prefix)) {
-            *layer.norm1.bias = Some(w.clone());
+            *layer.norm1.bias = Some(Self::to_f32(w));
             *loaded_count += 1;
         }
 
         // Norm2
         if let Some(w) = weights.get(&format!("{}.norm2.weight", prefix)) {
-            *layer.norm2.weight = Some(w.clone());
+            *layer.norm2.weight = Some(Self::to_f32(w));
             *loaded_count += 1;
         }
         if let Some(w) = weights.get(&format!("{}.norm2.bias", prefix)) {
-            *layer.norm2.bias = Some(w.clone());
+            *layer.norm2.bias = Some(Self::to_f32(w));
             *loaded_count += 1;
         }
 

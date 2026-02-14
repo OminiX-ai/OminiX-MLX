@@ -14,12 +14,12 @@
 //! ```bash
 //! # List weights in an ONNX model (RECOMMENDED USE)
 //! cargo run --release --example export_vits_onnx -- \
-//!     --base ~/.dora/models/primespeech/gpt-sovits-mlx/vits.onnx \
+//!     --base ~/.OminiX/models/gpt-sovits-mlx/vits.onnx \
 //!     --list
 //!
 //! # EXPERIMENTAL: Attempt to patch weights (may not work correctly!)
 //! cargo run --release --example export_vits_onnx -- \
-//!     --base ~/.dora/models/primespeech/gpt-sovits-mlx/vits.onnx \
+//!     --base ~/.OminiX/models/gpt-sovits-mlx/vits.onnx \
 //!     --weights /tmp/vits_finetuned.generator.safetensors \
 //!     --output /tmp/finetuned_vits.onnx
 //! ```

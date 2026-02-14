@@ -48,11 +48,11 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
     use gpt_sovits_mlx::models::vits::load_vits_model;
 
     println!("Loading models...");
-    let mut hubert = load_hubert_model("~/.dora/models/primespeech/gpt-sovits-mlx/hubert.safetensors")?;
-    let vits = load_vits_model("~/.dora/models/primespeech/gpt-sovits-mlx/doubao_mixed_sovits_new.safetensors")?;
+    let mut hubert = load_hubert_model("~/.OminiX/models/gpt-sovits-mlx/hubert.safetensors")?;
+    let vits = load_vits_model("~/.OminiX/models/gpt-sovits-mlx/doubao_mixed_sovits_new.safetensors")?;
 
     // Load reference audio
-    let ref_path = "/Users/yuechen/.dora/models/primespeech/moyoyo/ref_audios/doubao_ref_mix_new.wav";
+    let ref_path = "/Users/yuechen/.OminiX/models/moyoyo/ref_audios/doubao_ref_mix_new.wav";
     let audio_16k = load_audio_for_hubert(ref_path)?;
     eval([&audio_16k])?;
 

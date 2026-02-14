@@ -1,7 +1,6 @@
 //! AISHELL-1 Benchmark for funasr-qwen4b-mlx
 //!
-//! Computes CER (Character Error Rate) on AISHELL-1 test set
-//! and compares with reported Fun-ASR-Nano performance.
+//! Computes CER (Character Error Rate) on AISHELL-1 test set.
 //!
 //! Setup:
 //! ```bash
@@ -13,33 +12,17 @@
 //!
 //! Run:
 //! ```bash
-//! cargo run --example benchmark_aishell --release -- /tmp/data_aishell [max_samples]
+//! cargo run --example benchmark_aishell --release -- /tmp/data_aishell [--max N] [--model-dir DIR]
 //! ```
 
-use funasr_qwen4b_mlx::sensevoice_encoder::{SenseVoiceEncoder, SenseVoiceEncoderConfig};
-use funasr_qwen4b_mlx::adaptor::AudioAdaptorQwen4B;
-use funasr_qwen4b_mlx::audio::{load_wav, resample, AudioConfig, MelFrontendMLX, apply_lfr};
-use funasr_qwen4b_mlx::error::Result;
-use mlx_rs::module::Module;
-use mlx_rs::quantization::MaybeQuantized;
-use mlx_rs::ops::indexing::IndexOp;
-use qwen3_mlx::{
-    load_model, load_tokenizer, KVCache,
-    AttentionInput, sample, create_attention_mask, AttentionMask,
-};
+use funasr_qwen4b_mlx::FunASRQwen4B;
+use funasr_qwen4b_mlx::audio::{load_wav, resample};
 use std::collections::HashMap;
 use std::fs;
 use std::path::Path;
 
-const SAMPLE_RATE: usize = 16000;
-const MAX_ASR_TOKENS: usize = 100;
-const TEMPERATURE: f32 = 0.6;
-const TOP_K: usize = 20;
-const PRESENCE_PENALTY: f32 = 1.0;
-const EOS_TOKEN: i32 = 151643;
-const IM_END_TOKEN: i32 = 151645;
-
-/// Compute Character Error Rate using Levenshtein distance
+/// Compute Character Error Rate using Levenshtein distance.
+/// Returns (edit_distance, substitutions, insertions, deletions).
 fn compute_cer(reference: &str, hypothesis: &str) -> (usize, usize, usize, usize) {
     let ref_chars: Vec<char> = reference.chars().filter(|c| !c.is_whitespace()).collect();
     let hyp_chars: Vec<char> = hypothesis.chars().filter(|c| !c.is_whitespace()).collect();
@@ -48,13 +31,12 @@ fn compute_cer(reference: &str, hypothesis: &str) -> (usize, usize, usize, usize
     let m = hyp_chars.len();
 
     if n == 0 {
-        return (m, 0, m, 0); // All insertions
+        return (m, 0, m, 0);
     }
     if m == 0 {
-        return (n, n, 0, 0); // All deletions
+        return (n, n, 0, 0);
     }
 
-    // Dynamic programming for edit distance with operation tracking
     let mut dp = vec![vec![0usize; m + 1]; n + 1];
 
     for i in 0..=n {
@@ -67,9 +49,9 @@ fn compute_cer(reference: &str, hypothesis: &str) -> (usize, usize, usize, usize
     for i in 1..=n {
         for j in 1..=m {
             let cost = if ref_chars[i - 1] == hyp_chars[j - 1] { 0 } else { 1 };
-            dp[i][j] = (dp[i - 1][j] + 1)          // deletion
-                .min(dp[i][j - 1] + 1)              // insertion
-                .min(dp[i - 1][j - 1] + cost);      // substitution
+            dp[i][j] = (dp[i - 1][j] + 1)
+                .min(dp[i][j - 1] + 1)
+                .min(dp[i - 1][j - 1] + cost);
         }
     }
 
@@ -78,9 +60,7 @@ fn compute_cer(reference: &str, hypothesis: &str) -> (usize, usize, usize, usize
     // Backtrack to count S, D, I
     let mut i = n;
     let mut j = m;
-    let mut substitutions = 0;
-    let mut deletions = 0;
-    let mut insertions = 0;
+    let (mut substitutions, mut deletions, mut insertions) = (0, 0, 0);
 
     while i > 0 || j > 0 {
         if i > 0 && j > 0 && ref_chars[i - 1] == hyp_chars[j - 1] {
@@ -104,33 +84,26 @@ fn compute_cer(reference: &str, hypothesis: &str) -> (usize, usize, usize, usize
     (edit_distance, substitutions, insertions, deletions)
 }
 
-/// Load AISHELL transcript file
-fn load_transcripts(transcript_path: &Path) -> Result<HashMap<String, String>> {
-    let content = fs::read_to_string(transcript_path)
-        .map_err(|e| funasr_qwen4b_mlx::error::Error::Audio(format!("Failed to read transcript: {}", e)))?;
-
+/// Load AISHELL transcript file (space-separated characters).
+fn load_transcripts(transcript_path: &Path) -> HashMap<String, String> {
+    let content = fs::read_to_string(transcript_path).expect("Failed to read transcript");
     let mut transcripts = HashMap::new();
     for line in content.lines() {
         let parts: Vec<&str> = line.splitn(2, ' ').collect();
         if parts.len() == 2 {
-            let utt_id = parts[0].to_string();
-            let text = parts[1].to_string();
-            transcripts.insert(utt_id, text);
+            transcripts.insert(parts[0].to_string(), parts[1].to_string());
         }
     }
-
-    Ok(transcripts)
+    transcripts
 }
 
-/// Find all test WAV files
+/// Recursively find all WAV files under a directory.
 fn find_test_files(test_dir: &Path) -> Vec<(String, std::path::PathBuf)> {
     let mut files = Vec::new();
-
     if let Ok(entries) = fs::read_dir(test_dir) {
         for entry in entries.flatten() {
             let path = entry.path();
             if path.is_dir() {
-                // Recurse into speaker directories
                 files.extend(find_test_files(&path));
             } else if path.extension().map_or(false, |e| e == "wav") {
                 if let Some(stem) = path.file_stem() {
@@ -139,193 +112,45 @@ fn find_test_files(test_dir: &Path) -> Vec<(String, std::path::PathBuf)> {
             }
         }
     }
-
     files.sort_by(|a, b| a.0.cmp(&b.0));
     files
 }
 
-fn get_logits(llm: &mut qwen3_mlx::Model, hidden: &mlx_rs::Array) -> Result<mlx_rs::Array> {
-    match &mut llm.lm_head {
-        Some(lm_head) => lm_head.forward(hidden)
-            .map_err(|e| funasr_qwen4b_mlx::error::Error::ModelLoad(format!("{:?}", e))),
-        None => match &mut llm.model.embed_tokens {
-            MaybeQuantized::Original(embed) => embed.as_linear(hidden)
-                .map_err(|e| funasr_qwen4b_mlx::error::Error::ModelLoad(format!("{:?}", e))),
-            MaybeQuantized::Quantized(embed) => embed.as_linear(hidden)
-                .map_err(|e| funasr_qwen4b_mlx::error::Error::ModelLoad(format!("{:?}", e))),
-        },
-    }
-}
+fn main() -> anyhow::Result<()> {
+    let args: Vec<String> = std::env::args().collect();
 
-fn embed_tokens(llm: &mut qwen3_mlx::Model, token_array: &mlx_rs::Array) -> Result<mlx_rs::Array> {
-    match &mut llm.model.embed_tokens {
-        MaybeQuantized::Original(embed) => embed.forward(token_array)
-            .map_err(|e| funasr_qwen4b_mlx::error::Error::ModelLoad(format!("{:?}", e))),
-        MaybeQuantized::Quantized(embed) => embed.forward(token_array)
-            .map_err(|e| funasr_qwen4b_mlx::error::Error::ModelLoad(format!("{:?}", e))),
-    }
-}
+    // Parse arguments
+    let mut aishell_dir = "/tmp/data_aishell".to_string();
+    let mut max_samples: usize = 200;
+    let mut model_dir = ".".to_string();
 
-fn sample_top_k(
-    logits: &mlx_rs::Array,
-    temperature: f32,
-    top_k: usize,
-    generated_tokens: &[i32],
-    presence_penalty: f32,
-) -> Result<mlx_rs::Array> {
-    let shape = logits.shape();
-    let vocab_size = *shape.last().unwrap() as usize;
-
-    let mut modified = logits.clone();
-    if presence_penalty > 0.0 && !generated_tokens.is_empty() {
-        let mut penalty_data = vec![0.0f32; vocab_size];
-        for &tok in generated_tokens {
-            if (tok as usize) < vocab_size {
-                penalty_data[tok as usize] = presence_penalty;
+    let mut i = 1;
+    while i < args.len() {
+        match args[i].as_str() {
+            "--max" => {
+                i += 1;
+                max_samples = args.get(i).and_then(|s| s.parse().ok()).unwrap_or(200);
             }
-        }
-        let penalty = mlx_rs::Array::from_slice(&penalty_data, &[1, vocab_size as i32]);
-        modified = mlx_rs::ops::subtract(&modified, &penalty)
-            .map_err(|e| funasr_qwen4b_mlx::error::Error::ModelLoad(format!("{:?}", e)))?;
-    }
-
-    modified = modified.multiply(mlx_rs::array!(1.0 / temperature))
-        .map_err(|e| funasr_qwen4b_mlx::error::Error::ModelLoad(format!("{:?}", e)))?;
-
-    if top_k > 0 && top_k < vocab_size {
-        let topk_vals = mlx_rs::ops::indexing::topk_axis_device(
-            &modified, top_k as i32, -1, mlx_rs::StreamOrDevice::default()
-        ).map_err(|e| funasr_qwen4b_mlx::error::Error::ModelLoad(format!("{:?}", e)))?;
-        let threshold = topk_vals.index((.., (top_k as i32 - 1)));
-        let threshold = threshold.reshape(&[1, 1])
-            .map_err(|e| funasr_qwen4b_mlx::error::Error::ModelLoad(format!("{:?}", e)))?;
-        let mask = modified.ge(&threshold)
-            .map_err(|e| funasr_qwen4b_mlx::error::Error::ModelLoad(format!("{:?}", e)))?;
-        let neg_inf = mlx_rs::array!(f32::NEG_INFINITY);
-        modified = mlx_rs::ops::r#where(&mask, &modified, &neg_inf)
-            .map_err(|e| funasr_qwen4b_mlx::error::Error::ModelLoad(format!("{:?}", e)))?;
-    }
-
-    sample(&modified, 1.0)
-        .map_err(|e| funasr_qwen4b_mlx::error::Error::ModelLoad(format!("{:?}", e)))
-}
-
-/// Transcribe single utterance (simplified, no ChatML for benchmark)
-fn transcribe_utterance(
-    samples: &[f32],
-    mel_frontend: &MelFrontendMLX,
-    encoder: &mut SenseVoiceEncoder,
-    adaptor: &mut AudioAdaptorQwen4B,
-    llm: &mut qwen3_mlx::Model,
-    tokenizer: &tokenizers::Tokenizer,
-) -> Result<String> {
-    // Audio pipeline
-    let mel = mel_frontend.compute_mel_spectrogram(samples)?;
-    let mel_lfr = apply_lfr(&mel, 7, 6)?;
-    let encoder_out = encoder.forward(&mel_lfr)?;
-    mlx_rs::transforms::eval([&encoder_out])?;
-    let audio_features = adaptor.forward(&encoder_out)?;
-    mlx_rs::transforms::eval([&audio_features])?;
-
-    // Generate (raw mode - just audio features)
-    let mut cache: Vec<Option<KVCache>> = (0..llm.model.layers.len())
-        .map(|_| Some(KVCache::default()))
-        .collect();
-
-    let mask = match create_attention_mask(&audio_features, &cache, Some(true))
-        .map_err(|e| funasr_qwen4b_mlx::error::Error::ModelLoad(format!("{:?}", e)))?
-    {
-        Some(AttentionMask::Array(m)) => Some(m),
-        _ => None,
-    };
-
-    let mut hidden = audio_features;
-    for (layer, c) in llm.model.layers.iter_mut().zip(cache.iter_mut()) {
-        hidden = layer.forward(AttentionInput {
-            x: &hidden,
-            mask: mask.as_ref(),
-            cache: c.as_mut(),
-        }).map_err(|e| funasr_qwen4b_mlx::error::Error::ModelLoad(format!("{:?}", e)))?;
-    }
-    hidden = llm.model.norm.forward(&hidden)
-        .map_err(|e| funasr_qwen4b_mlx::error::Error::ModelLoad(format!("{:?}", e)))?;
-
-    let last_hidden = hidden.index((.., -1, ..));
-    let logits = get_logits(llm, &last_hidden)?;
-
-    let mut tokens: Vec<i32> = Vec::new();
-    let mut token = sample_top_k(&logits, TEMPERATURE, TOP_K, &tokens, PRESENCE_PENALTY)?;
-    mlx_rs::transforms::eval([&token])?;
-    let mut token_id: i32 = token.item();
-
-    for _ in 0..MAX_ASR_TOKENS {
-        if token_id == EOS_TOKEN || token_id == IM_END_TOKEN {
-            break;
-        }
-        tokens.push(token_id);
-
-        // N-gram repetition check
-        if tokens.len() >= 6 {
-            let n = 3;
-            if tokens.len() >= n * 2 {
-                let tail = &tokens[tokens.len() - n * 2..];
-                if tail[..n] == tail[n..] {
-                    tokens.truncate(tokens.len() - n);
-                    break;
-                }
+            "--model-dir" => {
+                i += 1;
+                model_dir = args.get(i).cloned().unwrap_or_else(|| ".".to_string());
             }
+            s if !s.starts_with("--") && i == 1 => {
+                aishell_dir = s.to_string();
+            }
+            _ => {}
         }
-
-        let token_array = mlx_rs::Array::from_slice(&[token_id], &[1, 1]);
-        let y_embed = embed_tokens(llm, &token_array)?;
-
-        let mut h = y_embed;
-        for (layer, c) in llm.model.layers.iter_mut().zip(cache.iter_mut()) {
-            h = layer.forward(AttentionInput {
-                x: &h,
-                mask: None,
-                cache: c.as_mut(),
-            }).map_err(|e| funasr_qwen4b_mlx::error::Error::ModelLoad(format!("{:?}", e)))?;
-        }
-        h = llm.model.norm.forward(&h)
-            .map_err(|e| funasr_qwen4b_mlx::error::Error::ModelLoad(format!("{:?}", e)))?;
-
-        let logits = get_logits(llm, &h.index((.., -1, ..)))?;
-        token = sample_top_k(&logits, TEMPERATURE, TOP_K, &tokens, PRESENCE_PENALTY)?;
-        mlx_rs::transforms::eval([&token])?;
-        token_id = token.item();
+        i += 1;
     }
-
-    let token_ids: Vec<u32> = tokens.iter().map(|&t| t as u32).collect();
-    let text = tokenizer.decode(&token_ids, true)
-        .map_err(|e| funasr_qwen4b_mlx::error::Error::Tokenizer(format!("{}", e)))?;
-
-    // Clean up
-    let text = text.trim()
-        .replace("<think>", "")
-        .replace("</think>", "")
-        .trim()
-        .to_string();
-
-    Ok(text)
-}
-
-fn main() -> Result<()> {
-    let aishell_dir = std::env::args().nth(1).unwrap_or_else(|| "/tmp/data_aishell".to_string());
-    let max_samples: usize = std::env::args().nth(2)
-        .and_then(|s| s.parse().ok())
-        .unwrap_or(100); // Default to 100 for quick test
 
     let aishell_path = Path::new(&aishell_dir);
     let transcript_path = aishell_path.join("transcript/aishell_transcript_v0.8.txt");
     let test_wav_dir = aishell_path.join("wav/test");
 
-    // Check paths
     if !transcript_path.exists() {
         eprintln!("Transcript not found: {:?}", transcript_path);
         eprintln!("\nDownload AISHELL-1:");
-        eprintln!("  cd /tmp");
-        eprintln!("  wget https://openslr.trmal.net/resources/33/data_aishell.tgz");
+        eprintln!("  cd /tmp && wget https://openslr.trmal.net/resources/33/data_aishell.tgz");
         eprintln!("  tar -xzf data_aishell.tgz");
         return Ok(());
     }
@@ -334,55 +159,22 @@ fn main() -> Result<()> {
         return Ok(());
     }
 
-    println!("=== AISHELL-1 Benchmark ===\n");
+    println!("=== AISHELL-1 CER Benchmark ===\n");
 
-    // Load transcripts
-    println!("Loading transcripts...");
-    let transcripts = load_transcripts(&transcript_path)?;
-    println!("  Loaded {} transcripts", transcripts.len());
+    let transcripts = load_transcripts(&transcript_path);
+    println!("Loaded {} transcripts", transcripts.len());
 
-    // Find test files
-    println!("Finding test files...");
     let test_files = find_test_files(&test_wav_dir);
-    println!("  Found {} test files", test_files.len());
+    println!("Found {} test files", test_files.len());
 
     let num_to_test = max_samples.min(test_files.len());
-    println!("  Testing {} samples\n", num_to_test);
+    println!("Testing {} samples\n", num_to_test);
 
-    // Load models
-    println!("Loading models...");
-    let qwen_path = if Path::new("models/Qwen3-4B-4bit/config.json").exists() {
-        "models/Qwen3-4B-4bit"
-    } else {
-        "models/Qwen3-4B"
-    };
-    let sensevoice_path = "sensevoice_iic.safetensors";
-    let adaptor_path = "adaptor_phase2_final.safetensors";
+    // Load model using high-level API (handles ChatML, anti-repetition, etc.)
+    println!("Loading FunASR-Qwen4B from '{}'...", model_dir);
+    let mut model = FunASRQwen4B::load(&model_dir)?;
+    println!("Model loaded.\n");
 
-    for (name, path) in [("Qwen3-4B", qwen_path), ("SenseVoice", sensevoice_path), ("Adaptor", adaptor_path)] {
-        if !Path::new(path).exists() {
-            eprintln!("Missing: {} at {}", name, path);
-            return Ok(());
-        }
-    }
-
-    let audio_config = AudioConfig::default();
-    let mel_frontend = MelFrontendMLX::new(audio_config)?;
-
-    let mut encoder = SenseVoiceEncoder::new(SenseVoiceEncoderConfig::default())?;
-    encoder.load_weights(sensevoice_path)?;
-
-    let mut adaptor = AudioAdaptorQwen4B::new()?;
-    adaptor.load_weights(adaptor_path)?;
-
-    let mut llm = load_model(qwen_path)
-        .map_err(|e| funasr_qwen4b_mlx::error::Error::ModelLoad(format!("{:?}", e)))?;
-    let tokenizer = load_tokenizer(qwen_path)
-        .map_err(|e| funasr_qwen4b_mlx::error::Error::Tokenizer(format!("{:?}", e)))?;
-
-    println!("  Models loaded\n");
-
-    // Run benchmark
     println!("=== Running Benchmark ===\n");
     let start_time = std::time::Instant::now();
 
@@ -393,19 +185,15 @@ fn main() -> Result<()> {
     let mut total_deletions = 0usize;
     let mut processed = 0usize;
     let mut skipped = 0usize;
+    let mut total_audio_secs = 0.0f64;
 
     for (idx, (utt_id, wav_path)) in test_files.iter().take(num_to_test).enumerate() {
-        // Get reference transcript
         let reference = match transcripts.get(utt_id) {
             Some(t) => t.clone(),
-            None => {
-                skipped += 1;
-                continue;
-            }
+            None => { skipped += 1; continue; }
         };
 
-        // Load and resample audio
-        let (samples, sample_rate) = match load_wav(&wav_path) {
+        let (samples, sample_rate) = match load_wav(wav_path) {
             Ok(s) => s,
             Err(e) => {
                 eprintln!("[{}/{}] {} - Load error: {:?}", idx + 1, num_to_test, utt_id, e);
@@ -420,10 +208,9 @@ fn main() -> Result<()> {
             samples
         };
 
-        // Transcribe
-        let hypothesis = match transcribe_utterance(
-            &samples, &mel_frontend, &mut encoder, &mut adaptor, &mut llm, &tokenizer
-        ) {
+        total_audio_secs += samples.len() as f64 / 16000.0;
+
+        let hypothesis = match model.transcribe_samples(&samples, 16000) {
             Ok(h) => h,
             Err(e) => {
                 eprintln!("[{}/{}] {} - Transcribe error: {:?}", idx + 1, num_to_test, utt_id, e);
@@ -432,7 +219,6 @@ fn main() -> Result<()> {
             }
         };
 
-        // Compute CER
         let ref_chars = reference.chars().filter(|c| !c.is_whitespace()).count();
         let (errors, subs, ins, dels) = compute_cer(&reference, &hypothesis);
 
@@ -445,18 +231,14 @@ fn main() -> Result<()> {
 
         let cer = if ref_chars > 0 { errors as f64 / ref_chars as f64 * 100.0 } else { 0.0 };
 
-        // Progress output
         if (idx + 1) % 10 == 0 || idx + 1 == num_to_test {
             let running_cer = if total_ref_chars > 0 {
                 total_errors as f64 / total_ref_chars as f64 * 100.0
-            } else {
-                0.0
-            };
-            println!("[{}/{}] CER: {:.2}% | Running CER: {:.2}%",
-                idx + 1, num_to_test, cer, running_cer);
+            } else { 0.0 };
+            println!("[{}/{}] Running CER: {:.2}%", idx + 1, num_to_test, running_cer);
         }
 
-        // Show some examples
+        // Show first 5 examples and any with very high CER
         if idx < 5 || cer > 50.0 {
             println!("  REF: {}", reference);
             println!("  HYP: {}", hypothesis);
@@ -466,34 +248,33 @@ fn main() -> Result<()> {
 
     let elapsed = start_time.elapsed();
 
-    // Final results
     println!("\n=== AISHELL-1 Benchmark Results ===\n");
 
     let final_cer = if total_ref_chars > 0 {
         total_errors as f64 / total_ref_chars as f64 * 100.0
-    } else {
-        0.0
-    };
+    } else { 0.0 };
 
     println!("Samples processed: {}", processed);
-    println!("Samples skipped: {}", skipped);
-    println!("Total reference chars: {}", total_ref_chars);
-    println!("Total errors: {} (S:{} I:{} D:{})",
+    println!("Samples skipped:   {}", skipped);
+    println!("Total ref chars:   {}", total_ref_chars);
+    println!("Total errors:      {} (S:{} I:{} D:{})",
         total_errors, total_substitutions, total_insertions, total_deletions);
     println!();
     println!("**CER: {:.2}%**", final_cer);
     println!();
-    println!("Time: {:.1}s ({:.2} utterances/sec)",
-        elapsed.as_secs_f64(),
-        processed as f64 / elapsed.as_secs_f64());
+    println!("Audio duration: {:.1}s", total_audio_secs);
+    println!("Wall time:      {:.1}s ({:.2} utt/s)",
+        elapsed.as_secs_f64(), processed as f64 / elapsed.as_secs_f64());
+    println!("RTF:            {:.2}x", elapsed.as_secs_f64() / total_audio_secs);
 
-    println!("\n=== Comparison with Reported Results ===\n");
-    println!("| Model | Opensource WER/CER |");
-    println!("|-------|-------------------|");
-    println!("| Fun-ASR (7.7B) | 3.38% |");
-    println!("| Fun-ASR-Nano (0.8B) | 4.22% |");
+    println!("\n=== Comparison ===\n");
+    println!("| Model | CER |");
+    println!("|-------|-----|");
+    println!("| FunASR (7.7B) | 3.38% |");
+    println!("| FunASR-Nano (0.8B) | 4.22% |");
+    println!("| Phase 2 adaptor only (8-bit) | 5.10% |");
     println!("| Paraformer v2 (0.2B) | 6.23% |");
-    println!("| **funasr-qwen4b-mlx** | **{:.2}%** |", final_cer);
+    println!("| **Phase 3 + LoRA r=16 (8-bit)** | **{:.2}%** |", final_cer);
 
     Ok(())
 }

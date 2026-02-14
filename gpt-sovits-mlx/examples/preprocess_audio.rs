@@ -201,7 +201,7 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
                 language: language.clone(),
                 model_path: model.unwrap_or_else(|| {
                     dirs::home_dir()
-                        .map(|h| h.join(".dora/models/funasr"))
+                        .map(|h| h.join(".OminiX/models/funasr"))
                         .unwrap_or_else(|| PathBuf::from("models/funasr"))
                 }),
                 ..Default::default()

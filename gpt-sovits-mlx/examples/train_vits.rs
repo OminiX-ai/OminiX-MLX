@@ -14,7 +14,7 @@
 //! # 3. Train VITS
 //! cargo run --release --example train_vits -- \
 //!   --data-dir /tmp/fewshot_1min_vits \
-//!   --pretrained ~/.dora/models/primespeech/gpt-sovits-mlx/vits_pretrained_v2.safetensors \
+//!   --pretrained ~/.OminiX/models/gpt-sovits-mlx/vits_pretrained_v2.safetensors \
 //!   --output /tmp/vits_finetuned.safetensors \
 //!   --epochs 4
 //! ```

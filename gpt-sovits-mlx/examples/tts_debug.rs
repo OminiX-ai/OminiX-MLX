@@ -21,7 +21,7 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
     let mut cloner = VoiceCloner::new(config)?;
 
     // Set reference audio
-    cloner.set_reference_audio("/Users/yuechen/.dora/models/primespeech/moyoyo/ref_audios/doubao_ref_mix_new.wav")?;
+    cloner.set_reference_audio("/Users/yuechen/.OminiX/models/moyoyo/ref_audios/doubao_ref_mix_new.wav")?;
 
     // Get phonemes using the same preprocessing
     let (phoneme_ids, phonemes, word2ph, norm_text) = preprocess_text(text);

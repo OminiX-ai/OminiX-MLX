@@ -3,7 +3,7 @@
 //! Uses full precision BF16 weights for highest quality.
 //!
 //! Model path can be set via environment variable:
-//!   export DORA_MODELS_PATH=~/.dora/models
+//!   export DORA_MODELS_PATH=~/.OminiX/models
 //!
 //! Expected directory structure:
 //!   $DORA_MODELS_PATH/qwen-image-2512/
@@ -77,12 +77,12 @@ fn get_model_dir() -> Result<PathBuf, Box<dyn std::error::Error>> {
 
     // Fall back to default location
     let home = std::env::var("HOME")?;
-    let default_path = PathBuf::from(format!("{}/.dora/models/qwen-image-2512", home));
+    let default_path = PathBuf::from(format!("{}/.OminiX/models/qwen-image-2512", home));
     if default_path.join("transformer").exists() {
         return Ok(default_path);
     }
 
-    Err("Model not found. Please set DORA_MODELS_PATH or place models in ~/.dora/models/qwen-image-2512/\n\
+    Err("Model not found. Please set DORA_MODELS_PATH or place models in ~/.OminiX/models/qwen-image-2512/\n\
          Expected structure:\n\
          qwen-image-2512/\n\
          ├── transformer/\n\

@@ -23,7 +23,7 @@ impl Default for ASRConfig {
     fn default() -> Self {
         // Default to FunASR model path
         let model_path = dirs::home_dir()
-            .map(|h| h.join(".dora/models/funasr"))
+            .map(|h| h.join(".OminiX/models/funasr"))
             .unwrap_or_else(|| PathBuf::from("models/funasr"));
 
         Self {
