@@ -31,6 +31,7 @@ MiniCPM-SALA is a 9B parameter hybrid attention model that achieves **million-to
 | Batched Inference | Complete |
 | Multi-turn Chat | Complete |
 | OpenAI-compatible API Server | Complete |
+| Model Management (download/delete) | Complete |
 | 8-bit Quantization | Complete |
 
 ## Quick Start
@@ -88,7 +89,9 @@ cargo run --release -p minicpm-sala-mlx --example server -- \
 | Method | Endpoint | Description |
 |--------|----------|-------------|
 | `POST` | `/v1/chat/completions` | Chat completion (OpenAI-compatible) |
-| `GET`  | `/v1/models` | List available models |
+| `GET`  | `/v1/models` | List models with metadata (path, size, quantization, loaded status) |
+| `POST` | `/v1/models/download` | Download a model from HuggingFace |
+| `DELETE` | `/v1/models/{id}` | Delete a downloaded model |
 | `GET`  | `/health` | Health check |
 
 **Chat completion request:**
@@ -123,6 +126,23 @@ curl http://localhost:8080/v1/chat/completions \
 }
 ```
 
+**Model management:**
+
+```bash
+# List models (includes path, size, quantization, loaded status)
+curl http://localhost:8080/v1/models
+
+# Download a model from HuggingFace
+curl -X POST http://localhost:8080/v1/models/download \
+  -H "Content-Type: application/json" \
+  -d '{"repo_id": "moxin-org/MiniCPM4-SALA-9B-8bit-mlx"}'
+
+# Delete a model
+curl -X DELETE http://localhost:8080/v1/models/MiniCPM4-SALA-9B-8bit-mlx
+```
+
+Model metadata and download state are persisted in `~/.ominix/config.json`. The server scans `--models-dir` (default `~/.ominix/models`) for model subdirectories on each list request. The currently loaded model is always included and marked with `"loaded": true`. Set `HF_TOKEN` env var or have `~/.cache/huggingface/token` for private repos.
+
 **Server options:**
 
 | Flag | Default | Description |
@@ -132,6 +152,7 @@ curl http://localhost:8080/v1/chat/completions \
 | `--temperature` | 0.7 | Default sampling temperature |
 | `--max-tokens` | 2048 | Default max generation tokens |
 | `--no-think` | false | Strip `<think>...</think>` from responses |
+| `--models-dir` | `~/.ominix/models` | Directory for managed models |
 
 ## Performance (Apple M3 Max, 128 GB)
 

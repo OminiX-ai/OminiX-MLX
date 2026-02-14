@@ -21,6 +21,7 @@ hyper = { version = "1", features = ["full"] }
 hyper-util = { version = "0.1", features = ["tokio"] }
 http-body-util = "0.1"
 tokio = { version = "1", features = ["full"] }
+hf-hub = "0.4"
 
 [[example]]
 name = "generate"
