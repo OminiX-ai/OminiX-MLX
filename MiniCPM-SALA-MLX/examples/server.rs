@@ -29,8 +29,8 @@ use tokio::net::TcpListener;
 use tokio::sync::{mpsc, oneshot};
 
 use minicpm_sala_mlx::{
-    create_layer_caches, format_chat_prompt_multi, get_model_args, load_model, load_tokenizer,
-    sample, strip_thinking,
+    create_layer_caches, format_chat_prompt_multi, get_model_args, is_stop_token, load_model,
+    load_tokenizer, sample, strip_thinking,
 };
 
 #[derive(Parser)]
@@ -195,7 +195,7 @@ fn run_inference(
 
     for _ in 0..req.max_tokens {
         let token_id = token.item::<u32>();
-        if token_id == 2 || token_id == 73440 {
+        if is_stop_token(token_id) {
             break;
         }
         generated_ids.push(token_id);

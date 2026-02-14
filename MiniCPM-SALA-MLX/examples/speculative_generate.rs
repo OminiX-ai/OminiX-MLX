@@ -3,8 +3,8 @@ use std::time::Instant;
 
 use clap::Parser;
 use minicpm_sala_mlx::{
-    create_layer_caches, format_chat_prompt, get_model_args, load_model, load_tokenizer, sample,
-    SpeculativeDecoder,
+    create_layer_caches, format_chat_prompt, get_model_args, is_stop_token, load_model,
+    load_tokenizer, sample, SpeculativeDecoder,
 };
 use mlx_rs::ops::indexing::IndexOp;
 use mlx_rs::transforms::eval;
@@ -123,7 +123,7 @@ fn main() -> anyhow::Result<()> {
     let mut total_draft_proposed = 0;
 
     let first_id = first_token.item::<u32>();
-    if first_id != 2 && first_id != 73440 {
+    if !is_stop_token(first_id) {
         generated_ids.push(first_id);
     }
 
@@ -132,7 +132,7 @@ fn main() -> anyhow::Result<()> {
 
     while generated_ids.len() < args.max_tokens {
         let last_id = last_token.item::<u32>();
-        if last_id == 2 || last_id == 73440 {
+        if is_stop_token(last_id) {
             break;
         }
 
@@ -143,7 +143,7 @@ fn main() -> anyhow::Result<()> {
         total_draft_proposed += args.num_draft;
 
         for &tid in &result.tokens {
-            if tid == 2 || tid == 73440 {
+            if is_stop_token(tid) {
                 break;
             }
             generated_ids.push(tid);
@@ -166,7 +166,7 @@ fn main() -> anyhow::Result<()> {
         }
 
         // Check for EOS in result
-        if result.tokens.iter().any(|&t| t == 2 || t == 73440) {
+        if result.tokens.iter().any(|&t| is_stop_token(t)) {
             break;
         }
     }
