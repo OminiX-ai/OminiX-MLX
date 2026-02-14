@@ -23,7 +23,7 @@ mlx-sys = { path = "../mlx-rs/mlx-sys" }
 [dev-dependencies]
 pretty_assertions.workspace = true
 clap = { version = "4", features = ["derive"] }
-dirs = "5"
+dirs = "6"
 half = "2"
 image = "0.25"
 
