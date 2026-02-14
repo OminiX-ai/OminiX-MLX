@@ -56,6 +56,7 @@ Built for production use with zero Python dependencies at inference time.
 │ mixtral-mlx   │         │                 │         │                 │
 │ mistral-mlx   │         │                 │         │                 │
 │ moxin-vlm-mlx │         │                 │         │                 │
+│ minicpm-sala   │         │                 │         │                 │
 └───────┬───────┘         └────────┬────────┘         └────────┬────────┘
         │                          │                           │
         └──────────────────────────┼───────────────────────────┘
@@ -157,6 +158,7 @@ OminiX-MLX/
 ├── mixtral-mlx/         # Mixtral 8x7B/8x22B
 ├── mistral-mlx/         # Mistral 7B
 ├── moxin-vlm-mlx/       # Moxin-7B VLM (vision-language)
+├── MiniCPM-SALA-MLX/    # MiniCPM-SALA 9B (hybrid attention, 1M context)
 │
 ├── gpt-sovits-mlx/      # GPT-SoVITS voice cloning
 ├── funasr-mlx/          # FunASR Paraformer ASR
@@ -179,6 +181,7 @@ OminiX-MLX/
 | GLM-4-MoE | `glm4-moe-mlx` | 9B | 45 expert MoE |
 | Mixtral | `mixtral-mlx` | 8x7B, 8x22B | MoE architecture |
 | Mistral | `mistral-mlx` | 7B | Sliding window attention |
+| MiniCPM-SALA | `minicpm-sala-mlx` | 9B | Hybrid attention (sparse + lightning), 1M context, OpenAI-compatible API |
 
 ### Vision-Language Models (VLMs)
 
@@ -338,6 +341,46 @@ for token in generator.take(256) {
 }
 ```
 
+### MiniCPM-SALA (Long-Context LLM)
+
+```bash
+# Download 8-bit quantized model
+huggingface-cli download moxin-org/MiniCPM4-SALA-9B-8bit-mlx --local-dir ./models/MiniCPM-SALA-8bit
+
+# Run text generation
+cargo run --release -p minicpm-sala-mlx --example generate -- \
+    ./models/MiniCPM-SALA-8bit "Explain the theory of relativity."
+
+# Run interactive chat
+cargo run --release -p minicpm-sala-mlx --example chat -- \
+    ./models/MiniCPM-SALA-8bit --no-think
+
+# Start OpenAI-compatible API server
+cargo run --release -p minicpm-sala-mlx --example server -- \
+    --model ./models/MiniCPM-SALA-8bit --port 8080 --no-think
+```
+
+**API Endpoints:**
+
+| Method | Endpoint | Description |
+|--------|----------|-------------|
+| POST | `/v1/chat/completions` | OpenAI-compatible chat completion |
+| GET | `/v1/models` | List available models |
+| GET | `/health` | Health check |
+
+**Example API call:**
+
+```bash
+curl http://localhost:8080/v1/chat/completions \
+  -H "Content-Type: application/json" \
+  -d '{
+    "model": "minicpm-sala-9b",
+    "messages": [{"role": "user", "content": "Hello!"}],
+    "temperature": 0.7,
+    "max_tokens": 256
+  }'
+```
+
 ### Image Generation
 
 ```bash
@@ -363,6 +406,7 @@ Benchmarks on Apple M3 Max (128GB):
 | LLM | Qwen3-4B | 45 tok/s | 8GB |
 | LLM | GLM4-9B-4bit | 35 tok/s | 6GB |
 | LLM | Mixtral-8x7B-4bit | 25 tok/s | 26GB |
+| LLM | MiniCPM-SALA-9B-8bit | 28 tok/s | 9.6GB |
 | VLM | Moxin-7B-8bit | 30 tok/s | 10GB |
 | ASR | Paraformer | 18x real-time | 500MB |
 | TTS | GPT-SoVITS | 4x real-time | 2GB |
@@ -380,6 +424,7 @@ Benchmarks on Apple M3 Max (128GB):
 | mixtral-mlx | [README](mixtral-mlx/README.md) | Mixtral MoE |
 | mistral-mlx | [README](mistral-mlx/README.md) | Mistral 7B |
 | moxin-vlm-mlx | [README](moxin-vlm-mlx/README.md) | Moxin-7B VLM |
+| minicpm-sala-mlx | [README](MiniCPM-SALA-MLX/README.md) | MiniCPM-SALA 9B (hybrid attention, 1M context) |
 | funasr-mlx | [README](funasr-mlx/README.md) | Paraformer ASR |
 | funasr-nano-mlx | [README](funasr-nano-mlx/README.md) | FunASR-Nano |
 | gpt-sovits-mlx | [README](gpt-sovits-mlx/README.md) | Voice cloning |
