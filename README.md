@@ -365,12 +365,15 @@ cargo run --release -p minicpm-sala-mlx --example server -- \
 | Method | Endpoint | Description |
 |--------|----------|-------------|
 | POST | `/v1/chat/completions` | OpenAI-compatible chat completion |
-| GET | `/v1/models` | List available models |
+| GET | `/v1/models` | List models with metadata (path, size, quantization, loaded status) |
+| POST | `/v1/models/download` | Download a model from HuggingFace |
+| DELETE | `/v1/models/{id}` | Delete a downloaded model |
 | GET | `/health` | Health check |
 
-**Example API call:**
+**Example API calls:**
 
 ```bash
+# Chat completion
 curl http://localhost:8080/v1/chat/completions \
   -H "Content-Type: application/json" \
   -d '{
@@ -379,6 +382,17 @@ curl http://localhost:8080/v1/chat/completions \
     "temperature": 0.7,
     "max_tokens": 256
   }'
+
+# Download a model
+curl -X POST http://localhost:8080/v1/models/download \
+  -H "Content-Type: application/json" \
+  -d '{"repo_id": "moxin-org/MiniCPM4-SALA-9B-8bit-mlx"}'
+
+# List models
+curl http://localhost:8080/v1/models
+
+# Delete a model
+curl -X DELETE http://localhost:8080/v1/models/MiniCPM4-SALA-9B-8bit-mlx
 ```
 
 ### Image Generation
