@@ -1,7 +1,9 @@
 use std::io::Write;
 use std::time::Instant;
 
-use minicpm_sala_mlx::{create_layer_caches, get_model_args, load_model, load_tokenizer, sample};
+use minicpm_sala_mlx::{
+    create_layer_caches, get_model_args, is_stop_token, load_model, load_tokenizer, sample,
+};
 use mlx_rs::ops::indexing::IndexOp;
 use mlx_rs::transforms::eval;
 
@@ -103,7 +105,7 @@ fn main() -> anyhow::Result<()> {
             } else {
                 tokens.index(b as i32).item::<u32>()
             };
-            if token_id == 2 || token_id == 73440 {
+            if is_stop_token(token_id) {
                 finished[b] = true;
                 continue;
             }

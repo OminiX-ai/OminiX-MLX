@@ -3,7 +3,8 @@ use std::time::Instant;
 
 use clap::Parser;
 use minicpm_sala_mlx::{
-    create_layer_caches, format_chat_prompt, get_model_args, load_model, load_tokenizer, sample,
+    create_layer_caches, format_chat_prompt, get_model_args, is_stop_token, load_model,
+    load_tokenizer, sample, ThinkFilter,
 };
 use mlx_rs::ops::indexing::IndexOp;
 use mlx_rs::transforms::eval;
@@ -129,15 +130,14 @@ fn main() -> anyhow::Result<()> {
 
         // Decode
         let mut generated_ids: Vec<u32> = Vec::new();
-        let mut prev_text_len = 0;
-        let mut think_done = false;
+        let mut filter = ThinkFilter::new(args.no_think);
 
         let decode_start = Instant::now();
         let mut num_decode_tokens = 0;
 
         for _ in 0..args.max_tokens {
             let token_id = token.item::<u32>();
-            if token_id == 2 || token_id == 73440 {
+            if is_stop_token(token_id) {
                 break;
             }
 
@@ -145,29 +145,10 @@ fn main() -> anyhow::Result<()> {
             num_decode_tokens += 1;
 
             if let Ok(full_text) = tokenizer.decode(&generated_ids, true) {
-                if args.no_think {
-                    if !think_done {
-                        if let Some(end) = full_text.find("</think>") {
-                            think_done = true;
-                            let after = &full_text[end + "</think>".len()..];
-                            let trimmed = after.trim_start_matches('\n');
-                            if !trimmed.is_empty() {
-                                print!("{}", trimmed);
-                                io::stdout().flush()?;
-                            }
-                            prev_text_len = full_text.len();
-                        }
-                    } else if full_text.len() > prev_text_len {
-                        print!("{}", &full_text[prev_text_len..]);
-                        io::stdout().flush()?;
-                        prev_text_len = full_text.len();
-                    }
-                } else {
-                    if full_text.len() > prev_text_len {
-                        print!("{}", &full_text[prev_text_len..]);
-                        io::stdout().flush()?;
-                    }
-                    prev_text_len = full_text.len();
+                let new_text = filter.next(&full_text);
+                if !new_text.is_empty() {
+                    print!("{}", new_text);
+                    io::stdout().flush()?;
                 }
             }
 

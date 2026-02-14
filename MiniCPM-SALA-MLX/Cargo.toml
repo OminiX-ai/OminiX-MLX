@@ -49,3 +49,7 @@ path = "examples/server.rs"
 [[example]]
 name = "test_rope_batch"
 path = "examples/test_rope_batch.rs"
+
+[[example]]
+name = "needle_test"
+path = "examples/needle_test.rs"

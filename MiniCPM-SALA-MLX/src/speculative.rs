@@ -63,12 +63,13 @@ impl SpeculativeDecoder {
         }
 
         // 3. Build verification input: [last_token, draft_1, ..., draft_K]
-        let mut all_token_ids: Vec<i32> = vec![last_token.item::<i32>()];
+        let mut all_token_ids: Vec<u32> = vec![last_token.item::<u32>()];
         for dt in &draft_tokens {
-            all_token_ids.push(dt.item::<i32>());
+            all_token_ids.push(dt.item::<u32>());
         }
+        let all_i32: Vec<i32> = all_token_ids.iter().map(|&t| t as i32).collect();
         let verify_input =
-            Array::from_slice(&all_token_ids, &[1, all_token_ids.len() as i32]);
+            Array::from_slice(&all_i32, &[1, all_i32.len() as i32]);
 
         // 4. Full forward pass for verification (updates caches for all K+1 positions)
         let logits = model.forward(&verify_input, caches)?;
