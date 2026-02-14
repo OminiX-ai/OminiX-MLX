@@ -21,11 +21,28 @@ use std::collections::HashMap;
 use std::fs;
 use std::path::Path;
 
+/// Strip punctuation for fair CER comparison (references are unpunctuated).
+fn strip_punctuation(s: &str) -> String {
+    s.chars()
+        .filter(|c| !c.is_whitespace() && !is_punctuation(*c))
+        .collect()
+}
+
+fn is_punctuation(c: char) -> bool {
+    matches!(c,
+        '。' | '，' | '、' | '？' | '！' | '；' | '：' | '"' | '"' |
+        '\u{2018}' | '\u{2019}' | '【' | '】' | '《' | '》' | '（' | '）' | '—' |
+        '…' | '·' | '～' | '「' | '」' | '﹑' | '＋' |
+        '.' | ',' | '?' | '!' | ';' | ':' | '"' | '\'' | '(' | ')' |
+        '[' | ']' | '{' | '}' | '-' | '/' | '\\' | '~'
+    )
+}
+
 /// Compute Character Error Rate using Levenshtein distance.
 /// Returns (edit_distance, substitutions, insertions, deletions).
 fn compute_cer(reference: &str, hypothesis: &str) -> (usize, usize, usize, usize) {
-    let ref_chars: Vec<char> = reference.chars().filter(|c| !c.is_whitespace()).collect();
-    let hyp_chars: Vec<char> = hypothesis.chars().filter(|c| !c.is_whitespace()).collect();
+    let ref_chars: Vec<char> = strip_punctuation(reference).chars().collect();
+    let hyp_chars: Vec<char> = strip_punctuation(hypothesis).chars().collect();
 
     let n = ref_chars.len();
     let m = hyp_chars.len();
