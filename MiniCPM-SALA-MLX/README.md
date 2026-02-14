@@ -33,6 +33,106 @@ MiniCPM-SALA is a 9B parameter hybrid attention model that achieves **million-to
 | OpenAI-compatible API Server | Complete |
 | 8-bit Quantization | Complete |
 
+## Quick Start
+
+### Prerequisites
+
+- macOS 14.0+ (Sonoma), Apple Silicon (M1/M2/M3/M4)
+- Rust 1.82+, Xcode Command Line Tools
+
+### Download Model
+
+```bash
+# 8-bit quantized (recommended — 9.6 GB)
+huggingface-cli download moxin-org/MiniCPM4-SALA-9B-8bit-mlx --local-dir ./models/MiniCPM-SALA-8bit
+```
+
+### Examples
+
+```bash
+# Text generation
+cargo run --release -p minicpm-sala-mlx --example generate -- \
+    ./models/MiniCPM-SALA-8bit "Explain quantum entanglement in simple terms."
+
+# Interactive multi-turn chat (strips <think> blocks)
+cargo run --release -p minicpm-sala-mlx --example chat -- \
+    ./models/MiniCPM-SALA-8bit --no-think
+
+# Batched inference (multiple prompts in parallel)
+cargo run --release -p minicpm-sala-mlx --example batch_generate -- \
+    ./models/MiniCPM-SALA-8bit
+
+# Self-speculative decoding (draft from first 8 layers)
+cargo run --release -p minicpm-sala-mlx --example speculative_generate -- \
+    ./models/MiniCPM-SALA-8bit
+
+# Needle-in-a-haystack long context test
+cargo run --release -p minicpm-sala-mlx --example needle_test -- \
+    ./models/MiniCPM-SALA-8bit --context-len 32000 --depth 0.5
+
+# Save quantized weights (fp16 → 4-bit or 8-bit)
+cargo run --release -p minicpm-sala-mlx --example save_quantized -- \
+    ./models/MiniCPM-SALA --bits 8 --output ./models/MiniCPM-SALA-8bit
+```
+
+### OpenAI-Compatible API Server
+
+```bash
+# Start server
+cargo run --release -p minicpm-sala-mlx --example server -- \
+    --model ./models/MiniCPM-SALA-8bit --port 8080 --no-think
+```
+
+**Endpoints:**
+
+| Method | Endpoint | Description |
+|--------|----------|-------------|
+| `POST` | `/v1/chat/completions` | Chat completion (OpenAI-compatible) |
+| `GET`  | `/v1/models` | List available models |
+| `GET`  | `/health` | Health check |
+
+**Chat completion request:**
+
+```bash
+curl http://localhost:8080/v1/chat/completions \
+  -H "Content-Type: application/json" \
+  -d '{
+    "model": "minicpm-sala-9b",
+    "messages": [
+      {"role": "system", "content": "You are a helpful assistant."},
+      {"role": "user", "content": "What is the capital of France?"}
+    ],
+    "temperature": 0.7,
+    "max_tokens": 256
+  }'
+```
+
+**Response:**
+
+```json
+{
+  "id": "chatcmpl-189409a7a2804800",
+  "object": "chat.completion",
+  "model": "minicpm-sala-9b",
+  "choices": [{
+    "index": 0,
+    "message": {"role": "assistant", "content": "The capital of France is Paris."},
+    "finish_reason": "stop"
+  }],
+  "usage": {"prompt_tokens": 32, "completion_tokens": 90, "total_tokens": 122}
+}
+```
+
+**Server options:**
+
+| Flag | Default | Description |
+|------|---------|-------------|
+| `--model` | (required) | Path to model directory |
+| `--port` | 8080 | Server port |
+| `--temperature` | 0.7 | Default sampling temperature |
+| `--max-tokens` | 2048 | Default max generation tokens |
+| `--no-think` | false | Strip `<think>...</think>` from responses |
+
 ## Performance (Apple M3 Max, 128 GB)
 
 ### Throughput
@@ -122,10 +222,11 @@ Tests whether the model can retrieve a specific fact ("The secret verification c
 
 ## Related Projects
 
-This project is part of the [OminiX-MLX](https://github.com/username/OminiX-MLX) ecosystem, which includes:
+This project is part of the [OminiX-MLX](https://github.com/OminiX-ai/OminiX-MLX) ecosystem, which includes:
 - `funasr-mlx` — Speech recognition
 - `moxin-vlm-mlx` — Vision-language model
 - `qwen3-mlx` — Qwen3 language model
+- `gpt-sovits-mlx` — Voice cloning
 
 ## License
 
