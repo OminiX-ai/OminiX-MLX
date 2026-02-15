@@ -34,7 +34,7 @@ rustfft = "6.2"  # FFT for mel spectrogram
 rand = "0.8"     # Dithering for FunASR-compatible preprocessing
 
 # Path utilities
-dirs = "5"
+dirs = "6"
 
 # Punctuation restoration (CT-Transformer via ONNX)
 funasr-mlx = { path = "../funasr-mlx", features = ["punctuation"], optional = true }

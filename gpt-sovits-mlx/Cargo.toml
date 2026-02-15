@@ -63,7 +63,7 @@ byteorder = "1.5"
 clap = { version = "4", features = ["derive"] }
 
 # Path expansion
-dirs = "5"
+dirs = "6"
 
 [features]
 default = []
