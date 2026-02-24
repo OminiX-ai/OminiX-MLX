@@ -1,0 +1,36 @@
+[package]
+name = "qwen3-asr-mlx"
+version = "0.1.0"
+edition = "2021"
+description = "Qwen3-ASR speech recognition on Apple Silicon with MLX"
+license = "Apache-2.0"
+
+[dependencies]
+# MLX framework
+mlx-rs = { path = "../mlx-rs", features = ["metal", "accelerate"] }
+mlx-sys = { path = "../mlx-rs/mlx-sys" }
+
+# Shared LLM infrastructure
+mlx-rs-core = { path = "../mlx-rs-core" }
+
+# Serialization
+serde = { version = "1", features = ["derive"] }
+serde_json = "1"
+
+# Tokenization
+tokenizers = "0.21"
+
+# Error handling
+thiserror = "2"
+
+# Audio processing
+rubato = "0.16"
+hound = "3.5"
+rustfft = "6.2"
+
+# Path utilities
+dirs = "5"
+
+[[example]]
+name = "transcribe"
+path = "examples/transcribe.rs"
