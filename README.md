@@ -52,8 +52,8 @@ Built for production use with zero Python dependencies at inference time.
 ├───────────────┤         ├─────────────────┤         ├─────────────────┤
 │ qwen3-mlx     │         │ funasr-mlx      │         │ flux-klein-mlx  │
 │ glm4-mlx      │         │ funasr-nano-mlx │         │ zimage-mlx      │
-│ glm4-moe-mlx  │         │ gpt-sovits-mlx  │         │ qwen-image-mlx  │
-│ mixtral-mlx   │         │                 │         │                 │
+│ glm4-moe-mlx  │         │ qwen3-asr-mlx   │         │ qwen-image-mlx  │
+│ mixtral-mlx   │         │ gpt-sovits-mlx  │         │                 │
 │ mistral-mlx   │         │                 │         │                 │
 │ moxin-vlm-mlx │         │                 │         │                 │
 │ minicpm-sala   │         │                 │         │                 │
@@ -163,6 +163,9 @@ OminiX-MLX/
 ├── gpt-sovits-mlx/      # GPT-SoVITS voice cloning
 ├── funasr-mlx/          # FunASR Paraformer ASR
 ├── funasr-nano-mlx/     # FunASR-Nano (SenseVoice + Qwen)
+├── qwen3-asr-1.7b-mlx/  # Qwen3-ASR (30+ languages, 0.6B/1.7B)
+│
+├── ominix-api/          # Unified OpenAI-compatible API server
 │
 ├── flux-klein-mlx/      # FLUX.2-klein image generation
 ├── zimage-mlx/          # Z-Image generation
@@ -195,6 +198,7 @@ OminiX-MLX/
 |-------|-------|-----------|-------------|
 | Paraformer-large | `funasr-mlx` | Chinese, English | 18x real-time |
 | FunASR-Nano | `funasr-nano-mlx` | Chinese, English | SenseVoice + Qwen |
+| **Qwen3-ASR** | `qwen3-asr-mlx` | Chinese, English, +28 more | 30-50x real-time, 0.6B/1.7B |
 
 ### Text-to-Speech (TTS)
 
@@ -395,6 +399,55 @@ curl http://localhost:8080/v1/models
 curl -X DELETE http://localhost:8080/v1/models/MiniCPM4-SALA-9B-8bit-mlx
 ```
 
+### Qwen3-ASR (Speech Recognition)
+
+```bash
+# Download model (1.7B 8-bit recommended, 2.46 GB)
+huggingface-cli download mlx-community/Qwen3-ASR-1.7B-8bit \
+    --local-dir ~/.OminiX/models/qwen3-asr-1.7b
+
+# Transcribe audio
+cargo run --release -p qwen3-asr-mlx --example transcribe -- audio.wav
+
+# Specify language
+cargo run --release -p qwen3-asr-mlx --example transcribe -- audio.wav --language English
+
+# Use 0.6B model (faster, 1.01 GB)
+huggingface-cli download mlx-community/Qwen3-ASR-0.6B-8bit \
+    --local-dir ~/.OminiX/models/qwen3-asr-0.6b
+cargo run --release -p qwen3-asr-mlx --example transcribe -- \
+    ~/.OminiX/models/qwen3-asr-0.6b audio.wav
+```
+
+### OminiX-API (Unified API Server)
+
+Single HTTP server for all OminiX model types — currently supports ASR, extensible for LLM/VLM/TTS.
+
+```bash
+# Start API server with ASR model
+cargo run --release -p ominix-api -- \
+    --asr-model ~/.OminiX/models/qwen3-asr-1.7b --port 8080
+
+# Transcribe via API (multipart — OpenAI Whisper-compatible)
+curl http://localhost:8080/v1/audio/transcriptions \
+    -F file=@audio.wav -F language=Chinese
+
+# Transcribe via API (JSON with file path)
+curl http://localhost:8080/v1/audio/transcriptions \
+    -H "Content-Type: application/json" \
+    -d '{"file_path": "audio.wav", "language": "English"}'
+```
+
+**API Endpoints:**
+
+| Method | Endpoint | Description |
+|--------|----------|-------------|
+| POST | `/v1/audio/transcriptions` | Transcribe audio (OpenAI Whisper-compatible) |
+| GET | `/v1/models` | List all models with metadata |
+| POST | `/v1/models/download` | Download model from HuggingFace |
+| DELETE | `/v1/models/{id}` | Delete a model |
+| GET | `/health` | Health check |
+
 ### Image Generation
 
 ```bash
@@ -423,6 +476,8 @@ Benchmarks on Apple M3 Max (128GB):
 | LLM | MiniCPM-SALA-9B-8bit | 28 tok/s | 9.6GB |
 | VLM | Moxin-7B-8bit | 30 tok/s | 10GB |
 | ASR | Paraformer | 18x real-time | 500MB |
+| ASR | Qwen3-ASR-1.7B-8bit | 30x real-time | 2.5GB |
+| ASR | Qwen3-ASR-0.6B-8bit | 50x real-time | 1.0GB |
 | TTS | GPT-SoVITS | 4x real-time | 2GB |
 | Image | Z-Image | ~3s/image | 8GB |
 | Image | FLUX.2-klein | ~5s/image | 13GB |
@@ -441,6 +496,7 @@ Benchmarks on Apple M3 Max (128GB):
 | minicpm-sala-mlx | [README](MiniCPM-SALA-MLX/README.md) | MiniCPM-SALA 9B (hybrid attention, 1M context) |
 | funasr-mlx | [README](funasr-mlx/README.md) | Paraformer ASR |
 | funasr-nano-mlx | [README](funasr-nano-mlx/README.md) | FunASR-Nano |
+| qwen3-asr-mlx | [README](qwen3-asr-1.7b-mlx/README.md) | Qwen3-ASR (30+ languages) |
 | gpt-sovits-mlx | [README](gpt-sovits-mlx/README.md) | Voice cloning |
 
 ## Feature Flags

@@ -43,6 +43,9 @@ members = [
     "glm-4.7-flash-mlx",
     "moxin-vlm-mlx",
     "MiniCPM-SALA-MLX",
+    "qwen3-asr-1.7b-mlx",
+    "qwen3-tts-mlx",
+    "ominix-api",
 ]
 
 resolver = "2"
