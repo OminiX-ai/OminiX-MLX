@@ -128,7 +128,7 @@ Plus 22 Chinese dialects (Sichuan, Cantonese, Wu, Minnan, etc.)
 ## Project Structure
 
 ```
-qwen3-asr-1.7b-mlx/
+qwen3-asr-mlx/
 ├── Cargo.toml
 ├── src/
 │   ├── lib.rs         # Public API, model path resolution
