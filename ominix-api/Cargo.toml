@@ -1,0 +1,37 @@
+[package]
+name = "ominix-api"
+version = "0.1.0"
+edition = "2021"
+description = "Unified OpenAI-compatible API server for OminiX-MLX models"
+license = "Apache-2.0"
+
+[features]
+default = ["asr"]
+asr = ["dep:qwen3-asr-mlx"]
+
+[dependencies]
+# HTTP server
+hyper = { version = "1", features = ["full"] }
+hyper-util = { version = "0.1", features = ["tokio"] }
+http-body-util = "0.1"
+tokio = { version = "1", features = ["full"] }
+
+# CLI
+clap = { version = "4", features = ["derive"] }
+anyhow = "1"
+
+# Serialization
+serde = { version = "1", features = ["derive"] }
+serde_json = "1"
+
+# Model download
+hf-hub = "0.4"
+
+# Audio encoding
+base64 = "0.22"
+
+# Path utilities
+dirs = "5"
+
+# Model crates (feature-gated)
+qwen3-asr-mlx = { path = "../qwen3-asr-mlx", optional = true }

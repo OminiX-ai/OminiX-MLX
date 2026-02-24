@@ -163,7 +163,7 @@ OminiX-MLX/
 ├── gpt-sovits-mlx/      # GPT-SoVITS voice cloning
 ├── funasr-mlx/          # FunASR Paraformer ASR
 ├── funasr-nano-mlx/     # FunASR-Nano (SenseVoice + Qwen)
-├── qwen3-asr-1.7b-mlx/  # Qwen3-ASR (30+ languages, 0.6B/1.7B)
+├── qwen3-asr-mlx/       # Qwen3-ASR (30+ languages, 0.6B/1.7B)
 │
 ├── ominix-api/          # Unified OpenAI-compatible API server
 │
@@ -496,7 +496,7 @@ Benchmarks on Apple M3 Max (128GB):
 | minicpm-sala-mlx | [README](MiniCPM-SALA-MLX/README.md) | MiniCPM-SALA 9B (hybrid attention, 1M context) |
 | funasr-mlx | [README](funasr-mlx/README.md) | Paraformer ASR |
 | funasr-nano-mlx | [README](funasr-nano-mlx/README.md) | FunASR-Nano |
-| qwen3-asr-mlx | [README](qwen3-asr-1.7b-mlx/README.md) | Qwen3-ASR (30+ languages) |
+| qwen3-asr-mlx | [README](qwen3-asr-mlx/README.md) | Qwen3-ASR (30+ languages) |
 | gpt-sovits-mlx | [README](gpt-sovits-mlx/README.md) | Voice cloning |
 
 ## Feature Flags
