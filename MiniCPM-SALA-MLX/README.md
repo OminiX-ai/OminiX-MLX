@@ -197,6 +197,37 @@ MiniCPM-SALA (Rust/mlx-rs) vs Qwen3-8B (Python/mlx-lm):
 | Think-loop Failures | 3 | 0 (stuck) | — |
 | **Total** | **11** | **8** | **7 (87.5%)** |
 
+### Function Calling — BFCL v4 (8-bit, temp=0.01)
+
+Evaluated on the [Berkeley Function Calling Leaderboard (BFCL) v4](https://gorilla.cs.berkeley.edu/leaderboard.html) non-live categories via [OminiX-API](https://github.com/moxin-org/OminiX-API) (50 samples per category, Prompt mode — bare JSON output, no dedicated FC format).
+
+| Category | Score | Accuracy |
+|----------|-------|----------|
+| Simple (Python) | 37/50 | 74.0% |
+| Multiple | 38/50 | 76.0% |
+| Parallel | 38/50 | 76.0% |
+| Parallel Multiple | 34/50 | 68.0% |
+| Irrelevance | 45/50 | 90.0% |
+| **Overall** | **192/250** | **76.8%** |
+
+**Leaderboard context** (Non-Live Overall, [Dec 2025 data](https://github.com/HuanzhiMao/BFCL-Result/tree/main/2025-12-16/score)):
+
+| Rank | Model | Size | Overall | Simple | Multiple | Parallel | Par.Mult. | Irrel. |
+|------|-------|------|---------|--------|----------|----------|-----------|--------|
+| 16 | Qwen3-8B (Prompt) | 8B | 88.56% | 75.25% | 95.00% | 94.50% | 89.50% | 87.50% |
+| 68 | MiniCPM3-4B-FC (FC) | 4B | 81.75% | 70.50% | 92.00% | 84.00% | 80.50% | 68.75% |
+| 78 | Granite-3.1-8B (FC) | 8B | 78.33% | 67.33% | 92.00% | 84.00% | 70.00% | 86.67% |
+| **~79** | **MiniCPM-SALA-9B (ours)** | **9B** | **76.8%** | **74.0%** | **76.0%** | **76.0%** | **68.0%** | **90.0%** |
+| 80 | Amazon-Nova-Micro (FC) | — | 74.10% | 70.92% | 87.50% | 75.50% | 62.50% | 70.83% |
+| 85 | MiniCPM3-4B (Prompt) | 4B | 70.54% | 66.17% | 77.00% | 70.00% | 69.00% | 70.83% |
+
+**Notes:**
+- SALA uses **Prompt mode** (outputs bare JSON `{"name": ..., "arguments": ...}`), not a dedicated function-calling format — FC-tuned models typically score higher
+- **Irrelevance detection (90%)** is a strong point, competitive with top-tier models
+- Main weakness is multiple/parallel where FC-tuned models dominate with 90%+
+- Tested on 50 samples per category (leaderboard uses 200-400); scores may shift with full evaluation
+- "Simple" here is Python-only; leaderboard averages Python/Java/JavaScript
+
 ### Needle-in-a-Haystack (8-bit, greedy)
 
 Tests whether the model can retrieve a specific fact ("The secret verification code for Project Aurora is 739258") buried at various depths in long filler text.
