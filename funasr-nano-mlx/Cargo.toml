@@ -20,7 +20,7 @@ serde_json = "1"
 serde_yaml = "0.9"
 
 # Tokenization
-tokenizers = "0.21"
+tokenizers = "0.22"
 
 # Error handling
 thiserror = "2"

@@ -17,7 +17,7 @@ safetensors.workspace = true
 bytemuck.workspace = true
 memmap2.workspace = true
 serde_json = "1"
-tokenizers = "0.21"
+tokenizers = "0.22"
 mlx-sys = { path = "../mlx-rs/mlx-sys" }
 
 [dev-dependencies]
