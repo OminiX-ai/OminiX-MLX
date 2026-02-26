@@ -42,7 +42,7 @@ members = [
     "step-audio2-mlx",
     "glm-4.7-flash-mlx",
     "moxin-vlm-mlx",
-    "MiniCPM-SALA-MLX",
+    "minicpm-sala-mlx",
     "qwen3-asr-mlx",
     "qwen3-tts-mlx",
     "ominix-api",

@@ -3,7 +3,7 @@ name = "funasr-qwen4b-mlx"
 version = "0.1.0"
 edition = "2021"
 description = "LLM-based ASR with SenseVoice encoder + Qwen3-4B on Apple Silicon MLX"
-license = "MIT"
+license = "MIT OR Apache-2.0"
 
 [dependencies]
 # MLX framework

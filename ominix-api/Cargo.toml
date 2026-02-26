@@ -3,7 +3,7 @@ name = "ominix-api"
 version = "0.1.0"
 edition = "2021"
 description = "Unified OpenAI-compatible API server for OminiX-MLX models"
-license = "Apache-2.0"
+license = "MIT OR Apache-2.0"
 
 [features]
 default = ["asr"]

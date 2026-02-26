@@ -8,7 +8,7 @@ description = "GPT-SoVITS voice cloning in pure Rust with MLX acceleration"
 repository = "https://github.com/user/gpt-sovits-mlx"
 keywords = ["tts", "voice-cloning", "mlx", "gpt-sovits"]
 categories = ["multimedia::audio"]
-license = "MIT"
+license = "MIT OR Apache-2.0"
 
 [dependencies]
 # MLX bindings (from parent workspace)

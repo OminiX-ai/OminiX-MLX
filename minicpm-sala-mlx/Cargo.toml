@@ -3,7 +3,7 @@ name = "minicpm-sala-mlx"
 version = "0.1.0"
 edition = "2021"
 description = "MiniCPM-SALA hybrid attention model inference on Apple Silicon with MLX"
-license = "Apache-2.0"
+license = "MIT OR Apache-2.0"
 
 [dependencies]
 mlx-rs = { path = "../mlx-rs", features = ["metal", "accelerate"] }

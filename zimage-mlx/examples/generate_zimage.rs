@@ -19,6 +19,7 @@ use flux_klein_mlx::{load_safetensors, sanitize_vae_weights};
 use zimage_mlx::{
     ZImageTransformer, ZImageConfig, create_coordinate_grid, sanitize_zimage_weights, sanitize_mlx_weights,
     QuantizedQwen3TextEncoder, sanitize_quantized_qwen3_weights,
+    ZImageTransformerQuantized, load_quantized_zimage_transformer,
 };
 use hf_hub::api::sync::ApiBuilder;
 use mlx_rs::module::ModuleParameters;
@@ -26,6 +27,39 @@ use mlx_rs::ops::indexing::IndexOp;
 use mlx_rs::Array;
 use std::collections::HashMap;
 use tokenizers::Tokenizer;
+
+// Wrapper for both Standard (f32/bf16) and Quantized (4-bit) transformers
+enum Transformer {
+    Standard(ZImageTransformer),
+    Quantized(ZImageTransformerQuantized),
+}
+
+impl Transformer {
+    fn compute_rope(&self, x_pos: &Array, cap_pos: &Array) -> Result<(Array, Array), mlx_rs::error::Exception> {
+        match self {
+            Transformer::Standard(t) => t.compute_rope(x_pos, cap_pos),
+            Transformer::Quantized(t) => t.compute_rope(x_pos, cap_pos),
+        }
+    }
+    
+    fn forward_with_rope(
+        &mut self,
+        x: &Array,
+        t: &Array,
+        cap_feats: &Array,
+        x_pos: &Array,
+        cap_pos: &Array,
+        cos: &Array,
+        sin: &Array,
+        x_mask: Option<&Array>,
+        cap_mask: Option<&Array>,
+    ) -> Result<Array, mlx_rs::error::Exception> {
+        match self {
+            Transformer::Standard(m) => m.forward_with_rope(x, t, cap_feats, x_pos, cap_pos, cos, sin, x_mask, cap_mask),
+            Transformer::Quantized(m) => m.forward_with_rope(x, t, cap_feats, x_pos, cap_pos, cos, sin, x_mask, cap_mask),
+        }
+    }
+}
 
 fn main() -> Result<(), Box<dyn std::error::Error>> {
     // Parse command line arguments
@@ -49,6 +83,8 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
     println!("=== Z-Image-Turbo Image Generation ===");
     if use_quantize {
         println!("Mode: 4-bit Quantized");
+    } else {
+        println!("Mode: Auto (prefer quantized if available)");
     }
     println!("Prompt: \"{}\"\n", prompt);
 
@@ -79,6 +115,17 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
         }
         Err(e) => {
             println!("  Warning: Could not find transformer config: {}", e);
+            None
+        }
+    };
+
+    let transformer_weights_path = match zimage_repo.get("transformer/model.safetensors") {
+        Ok(path) => {
+            println!("  Transformer weights: downloaded");
+            Some(path)
+        }
+        Err(e) => {
+            println!("  Warning: Could not download transformer weights: {}", e);
             None
         }
     };
@@ -274,79 +321,74 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
     println!("  cap_feat_dim: {}", zimage_config.cap_feat_dim);
 
     // Create transformer model
-    let start = std::time::Instant::now();
-    let mut transformer = ZImageTransformer::new(zimage_config.clone())?;
-    println!("  Model created in {:?}", start.elapsed());
-
-    // Try to load transformer weights - first try dequantized MLX, then PyTorch
-    let dequant_mlx_path = std::path::Path::new("/tmp/zimage_dequantized.safetensors");
-    let pytorch_transformer_path = std::path::Path::new("models/zimage-turbo-pytorch/transformer");
-
-    let weights_opt = if dequant_mlx_path.exists() {
-        // Use dequantized MLX weights (known to work with Python implementation)
-        println!("  Loading dequantized MLX weights...");
+    let mut transformer = if let Some(ref path) = transformer_weights_path {
+        // Preference 1: Downloaded MLX model (Quantized)
+        println!("  Loading weights from downloaded MLX model (Quantized)...");
         let start = std::time::Instant::now();
-        let raw_weights = load_safetensors(dequant_mlx_path)?;
+        let raw_weights = load_safetensors(path)?;
         println!("  Loaded {} raw weights", raw_weights.len());
-        let weights = sanitize_mlx_weights(raw_weights);
-        println!("  Sanitized to {} weights in {:?}", weights.len(), start.elapsed());
-        Some(weights)
-    } else if pytorch_transformer_path.exists() {
-        let shard1 = pytorch_transformer_path.join("diffusion_pytorch_model-00001-of-00003.safetensors");
-        if shard1.exists() {
-            println!("  Loading weights from PyTorch model...");
+        
+        let t = load_quantized_zimage_transformer(raw_weights, zimage_config.clone())?;
+        println!("  Quantized transformer loaded in {:?}", start.elapsed());
+        Transformer::Quantized(t)
+    } else {
+        // Preference 2: Local dequantized or PyTorch model
+        println!("  Initializing standard transformer...");
+        let mut t = ZImageTransformer::new(zimage_config.clone())?;
+        
+        let dequant_mlx_path = std::path::Path::new("/tmp/zimage_dequantized.safetensors");
+        let pytorch_transformer_path = std::path::Path::new("models/zimage-turbo-pytorch/transformer");
+        
+        let weights_opt = if dequant_mlx_path.exists() {
+            println!("  Loading dequantized MLX weights from /tmp...");
             let start = std::time::Instant::now();
-
-            let mut all_weights = HashMap::new();
-            for i in 1..=3 {
-                let shard_path = pytorch_transformer_path.join(format!("diffusion_pytorch_model-0000{}-of-00003.safetensors", i));
-                if shard_path.exists() {
-                    let shard_weights = load_safetensors(&shard_path)?;
-                    println!("    Loaded shard {}: {} weights", i, shard_weights.len());
-                    all_weights.extend(shard_weights);
-                }
-            }
-
-            let weights = sanitize_zimage_weights(all_weights);
-            println!("  Sanitized {} weights in {:?}", weights.len(), start.elapsed());
+            let raw_weights = load_safetensors(dequant_mlx_path)?;
+            let weights = sanitize_mlx_weights(raw_weights);
+            println!("  Sanitized to {} weights in {:?}", weights.len(), start.elapsed());
             Some(weights)
+        } else if pytorch_transformer_path.exists() {
+            println!("  Checking PyTorch weights...");
+            let shard1 = pytorch_transformer_path.join("diffusion_pytorch_model-00001-of-00003.safetensors");
+            if shard1.exists() {
+                 println!("  Loading weights from PyTorch model...");
+                 let mut all_weights = HashMap::new();
+                 for i in 1..=3 {
+                     let shard_path = pytorch_transformer_path.join(format!("diffusion_pytorch_model-0000{}-of-00003.safetensors", i));
+                     if shard_path.exists() {
+                         let shard_weights = load_safetensors(&shard_path)?;
+                         all_weights.extend(shard_weights);
+                     }
+                 }
+                 let weights = sanitize_zimage_weights(all_weights);
+                 Some(weights)
+            } else {
+                None
+            }
         } else {
             None
+        };
+        
+        if let Some(weights) = weights_opt {
+             let weights: HashMap<String, Array> = weights
+                .into_iter()
+                .map(|(k, v)| {
+                    let v32 = v.as_type::<f32>().unwrap_or(v);
+                    (k, v32)
+                })
+                .collect();
+                
+             let weights_rc: HashMap<std::rc::Rc<str>, Array> = weights
+                .into_iter()
+                .map(|(k, v)| (std::rc::Rc::from(k.as_str()), v))
+                .collect();
+             t.update_flattened(weights_rc);
+             println!("  Standard transformer weights loaded/updated.");
+        } else {
+             println!("  Note: Using random weights (no standard transformer weights found)");
         }
-    } else {
-        None
+        
+        Transformer::Standard(t)
     };
-
-    if let Some(weights) = weights_opt {
-        // Convert bf16 to f32 if needed
-        let weights: HashMap<String, Array> = weights
-            .into_iter()
-            .map(|(k, v)| {
-                let v32 = v.as_type::<f32>().unwrap_or(v);
-                (k, v32)
-            })
-            .collect();
-
-        // Check weights before loading
-        let te_before = transformer.t_embedder.linear1.weight.sum(None)?.item::<f32>();
-        let layer_before = transformer.layers[0].attention.to_q.weight.sum(None)?.item::<f32>();
-        println!("  Before: t_embedder.linear1={:.2}, layers.0.attention.to_q={:.2}", te_before, layer_before);
-
-        // Load into model
-        let weights_rc: HashMap<std::rc::Rc<str>, Array> = weights
-            .into_iter()
-            .map(|(k, v)| (std::rc::Rc::from(k.as_str()), v))
-            .collect();
-        transformer.update_flattened(weights_rc);
-
-        // Verify weights loaded
-        let te_after = transformer.t_embedder.linear1.weight.sum(None)?.item::<f32>();
-        let layer_after = transformer.layers[0].attention.to_q.weight.sum(None)?.item::<f32>();
-        println!("  After: t_embedder.linear1={:.2}, layers.0.attention.to_q={:.2}", te_after, layer_after);
-        println!("  Weights changed: t_embedder={}, layers.0.to_q={}", te_before != te_after, layer_before != layer_after);
-    } else {
-        println!("  Note: Using random weights (no transformer weights found)");
-    }
 
     // =========================================================================
     // Step 4: Load VAE decoder
@@ -587,7 +629,7 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
     // Step 9: Denoising loop (placeholder)
     // =========================================================================
     println!("\nStep 9: Denoising loop (placeholder)...");
-    println!("  Note: Using random weights, output will be noise");
+    println!("  Denoising loop...");
 
     // Flow matching Euler scheduler
     // sigma=1 is noise, sigma=0 is clean data

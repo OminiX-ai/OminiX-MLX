@@ -50,3 +50,6 @@ build/
 
 # Debug/test files
 *.tmp.claude/
+
+# Downloaded model weights
+models/
