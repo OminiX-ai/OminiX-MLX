@@ -3,7 +3,7 @@ name = "funasr-nano-mlx"
 version = "0.1.0"
 edition = "2021"
 description = "Fun-ASR-Nano speech recognition on Apple Silicon with MLX"
-license = "MIT"
+license = "MIT OR Apache-2.0"
 repository = "https://github.com/example/funasr-nano-mlx"
 
 [dependencies]

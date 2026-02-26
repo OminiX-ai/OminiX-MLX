@@ -3,7 +3,7 @@ name = "qwen3-asr-mlx"
 version = "0.1.0"
 edition = "2021"
 description = "Qwen3-ASR speech recognition on Apple Silicon with MLX"
-license = "Apache-2.0"
+license = "MIT OR Apache-2.0"
 
 [dependencies]
 # MLX framework
