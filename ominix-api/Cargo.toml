@@ -6,13 +6,16 @@ description = "Unified OpenAI-compatible API server for OminiX-MLX models"
 license = "MIT OR Apache-2.0"
 
 [features]
-default = ["asr"]
+default = ["asr", "tts"]
 asr = ["dep:qwen3-asr-mlx"]
+tts = ["dep:qwen3-tts-mlx"]
+llm = ["dep:qwen3-5-35b-mlx", "dep:mlx-rs"]
 
 [dependencies]
 # HTTP server
 hyper = { version = "1", features = ["full"] }
 hyper-util = { version = "0.1", features = ["tokio"] }
+http-body = "1"
 http-body-util = "0.1"
 tokio = { version = "1", features = ["full"] }
 
@@ -33,5 +36,11 @@ base64 = "0.22"
 # Path utilities
 dirs = "5"
 
+# Streaming SSE
+tokio-stream = "0.1"
+
 # Model crates (feature-gated)
 qwen3-asr-mlx = { path = "../qwen3-asr-mlx", optional = true }
+qwen3-tts-mlx = { path = "../qwen3-tts-mlx", optional = true }
+qwen3-5-35b-mlx = { path = "../qwen3.5-35B-mlx", optional = true }
+mlx-rs = { path = "../mlx-rs", features = ["metal", "accelerate"], optional = true }
