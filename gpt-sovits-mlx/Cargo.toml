@@ -54,7 +54,7 @@ ndarray = "0.17.2"
 rand = "0.8"
 
 # ONNX manipulation
-safetensors = "0.5"
+safetensors = "0.7"
 onnx-pb = "0.1"
 prost_old = { package = "prost", version = "0.6.1" }
 byteorder = "1.5"
