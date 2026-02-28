@@ -45,6 +45,7 @@ members = [
     "minicpm-sala-mlx",
     "qwen3-asr-mlx",
     "qwen3-tts-mlx",
+    "qwen3.5-35B-mlx",
     "ominix-api",
 ]
 
