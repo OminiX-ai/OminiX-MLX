@@ -513,7 +513,8 @@ fn get_weight(weights: &HashMap<String, Array>, key: &str) -> Result<Array> {
 }
 
 /// Load a Conv1d from weight keys. MLX Conv1d weight shape: [out, kernel, in] (NLC format).
-/// PyTorch saves [out, in, kernel], so we may need to transpose.
+/// PyTorch saves [out, in, kernel], so we transpose only when needed.
+/// `needs_transpose`: true if weights are in PyTorch format and need transposing.
 fn load_conv1d(
     weights: &HashMap<String, Array>,
     prefix: &str,
@@ -521,6 +522,7 @@ fn load_conv1d(
     padding: i32,
     dilation: i32,
     groups: i32,
+    needs_transpose: bool,
 ) -> Result<(nn::Conv1d, Option<Array>)> {
     let weight_key = format!("{prefix}.weight");
     let bias_key = format!("{prefix}.bias");
@@ -528,10 +530,13 @@ fn load_conv1d(
     let weight = get_weight(weights, &weight_key)?;
     let bias = weights.get(&bias_key).cloned();
 
-    // MLX Conv1d expects weight shape [out, kernel, in]
-    // PyTorch Conv1d has weight shape [out, in, kernel]
-    // Transpose axes [0, 2, 1] to convert
-    let weight = weight.transpose_axes(&[0, 2, 1])?;
+    // Only transpose if weights are in PyTorch format [out, in, kernel]
+    // MLX format is already [out, kernel, in]
+    let weight = if needs_transpose {
+        weight.transpose_axes(&[0, 2, 1])?
+    } else {
+        weight
+    };
 
     let conv = nn::Conv1d {
         weight: Param::new(weight),
@@ -551,9 +556,10 @@ fn load_tdnn(
     prefix: &str,
     kernel_size: i32,
     dilation: i32,
+    needs_transpose: bool,
 ) -> Result<TdnnBlock> {
     let padding = ((kernel_size - 1) * dilation) / 2; // same padding
-    let (conv, _) = load_conv1d(weights, &format!("{prefix}.conv"), 1, padding, dilation, 1)?;
+    let (conv, _) = load_conv1d(weights, &format!("{prefix}.conv"), 1, padding, dilation, 1, needs_transpose)?;
     Ok(TdnnBlock { conv })
 }
 
@@ -565,6 +571,7 @@ fn load_res2net(
     kernel_size: i32,
     dilation: i32,
     scale: i32,
+    needs_transpose: bool,
 ) -> Result<Res2NetBlock> {
     let chunk_size = channels / scale;
     let padding = ((kernel_size - 1) * dilation) / 2;
@@ -578,6 +585,7 @@ fn load_res2net(
             padding,
             dilation,
             1,
+            needs_transpose,
         )?;
         blocks.push(TdnnBlock { conv });
     }
@@ -593,9 +601,10 @@ fn load_res2net(
 fn load_se_block(
     weights: &HashMap<String, Array>,
     prefix: &str,
+    needs_transpose: bool,
 ) -> Result<SeBlock> {
-    let (conv1, _) = load_conv1d(weights, &format!("{prefix}.conv1"), 1, 0, 1, 1)?;
-    let (conv2, _) = load_conv1d(weights, &format!("{prefix}.conv2"), 1, 0, 1, 1)?;
+    let (conv1, _) = load_conv1d(weights, &format!("{prefix}.conv1"), 1, 0, 1, 1, needs_transpose)?;
+    let (conv2, _) = load_conv1d(weights, &format!("{prefix}.conv2"), 1, 0, 1, 1, needs_transpose)?;
     Ok(SeBlock { conv1, conv2 })
 }
 
@@ -607,8 +616,9 @@ fn load_se_res2net_block(
     kernel_size: i32,
     dilation: i32,
     scale: i32,
+    needs_transpose: bool,
 ) -> Result<SeRes2NetBlock> {
-    let tdnn1 = load_tdnn(weights, &format!("{prefix}.tdnn1"), 1, 1)?;
+    let tdnn1 = load_tdnn(weights, &format!("{prefix}.tdnn1"), 1, 1, needs_transpose)?;
     let res2net_block = load_res2net(
         weights,
         &format!("{prefix}.res2net_block"),
@@ -616,9 +626,10 @@ fn load_se_res2net_block(
         kernel_size,
         dilation,
         scale,
+        needs_transpose,
     )?;
-    let tdnn2 = load_tdnn(weights, &format!("{prefix}.tdnn2"), 1, 1)?;
-    let se_block = load_se_block(weights, &format!("{prefix}.se_block"))?;
+    let tdnn2 = load_tdnn(weights, &format!("{prefix}.tdnn2"), 1, 1, needs_transpose)?;
+    let se_block = load_se_block(weights, &format!("{prefix}.se_block"), needs_transpose)?;
 
     Ok(SeRes2NetBlock {
         tdnn1,
@@ -636,6 +647,15 @@ pub fn load_speaker_encoder(
 ) -> Result<SpeakerEncoder> {
     let prefix = "speaker_encoder";
 
+    // Detect weight format: PyTorch [out, in, kernel] vs MLX [out, kernel, in]
+    // Check initial conv (kernel_size=5, mel_dim=128): unambiguous since 5 ≠ 128
+    let test_key = format!("{prefix}.blocks.0.conv.weight");
+    let test_weight = get_weight(weights, &test_key)?;
+    let shape = test_weight.shape();
+    // PyTorch: [512, 128, 5] → shape[2]=5 < shape[1]=128 → needs transpose
+    // MLX:     [512, 5, 128] → shape[2]=128 > shape[1]=5 → already correct
+    let needs_transpose = shape[2] < shape[1];
+
     // blocks.0: initial TDNN (mel_dim → enc_channels[0], k=5, d=1)
     let padding0 = ((config.enc_kernel_sizes[0] - 1) * config.enc_dilations[0]) / 2;
     let (initial_conv, _) = load_conv1d(
@@ -645,6 +665,7 @@ pub fn load_speaker_encoder(
         padding0,
         config.enc_dilations[0],
         1,
+        needs_transpose,
     )?;
     let initial_tdnn = TdnnBlock { conv: initial_conv };
 
@@ -658,6 +679,7 @@ pub fn load_speaker_encoder(
             config.enc_kernel_sizes[i],
             config.enc_dilations[i],
             config.enc_res2net_scale,
+            needs_transpose,
         )?;
         se_res2net_blocks.push(block);
     }
@@ -670,12 +692,13 @@ pub fn load_speaker_encoder(
         0,
         1,
         1,
+        needs_transpose,
     )?;
     let mfa = TdnnBlock { conv: mfa_conv };
 
     // ASP: Attentive Statistics Pooling
     // TDNN: 3*1536=4608 → attn_channels
-    let asp_tdnn = load_tdnn(weights, &format!("{prefix}.asp.tdnn"), 1, 1)?;
+    let asp_tdnn = load_tdnn(weights, &format!("{prefix}.asp.tdnn"), 1, 1, needs_transpose)?;
     let (asp_conv, _) = load_conv1d(
         weights,
         &format!("{prefix}.asp.conv"),
@@ -683,6 +706,7 @@ pub fn load_speaker_encoder(
         0,
         1,
         1,
+        needs_transpose,
     )?;
     let asp = AttentiveStatisticsPooling {
         tdnn: asp_tdnn,
@@ -698,6 +722,7 @@ pub fn load_speaker_encoder(
         0,
         1,
         1,
+        needs_transpose,
     )?;
 
     Ok(SpeakerEncoder {
