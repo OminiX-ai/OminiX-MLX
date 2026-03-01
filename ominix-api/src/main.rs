@@ -682,92 +682,130 @@ fn tts_inference_worker(
     mut rx: mpsc::Receiver<TtsRequest>,
 ) {
     while let Some(req) = rx.blocking_recv() {
-        let start = Instant::now();
-        let sr = &req.speech_req;
-
-        let speaker = sr.voice.as_deref().unwrap_or(&req.default_speaker);
-        let language = sr.language.as_deref().unwrap_or(&req.default_language);
-
-        let opts = qwen3_tts_mlx::SynthesizeOptions {
-            speaker,
-            language,
-            temperature: sr.temperature,
-            top_k: sr.top_k,
-            top_p: sr.top_p,
-            max_new_tokens: None,
-            seed: sr.seed,
-        };
-
-        let result = if let Some(ref instruct) = sr.instruct {
-            // Voice design mode
-            synth
-                .synthesize_voice_design_with_timing(&sr.input, instruct, language, &opts)
-        } else if let Some(ref ref_audio_b64) = sr.reference_audio {
-            // Voice cloning mode
-            use base64::Engine;
-            let decoded = match base64::prelude::BASE64_STANDARD.decode(ref_audio_b64) {
-                Ok(d) => d,
-                Err(e) => {
-                    let _ = req.response_tx.send(Err(format!("Invalid base64 reference_audio: {}", e)));
-                    continue;
-                }
-            };
-
-            // Decode WAV bytes to f32 samples
-            let ref_samples = match decode_wav_to_f32(&decoded) {
-                Ok(s) => s,
-                Err(e) => {
-                    let _ = req.response_tx.send(Err(format!("Invalid reference audio WAV: {}", e)));
-                    continue;
-                }
-            };
-
-            if let Some(ref ref_text) = sr.reference_text {
-                // ICL voice cloning (note: may not work well on Apple Silicon)
-                synth.synthesize_voice_clone_icl_with_timing(
-                    &sr.input, &ref_samples, ref_text, language, &opts,
-                )
-            } else {
-                // x_vector_only voice cloning
-                synth.synthesize_voice_clone_with_timing(
-                    &sr.input, &ref_samples, language, &opts,
-                )
-            }
-        } else {
-            // Standard preset speaker mode
-            synth.synthesize_with_timing(&sr.input, &opts)
-        };
-
+        let result = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
+            tts_process_request(&mut synth, &req)
+        }));
         let result = match result {
-            Ok((samples, timing)) => {
-                let normalized = qwen3_tts_mlx::normalize_audio(&samples, 0.95);
-                let duration_secs = samples.len() as f32 / synth.sample_rate as f32;
-                let wav_bytes = encode_wav_bytes(&normalized, synth.sample_rate);
-                eprintln!(
-                    "[{}] TTS: {:.1}s audio in {:.0}ms (prefill={:.0}ms gen={:.0}ms decode={:.0}ms)",
-                    timestamp(),
-                    duration_secs,
-                    timing.total_ms,
-                    timing.prefill_ms,
-                    timing.generation_ms,
-                    timing.decode_ms,
-                );
-                Ok(TtsResult {
-                    wav_bytes,
-                    duration_secs,
-                    processing_secs: start.elapsed().as_secs_f32(),
-                })
+            Ok(r) => r,
+            Err(panic_info) => {
+                let msg = if let Some(s) = panic_info.downcast_ref::<&str>() {
+                    format!("TTS worker panic: {}", s)
+                } else if let Some(s) = panic_info.downcast_ref::<String>() {
+                    format!("TTS worker panic: {}", s)
+                } else {
+                    "TTS worker panic (unknown payload)".to_string()
+                };
+                eprintln!("[{}] {}", timestamp(), msg);
+                Err(msg)
             }
-            Err(e) => Err(format!("{}", e)),
+        };
+        let _ = req.response_tx.send(result);
+    }
+}
+
+#[cfg(feature = "tts")]
+fn tts_process_request(
+    synth: &mut qwen3_tts_mlx::Synthesizer,
+    req: &TtsRequest,
+) -> std::result::Result<TtsResult, String> {
+    let start = Instant::now();
+    let sr = &req.speech_req;
+
+    let speaker = sr.voice.as_deref().unwrap_or(&req.default_speaker);
+    let language = sr.language.as_deref().unwrap_or(&req.default_language);
+
+    let opts = qwen3_tts_mlx::SynthesizeOptions {
+        speaker,
+        language,
+        temperature: sr.temperature,
+        top_k: sr.top_k,
+        top_p: sr.top_p,
+        max_new_tokens: None,
+        seed: sr.seed,
+    };
+
+    let result = if let Some(ref instruct) = sr.instruct {
+        // Voice design mode
+        synth
+            .synthesize_voice_design_with_timing(&sr.input, instruct, language, &opts)
+    } else if let Some(ref ref_audio_b64) = sr.reference_audio {
+        // Voice cloning mode
+        use base64::Engine;
+        let decoded = base64::prelude::BASE64_STANDARD
+            .decode(ref_audio_b64)
+            .map_err(|e| format!("Invalid base64 reference_audio: {}", e))?;
+
+        // Decode WAV bytes to f32 samples
+        let (ref_samples, ref_sr) = decode_wav_to_f32(&decoded)
+            .map_err(|e| format!("Invalid reference audio WAV: {}", e))?;
+
+        // Resample to 24kHz if needed (speaker encoder expects 24kHz)
+        let ref_samples = if ref_sr != synth.sample_rate {
+            eprintln!(
+                "[{}] Resampling reference audio: {}Hz -> {}Hz",
+                timestamp(), ref_sr, synth.sample_rate
+            );
+            resample_linear(&ref_samples, ref_sr, synth.sample_rate)
+        } else {
+            ref_samples
         };
 
-        let _ = req.response_tx.send(result);
+        // Trim reference audio to max 6 seconds to avoid speaker encoder issues
+        let max_ref_samples = synth.sample_rate as usize * 6;
+        let ref_samples = if ref_samples.len() > max_ref_samples {
+            eprintln!(
+                "[{}] Trimming reference audio: {:.1}s -> 6.0s",
+                timestamp(),
+                ref_samples.len() as f32 / synth.sample_rate as f32
+            );
+            ref_samples[..max_ref_samples].to_vec()
+        } else {
+            ref_samples
+        };
+
+        if let Some(ref ref_text) = sr.reference_text {
+            // ICL voice cloning (note: may not work well on Apple Silicon)
+            synth.synthesize_voice_clone_icl_with_timing(
+                &sr.input, &ref_samples, ref_text, language, &opts,
+            )
+        } else {
+            // x_vector_only voice cloning
+            synth.synthesize_voice_clone_with_timing(
+                &sr.input, &ref_samples, language, &opts,
+            )
+        }
+    } else {
+        // Standard preset speaker mode
+        synth.synthesize_with_timing(&sr.input, &opts)
+    };
+
+    match result {
+        Ok((samples, timing)) => {
+            let normalized = qwen3_tts_mlx::normalize_audio(&samples, 0.95);
+            let duration_secs = samples.len() as f32 / synth.sample_rate as f32;
+            let wav_bytes = encode_wav_bytes(&normalized, synth.sample_rate);
+            eprintln!(
+                "[{}] TTS: {:.1}s audio in {:.0}ms (prefill={:.0}ms gen={:.0}ms decode={:.0}ms)",
+                timestamp(),
+                duration_secs,
+                timing.total_ms,
+                timing.prefill_ms,
+                timing.generation_ms,
+                timing.decode_ms,
+            );
+            Ok(TtsResult {
+                wav_bytes,
+                duration_secs,
+                processing_secs: start.elapsed().as_secs_f32(),
+            })
+        }
+        Err(e) => Err(format!("{}", e)),
     }
 }
 
 /// Decode raw WAV bytes (16-bit PCM or 32-bit float) into f32 samples.
 #[cfg(feature = "tts")]
-fn decode_wav_to_f32(data: &[u8]) -> std::result::Result<Vec<f32>, String> {
+fn decode_wav_to_f32(data: &[u8]) -> std::result::Result<(Vec<f32>, u32), String> {
     if data.len() < 44 {
         return Err("WAV data too short".into());
     }
@@ -778,6 +816,7 @@ fn decode_wav_to_f32(data: &[u8]) -> std::result::Result<Vec<f32>, String> {
     // Parse fmt chunk
     let audio_format = u16::from_le_bytes([data[20], data[21]]);
     let num_channels = u16::from_le_bytes([data[22], data[23]]) as usize;
+    let sample_rate = u32::from_le_bytes([data[24], data[25], data[26], data[27]]);
     let bits_per_sample = u16::from_le_bytes([data[34], data[35]]);
 
     // Find data chunk
@@ -816,7 +855,7 @@ fn decode_wav_to_f32(data: &[u8]) -> std::result::Result<Vec<f32>, String> {
                 ));
             };
 
-            return Ok(samples);
+            return Ok((samples, sample_rate));
         }
 
         pos += 8 + chunk_size;
@@ -827,6 +866,28 @@ fn decode_wav_to_f32(data: &[u8]) -> std::result::Result<Vec<f32>, String> {
     }
 
     Err("No data chunk found in WAV".into())
+}
+
+/// Resample audio using linear interpolation.
+#[cfg(feature = "tts")]
+fn resample_linear(samples: &[f32], from_sr: u32, to_sr: u32) -> Vec<f32> {
+    if from_sr == to_sr || samples.is_empty() {
+        return samples.to_vec();
+    }
+    let ratio = from_sr as f64 / to_sr as f64;
+    let out_len = (samples.len() as f64 / ratio) as usize;
+    let mut out = Vec::with_capacity(out_len);
+    for i in 0..out_len {
+        let src_pos = i as f64 * ratio;
+        let idx = src_pos as usize;
+        let frac = (src_pos - idx as f64) as f32;
+        if idx + 1 < samples.len() {
+            out.push(samples[idx] * (1.0 - frac) + samples[idx + 1] * frac);
+        } else if idx < samples.len() {
+            out.push(samples[idx]);
+        }
+    }
+    out
 }
 
 // ============================================================================
@@ -1339,8 +1400,8 @@ async fn handle_speech(
             timestamp(),
             voice,
             lang,
-            if speech_req.input.len() > 80 {
-                format!("{}...", &speech_req.input[..80])
+            if speech_req.input.chars().count() > 40 {
+                format!("{}...", speech_req.input.chars().take(40).collect::<String>())
             } else {
                 speech_req.input.clone()
             }
