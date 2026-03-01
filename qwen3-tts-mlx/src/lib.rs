@@ -56,6 +56,8 @@ pub struct SynthesizeOptions<'a> {
     pub top_p: Option<f32>,
     pub max_new_tokens: Option<i32>,
     pub seed: Option<u64>,
+    /// Speed factor: > 1.0 = faster, < 1.0 = slower. Default 1.0.
+    pub speed_factor: Option<f32>,
 }
 
 impl Default for SynthesizeOptions<'_> {
@@ -68,6 +70,7 @@ impl Default for SynthesizeOptions<'_> {
             top_p: None,
             max_new_tokens: None,
             seed: None,
+            speed_factor: None,
         }
     }
 }
@@ -238,6 +241,9 @@ impl Synthesizer {
         if let Some(n) = opts.max_new_tokens {
             gen_config.max_new_tokens = n;
         }
+        if let Some(s) = opts.speed_factor {
+            gen_config.speed_factor = s;
+        }
 
         // Tokenize text
         let encoding = self
@@ -338,6 +344,9 @@ impl Synthesizer {
         }
         if let Some(n) = opts.max_new_tokens {
             gen_config.max_new_tokens = n;
+        }
+        if let Some(s) = opts.speed_factor {
+            gen_config.speed_factor = s;
         }
 
         // Tokenize text
@@ -456,6 +465,9 @@ impl Synthesizer {
         }
         if let Some(n) = opts.max_new_tokens {
             gen_config.max_new_tokens = n;
+        }
+        if let Some(s) = opts.speed_factor {
+            gen_config.speed_factor = s;
         }
 
         // Tokenize text
@@ -595,6 +607,9 @@ impl Synthesizer {
         }
         if let Some(n) = opts.max_new_tokens {
             gen_config.max_new_tokens = n;
+        }
+        if let Some(s) = opts.speed_factor {
+            gen_config.speed_factor = s;
         }
 
         // Tokenize target text
@@ -755,6 +770,9 @@ impl Synthesizer {
         }
         if let Some(n) = opts.max_new_tokens {
             gen_config.max_new_tokens = n;
+        }
+        if let Some(s) = opts.speed_factor {
+            gen_config.speed_factor = s;
         }
 
         let encoding = self

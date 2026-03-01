@@ -275,9 +275,10 @@ pub fn generate(
         all_codes.push(frame);
 
         // Build next input: codec_embed(prev_codes) + trailing_text or tts_pad
-        let text_embed = if step < trailing_len {
-            // Slice trailing text embedding for this frame
-            let s = step as i32;
+        // Speed factor: advance text index faster (>1.0) or slower (<1.0)
+        let text_idx = (step as f32 * gen_config.speed_factor) as usize;
+        let text_embed = if text_idx < trailing_len {
+            let s = text_idx as i32;
             trailing_text_embeds.index((.., s..s + 1, ..))
         } else {
             tts_pad_embed.clone()
@@ -417,8 +418,9 @@ pub fn generate_voice_design(
         }
         all_codes.push(frame);
 
-        let text_embed = if step < trailing_len {
-            let s = step as i32;
+        let text_idx = (step as f32 * gen_config.speed_factor) as usize;
+        let text_embed = if text_idx < trailing_len {
+            let s = text_idx as i32;
             trailing_text_embeds.index((.., s..s + 1, ..))
         } else {
             tts_pad_embed.clone()
@@ -552,8 +554,9 @@ pub fn generate_voice_clone(
         }
         all_codes.push(frame);
 
-        let text_embed = if step < trailing_len {
-            let s = step as i32;
+        let text_idx = (step as f32 * gen_config.speed_factor) as usize;
+        let text_embed = if text_idx < trailing_len {
+            let s = text_idx as i32;
             trailing_text_embeds.index((.., s..s + 1, ..))
         } else {
             tts_pad_embed.clone()
@@ -718,9 +721,10 @@ pub fn generate_voice_clone_icl(
         all_codes.push(frame);
 
         // Trailing text from ICL prompt surplus, then tts_pad
-        let text_embed = if trailing_len > 0 && step < trailing_len {
+        let text_idx = (step as f32 * gen_config.speed_factor) as usize;
+        let text_embed = if trailing_len > 0 && text_idx < trailing_len {
             use mlx_rs::ops::indexing::IndexOp;
-            let s = step as i32;
+            let s = text_idx as i32;
             trailing_text_embed.index((.., s..s + 1, ..))
         } else {
             tts_pad_embed.clone()
@@ -919,9 +923,10 @@ impl GenerationState {
             }
             frames.push(frame);
 
-            // Build next input
-            let text_embed = if self.step < self.trailing_len {
-                let s = self.step as i32;
+            // Build next input (speed factor controls text pacing)
+            let text_idx = (self.step as f32 * self.gen_config.speed_factor) as usize;
+            let text_embed = if text_idx < self.trailing_len {
+                let s = text_idx as i32;
                 self.trailing_text_embeds.index((.., s..s + 1, ..))
             } else {
                 self.tts_pad_embed.clone()
