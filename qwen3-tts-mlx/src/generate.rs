@@ -22,6 +22,71 @@ use crate::error::Result;
 use crate::sampling::{build_eos_suppression_mask, build_suppression_mask, sample_logits_with_mask, RepetitionPenaltyMask, SamplingKey};
 use crate::talker::Talker;
 
+/// Interpolate text embeddings for speed control (GPT-SoVITS-style).
+///
+/// Given trailing text embeddings [1, N, hidden] (text tokens + tts_eos at end),
+/// resizes the text portion via linear interpolation while preserving the tts_eos
+/// embedding exactly. Returns (new_embeds, new_len).
+///
+/// speed_factor > 1.0 → shorter sequence → faster speech
+/// speed_factor < 1.0 → longer sequence → slower speech
+fn interpolate_text_embeddings_for_speed(
+    embeds: &Array,
+    speed_factor: f32,
+) -> Result<(Array, usize)> {
+    let total_len = embeds.dim(1) as usize;
+    if total_len <= 1 || (speed_factor - 1.0).abs() < 1e-6 {
+        return Ok((embeds.clone(), total_len));
+    }
+
+    // Split: text embeddings [0..N-1] and eos embedding [N-1]
+    let text_len = total_len - 1;
+    let text_embeds = embeds.index((.., ..text_len as i32, ..));
+    let eos_embed = embeds.index((.., text_len as i32.., ..));
+
+    let new_text_len = ((text_len as f32 / speed_factor).round() as usize).max(1);
+    if new_text_len == text_len {
+        return Ok((embeds.clone(), total_len));
+    }
+
+    // Linear interpolation of text embeddings
+    let mut slices: Vec<Array> = Vec::with_capacity(new_text_len + 1);
+    let scale = if new_text_len == 1 {
+        0.0
+    } else {
+        (text_len - 1) as f32 / (new_text_len - 1) as f32
+    };
+
+    for i in 0..new_text_len {
+        let src = i as f32 * scale;
+        let lo = src.floor() as usize;
+        let hi = (lo + 1).min(text_len - 1);
+        let w = src - lo as f32;
+
+        if w.abs() < 1e-6 {
+            slices.push(text_embeds.index((.., lo as i32..lo as i32 + 1, ..)));
+        } else {
+            let lo_e = text_embeds.index((.., lo as i32..lo as i32 + 1, ..));
+            let hi_e = text_embeds.index((.., hi as i32..hi as i32 + 1, ..));
+            slices.push(&lo_e * (1.0 - w) + &hi_e * w);
+        }
+    }
+
+    // Append tts_eos at the end (preserved exactly)
+    slices.push(eos_embed);
+
+    let refs: Vec<&Array> = slices.iter().collect();
+    let result = mlx_rs::ops::concatenate_axis(&refs, 1)?;
+    let new_total = new_text_len + 1;
+
+    info!(
+        "Speed {:.2}x: text embeddings {} → {} (total {} → {})",
+        speed_factor, text_len, new_text_len, total_len, new_total
+    );
+
+    Ok((result, new_total))
+}
+
 /// Timing information for each phase of generation.
 #[derive(Debug, Clone)]
 pub struct GenerationTiming {
@@ -178,6 +243,10 @@ pub fn generate(
 
     // Precompute projected trailing text embeddings [1, trailing_len, hidden]
     let trailing_text_embeds = talker.build_projected_text_embeddings(&trailing_text_ids)?;
+    // Apply speed-based embedding interpolation (GPT-SoVITS style)
+    let (trailing_text_embeds, trailing_len) = interpolate_text_embeddings_for_speed(
+        &trailing_text_embeds, gen_config.speed_factor,
+    )?;
     // Precompute tts_pad embedding [1, 1, hidden]
     let tts_pad_embed = talker.build_text_only_embedding(tts_config.tts_pad_token_id)?;
 
@@ -275,10 +344,8 @@ pub fn generate(
         all_codes.push(frame);
 
         // Build next input: codec_embed(prev_codes) + trailing_text or tts_pad
-        // Speed factor: advance text index faster (>1.0) or slower (<1.0)
-        let text_idx = (step as f32 * gen_config.speed_factor) as usize;
-        let text_embed = if text_idx < trailing_len {
-            let s = text_idx as i32;
+        let text_embed = if step < trailing_len {
+            let s = step as i32;
             trailing_text_embeds.index((.., s..s + 1, ..))
         } else {
             tts_pad_embed.clone()
@@ -339,6 +406,9 @@ pub fn generate_voice_design(
     let trailing_len = trailing_text_ids.len();
 
     let trailing_text_embeds = talker.build_projected_text_embeddings(&trailing_text_ids)?;
+    let (trailing_text_embeds, trailing_len) = interpolate_text_embeddings_for_speed(
+        &trailing_text_embeds, gen_config.speed_factor,
+    )?;
     let tts_pad_embed = talker.build_text_only_embedding(tts_config.tts_pad_token_id)?;
 
     let prefill_positions = instruct_token_ids.len() + 9;
@@ -418,9 +488,8 @@ pub fn generate_voice_design(
         }
         all_codes.push(frame);
 
-        let text_idx = (step as f32 * gen_config.speed_factor) as usize;
-        let text_embed = if text_idx < trailing_len {
-            let s = text_idx as i32;
+        let text_embed = if step < trailing_len {
+            let s = step as i32;
             trailing_text_embeds.index((.., s..s + 1, ..))
         } else {
             tts_pad_embed.clone()
@@ -477,6 +546,9 @@ pub fn generate_voice_clone(
     let trailing_len = trailing_text_ids.len();
 
     let trailing_text_embeds = talker.build_projected_text_embeddings(&trailing_text_ids)?;
+    let (trailing_text_embeds, trailing_len) = interpolate_text_embeddings_for_speed(
+        &trailing_text_embeds, gen_config.speed_factor,
+    )?;
     let tts_pad_embed = talker.build_text_only_embedding(tts_config.tts_pad_token_id)?;
 
     info!(
@@ -554,9 +626,8 @@ pub fn generate_voice_clone(
         }
         all_codes.push(frame);
 
-        let text_idx = (step as f32 * gen_config.speed_factor) as usize;
-        let text_embed = if text_idx < trailing_len {
-            let s = text_idx as i32;
+        let text_embed = if step < trailing_len {
+            let s = step as i32;
             trailing_text_embeds.index((.., s..s + 1, ..))
         } else {
             tts_pad_embed.clone()
@@ -721,10 +792,9 @@ pub fn generate_voice_clone_icl(
         all_codes.push(frame);
 
         // Trailing text from ICL prompt surplus, then tts_pad
-        let text_idx = (step as f32 * gen_config.speed_factor) as usize;
-        let text_embed = if trailing_len > 0 && text_idx < trailing_len {
+        let text_embed = if trailing_len > 0 && step < trailing_len {
             use mlx_rs::ops::indexing::IndexOp;
-            let s = text_idx as i32;
+            let s = step as i32;
             trailing_text_embed.index((.., s..s + 1, ..))
         } else {
             tts_pad_embed.clone()
@@ -826,6 +896,9 @@ impl GenerationState {
         let trailing_len = trailing_text_ids.len();
 
         let trailing_text_embeds = talker.build_projected_text_embeddings(&trailing_text_ids)?;
+        let (trailing_text_embeds, trailing_len) = interpolate_text_embeddings_for_speed(
+            &trailing_text_embeds, gen_config.speed_factor,
+        )?;
         let tts_pad_embed = talker.build_text_only_embedding(tts_config.tts_pad_token_id)?;
 
         talker.reset_caches();
@@ -923,10 +996,9 @@ impl GenerationState {
             }
             frames.push(frame);
 
-            // Build next input (speed factor controls text pacing)
-            let text_idx = (self.step as f32 * self.gen_config.speed_factor) as usize;
-            let text_embed = if text_idx < self.trailing_len {
-                let s = text_idx as i32;
+            // Build next input
+            let text_embed = if self.step < self.trailing_len {
+                let s = self.step as i32;
                 self.trailing_text_embeds.index((.., s..s + 1, ..))
             } else {
                 self.tts_pad_embed.clone()
