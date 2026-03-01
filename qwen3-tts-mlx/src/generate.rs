@@ -243,10 +243,6 @@ pub fn generate(
 
     // Precompute projected trailing text embeddings [1, trailing_len, hidden]
     let trailing_text_embeds = talker.build_projected_text_embeddings(&trailing_text_ids)?;
-    // Apply speed-based embedding interpolation (GPT-SoVITS style)
-    let (trailing_text_embeds, trailing_len) = interpolate_text_embeddings_for_speed(
-        &trailing_text_embeds, gen_config.speed_factor,
-    )?;
     // Precompute tts_pad embedding [1, 1, hidden]
     let tts_pad_embed = talker.build_text_only_embedding(tts_config.tts_pad_token_id)?;
 
@@ -406,9 +402,6 @@ pub fn generate_voice_design(
     let trailing_len = trailing_text_ids.len();
 
     let trailing_text_embeds = talker.build_projected_text_embeddings(&trailing_text_ids)?;
-    let (trailing_text_embeds, trailing_len) = interpolate_text_embeddings_for_speed(
-        &trailing_text_embeds, gen_config.speed_factor,
-    )?;
     let tts_pad_embed = talker.build_text_only_embedding(tts_config.tts_pad_token_id)?;
 
     let prefill_positions = instruct_token_ids.len() + 9;
@@ -546,9 +539,6 @@ pub fn generate_voice_clone(
     let trailing_len = trailing_text_ids.len();
 
     let trailing_text_embeds = talker.build_projected_text_embeddings(&trailing_text_ids)?;
-    let (trailing_text_embeds, trailing_len) = interpolate_text_embeddings_for_speed(
-        &trailing_text_embeds, gen_config.speed_factor,
-    )?;
     let tts_pad_embed = talker.build_text_only_embedding(tts_config.tts_pad_token_id)?;
 
     info!(
@@ -896,9 +886,6 @@ impl GenerationState {
         let trailing_len = trailing_text_ids.len();
 
         let trailing_text_embeds = talker.build_projected_text_embeddings(&trailing_text_ids)?;
-        let (trailing_text_embeds, trailing_len) = interpolate_text_embeddings_for_speed(
-            &trailing_text_embeds, gen_config.speed_factor,
-        )?;
         let tts_pad_embed = talker.build_text_only_embedding(tts_config.tts_pad_token_id)?;
 
         talker.reset_caches();
