@@ -585,9 +585,12 @@ fn make_quantized_linear(
     let scales = get_weight(weights, &format!("{}.scales", prefix))?;
     let biases = get_weight(weights, &format!("{}.biases", prefix))?;
 
+    // Also load the linear bias if present (e.g., Qwen2 q/k/v projections have bias=True)
+    let linear_bias = weights.get(&format!("{}.bias", prefix)).cloned();
+
     let inner = nn::Linear {
         weight: Param::new(weight),
-        bias: Param::new(None),
+        bias: Param::new(linear_bias),
     };
 
     let mut ql = nn::QuantizedLinear {
