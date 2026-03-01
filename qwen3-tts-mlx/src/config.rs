@@ -276,6 +276,12 @@ pub struct GenerationConfig {
     #[serde(default = "default_max_tokens")]
     pub max_new_tokens: i32,
 
+    /// Speed factor: > 1.0 = faster speech, < 1.0 = slower speech.
+    /// Controls how fast text tokens are fed to the model during generation.
+    /// Default 1.0 = one text token per codec frame (natural speed).
+    #[serde(default = "default_speed")]
+    pub speed_factor: f32,
+
     #[serde(default = "default_true")]
     pub subtalker_dosample: bool,
     #[serde(default = "default_temp")]
@@ -307,6 +313,7 @@ impl Default for GenerationConfig {
             top_p: 1.0,
             repetition_penalty: 1.05,
             max_new_tokens: 8192,
+            speed_factor: 1.0,
             subtalker_dosample: true,
             subtalker_temperature: 0.9,
             subtalker_top_k: 50,
@@ -321,3 +328,4 @@ fn default_top_k() -> i32 { 50 }
 fn default_top_p() -> f32 { 1.0 }
 fn default_rep_penalty() -> f32 { 1.05 }
 fn default_max_tokens() -> i32 { 8192 }
+fn default_speed() -> f32 { 1.0 }
