@@ -30,6 +30,9 @@ pub struct TalkerAttention {
     pub head_dim: i32,
     pub scale: f32,
     pub rope: nn::Rope,
+    /// RoPE position speed factor: >1.0 makes the model's internal clock run faster.
+    /// KV cache indexing is unaffected — only the RoPE rotation angles change.
+    pub rope_speed_factor: f32,
 
     pub q_proj: MaybeQuantized<nn::Linear>,
     pub k_proj: MaybeQuantized<nn::Linear>,
@@ -73,15 +76,19 @@ impl TalkerAttention {
             .reshape(&[b, l, self.n_kv_heads, -1])?
             .transpose_axes(&[0, 2, 1, 3])?;
 
-        // Apply RoPE (all 3 MRoPE dims use same position, equivalent to standard RoPE)
-        let offset = cache.offset();
+        // Apply RoPE with optional speed factor (makes model's internal clock run faster)
+        let rope_offset = if (self.rope_speed_factor - 1.0).abs() < 1e-6 {
+            cache.offset()
+        } else {
+            (cache.offset() as f32 * self.rope_speed_factor) as i32
+        };
         let q_input = nn::RopeInputBuilder::new(&queries)
-            .offset(offset)
+            .offset(rope_offset)
             .build()
             .unwrap();
         queries = self.rope.forward(q_input)?;
         let k_input = nn::RopeInputBuilder::new(&keys)
-            .offset(offset)
+            .offset(rope_offset)
             .build()
             .unwrap();
         keys = self.rope.forward(k_input)?;
@@ -316,7 +323,6 @@ impl CodePredictor {
         // Concatenate to form 2-token prefill: [past_hidden, code0_embed]
         let prefill_input =
             mlx_rs::ops::concatenate_axis(&[&proj_hidden, &proj_code0], 1)?;
-        eval(std::iter::once(&prefill_input))?;
 
         // Initialize KV caches for code predictor (fresh per time step)
         let mut caches: Vec<KVCache> = (0..self.layers.len())
@@ -328,15 +334,13 @@ impl CodePredictor {
         for (layer, cache) in self.layers.iter_mut().zip(caches.iter_mut()) {
             current_output = layer.forward(&current_output, None, cache)?;
         }
-        eval(std::iter::once(&current_output))?;
 
         // Sample codebook 1 from last position (code0 position) logits
         let normed = self.norm.forward(&current_output)?;
         use mlx_rs::ops::indexing::IndexOp;
         let last_normed = normed.index((.., -1.., ..)); // [B, 1, 1024]
         let logits = self.lm_heads[0].forward(&last_normed)?;
-        eval([&logits])?;
-        // Greedy decoding (argmax) for code predictor
+        // Greedy decoding (argmax) — sample_logits evals internally
         let token = sample_logits(&logits, 0.0, 0, 1.0, 1.0, &[], None)?;
         codes.push(token);
 
@@ -353,12 +357,10 @@ impl CodePredictor {
             for (layer, cache) in self.layers.iter_mut().zip(caches.iter_mut()) {
                 current_input = layer.forward(&current_input, None, cache)?;
             }
-            eval(std::iter::once(&current_input))?;
 
             let normed = self.norm.forward(&current_input)?;
             let logits = self.lm_heads[g].forward(&normed)?;
-            eval([&logits])?;
-            // Greedy decoding (argmax) for code predictor
+            // Greedy decoding (argmax) — sample_logits evals internally
             let token = sample_logits(&logits, 0.0, 0, 1.0, 1.0, &[], None)?;
             codes.push(token);
         }
@@ -397,6 +399,14 @@ pub struct Talker {
 }
 
 impl Talker {
+    /// Set RoPE speed factor across all attention layers.
+    /// >1.0 makes the model's internal clock run faster (potentially faster speech).
+    pub fn set_rope_speed_factor(&mut self, factor: f32) {
+        for layer in &mut self.layers {
+            layer.self_attn.rope_speed_factor = factor;
+        }
+    }
+
     /// Reset KV caches (call before each generation)
     pub fn reset_caches(&mut self) {
         self.caches = (0..self.layers.len())
@@ -408,10 +418,10 @@ impl Talker {
     /// Returns (codebook_0_logits, last_hidden_state)
     pub fn forward_step(
         &mut self,
-        input_embeds: &Array, // [B, L, hidden_size]
+        input_embeds: Array, // [B, L, hidden_size] — takes ownership, no clone needed
     ) -> Result<(Array, Array)> {
         let l = input_embeds.dim(1);
-        let mut h = input_embeds.clone();
+        let mut h = input_embeds;
 
         // Create causal mask if needed
         let mask = if l > 1 {
@@ -461,16 +471,14 @@ impl Talker {
             self.text_projection.forward(&embed)?
         };
 
-        // Codebook 0: talker's codec_embedding
-        let mut codec_embed = zeros::<f32>(&[1, 1, self.config.hidden_size])?;
+        // Codebook 0: talker's codec_embedding (start directly, no zeros allocation)
         let code0_arr = Array::from_slice(&[prev_codes[0] as i32], &[1, 1]);
-        codec_embed = codec_embed.add(self.codec_embedding.forward(&code0_arr)?)?;
+        let mut codec_embed = self.codec_embedding.forward(&code0_arr)?;
 
         // Codebooks 1-15: code predictor's codec_embeddings
         for g in 0..15 {
             let code_arr = Array::from_slice(&[prev_codes[g + 1] as i32], &[1, 1]);
-            let embed = self.code_predictor.codec_embeddings[g].forward(&code_arr)?;
-            codec_embed = codec_embed.add(embed)?;
+            codec_embed = codec_embed.add(self.code_predictor.codec_embeddings[g].forward(&code_arr)?)?;
         }
 
         Ok(text_embed.add(codec_embed)?)
@@ -864,16 +872,14 @@ impl Talker {
         prev_codes: &[u32; 16],
         text_embed: &Array,
     ) -> Result<Array> {
-        // Codebook 0: talker's codec_embedding
-        let mut codec_embed = zeros::<f32>(&[1, 1, self.config.hidden_size])?;
+        // Codebook 0: talker's codec_embedding (start directly, no zeros allocation)
         let code0_arr = Array::from_slice(&[prev_codes[0] as i32], &[1, 1]);
-        codec_embed = codec_embed.add(self.codec_embedding.forward(&code0_arr)?)?;
+        let mut codec_embed = self.codec_embedding.forward(&code0_arr)?;
 
         // Codebooks 1-15: code predictor's codec_embeddings
         for g in 0..15 {
             let code_arr = Array::from_slice(&[prev_codes[g + 1] as i32], &[1, 1]);
-            let embed = self.code_predictor.codec_embeddings[g].forward(&code_arr)?;
-            codec_embed = codec_embed.add(embed)?;
+            codec_embed = codec_embed.add(self.code_predictor.codec_embeddings[g].forward(&code_arr)?)?;
         }
 
         Ok(codec_embed.add(text_embed)?)
@@ -1014,6 +1020,7 @@ fn load_talker_attention(
         head_dim: config.head_dim,
         scale: (config.head_dim as f32).sqrt().recip(),
         rope,
+        rope_speed_factor: 1.0,
         q_proj: load_maybe_quantized(weights, &format!("{prefix}.q_proj"), quant)?,
         k_proj: load_maybe_quantized(weights, &format!("{prefix}.k_proj"), quant)?,
         v_proj: load_maybe_quantized(weights, &format!("{prefix}.v_proj"), quant)?,

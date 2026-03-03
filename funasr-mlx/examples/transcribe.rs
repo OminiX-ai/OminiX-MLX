@@ -1,10 +1,7 @@
-//! Simple transcription example
+//! Simple transcription example with chunking support for long audio.
 //!
 //! Usage:
-//!   cargo run --release --example transcribe -- <audio.wav> <model_dir>
-//!
-//! Example:
-//!   cargo run --release --example transcribe -- test.wav /path/to/paraformer
+//!   cargo run --release --example transcribe -- <audio.wav> <model_dir> [--chunk SECS]
 
 use std::env;
 use std::time::Instant;
@@ -17,21 +14,23 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
     let args: Vec<String> = env::args().collect();
 
     if args.len() < 3 {
-        eprintln!("Usage: {} <audio.wav> <model_dir>", args[0]);
-        eprintln!();
-        eprintln!("Arguments:");
-        eprintln!("  audio.wav  - Input audio file (16kHz mono, or will be resampled)");
-        eprintln!("  model_dir  - Directory containing:");
-        eprintln!("               - paraformer.safetensors (model weights)");
-        eprintln!("               - am.mvn (CMVN normalization)");
-        eprintln!("               - tokens.txt (vocabulary)");
+        eprintln!("Usage: {} <audio.wav> <model_dir> [--chunk SECS]", args[0]);
         std::process::exit(1);
     }
 
     let audio_path = &args[1];
     let model_dir = &args[2];
+    let mut chunk_secs: f32 = 20.0;
 
-    // Construct paths
+    let mut i = 3;
+    while i < args.len() {
+        if args[i] == "--chunk" && i + 1 < args.len() {
+            chunk_secs = args[i + 1].parse().unwrap_or(20.0);
+            i += 1;
+        }
+        i += 1;
+    }
+
     let weights_path = format!("{}/paraformer.safetensors", model_dir);
     let cmvn_path = format!("{}/am.mvn", model_dir);
     let vocab_path = format!("{}/tokens.txt", model_dir);
@@ -40,14 +39,8 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
     println!("Loading audio: {}", audio_path);
     let (samples, sample_rate) = load_wav(audio_path)?;
     let duration_secs = samples.len() as f32 / sample_rate as f32;
-    println!(
-        "  {} samples, {} Hz, {:.2}s",
-        samples.len(),
-        sample_rate,
-        duration_secs
-    );
+    println!("  {:.1}s ({} samples @ {}Hz)", duration_secs, samples.len(), sample_rate);
 
-    // Resample to 16kHz if needed
     let samples = if sample_rate != 16000 {
         println!("  Resampling to 16kHz...");
         resample(&samples, sample_rate, 16000)
@@ -56,36 +49,44 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
     };
 
     // Load model
-    println!("\nLoading model from: {}", model_dir);
+    println!("Loading model from: {}", model_dir);
     let mut model = load_model(&weights_path)?;
     model.training_mode(false);
-
-    // Load CMVN
     let (addshift, rescale) = parse_cmvn_file(&cmvn_path)?;
     model.set_cmvn(addshift, rescale);
-
-    // Load vocabulary
     let vocab = Vocabulary::load(&vocab_path)?;
     println!("  {} tokens loaded", vocab.len());
 
     // Transcribe
-    println!("\nTranscribing...");
     let start = Instant::now();
-    let text = transcribe(&mut model, &samples, &vocab)?;
-    let elapsed = start.elapsed();
+    let text = if duration_secs > 30.0 {
+        let chunk_size = (chunk_secs * 16000.0) as usize;
+        let total_chunks = (samples.len() + chunk_size - 1) / chunk_size;
+        println!("Using chunked transcription ({:.0}s chunks, {} chunks)...", chunk_secs, total_chunks);
 
-    // Calculate metrics
-    let inference_ms = elapsed.as_millis();
-    let rtf = (inference_ms as f32 / 1000.0) / duration_secs;
+        let mut results: Vec<String> = Vec::new();
+        for (i, chunk) in samples.chunks(chunk_size).enumerate() {
+            if chunk.len() < 1600 { break; } // skip < 100ms
+            eprint!("\r  Chunk {}/{}", i + 1, total_chunks);
+            match transcribe(&mut model, chunk, &vocab) {
+                Ok(text) if !text.is_empty() => results.push(text),
+                Ok(_) => {}
+                Err(e) => eprintln!("\n  Chunk {} error: {}", i + 1, e),
+            }
+        }
+        eprintln!();
+        results.join("")
+    } else {
+        transcribe(&mut model, &samples, &vocab)?
+    };
+
+    let elapsed = start.elapsed();
+    let rtf = elapsed.as_secs_f32() / duration_secs;
 
     println!("\n=== Results ===");
     println!("Text: {}", text);
-    println!();
-    println!("Performance:");
-    println!("  Audio duration: {:.2}s", duration_secs);
-    println!("  Inference time: {} ms", inference_ms);
-    println!("  RTF: {:.4}x", rtf);
-    println!("  Speed: {:.1}x real-time", 1.0 / rtf);
+    println!("\nAudio: {:.1}s | Time: {:.1}s | {:.1}x realtime | RTF: {:.4}x",
+        duration_secs, elapsed.as_secs_f32(), 1.0 / rtf, rtf);
 
     Ok(())
 }

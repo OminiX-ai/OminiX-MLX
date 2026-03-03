@@ -68,6 +68,10 @@ struct Args {
     /// Without this, falls back to x_vector_only mode.
     #[arg(long)]
     reference_text: Option<String>,
+
+    /// Speed factor for speech (0.5-2.0). <1.0 = slower, >1.0 = faster.
+    #[arg(long)]
+    speed: Option<f32>,
 }
 
 fn main() -> std::result::Result<(), Box<dyn std::error::Error>> {
@@ -101,6 +105,7 @@ fn main() -> std::result::Result<(), Box<dyn std::error::Error>> {
         top_p: args.top_p,
         max_new_tokens: args.max_tokens,
         seed: args.seed,
+        speed_factor: args.speed,
     };
 
     if let Some(ref ref_audio_path) = args.reference_audio {

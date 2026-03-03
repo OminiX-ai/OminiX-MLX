@@ -11,7 +11,7 @@ use mlx_rs_core::{initialize_rope, KVCache};
 use mlx_rs::macros::ModuleParameters;
 use mlx_rs::module::{ModuleParameters as ModuleParametersTrait, Param};
 use mlx_rs::nn;
-use mlx_rs::ops::indexing::*;
+use mlx_rs::ops::indexing::{argmax_axis, IndexOp};
 use mlx_rs::quantization::MaybeQuantized;
 use mlx_rs::transforms::eval;
 use mlx_rs::Array;
@@ -316,7 +316,12 @@ impl Qwen3ASR {
                     }
                 }
             }
-            eprintln!("Audio tower: loaded {} parameters", loaded);
+            let expected = params.len();
+            eprintln!("Audio tower: loaded {}/{} parameters", loaded, expected);
+            if loaded < expected {
+                eprintln!("WARNING: {} audio tower parameters missing — model may produce incorrect output",
+                    expected - loaded);
+            }
             eval(params.values().map(|v| &**v))?;
         }
 
@@ -461,7 +466,12 @@ impl Qwen3ASR {
                 }
             }
         }
-        eprintln!("Text decoder: loaded {} parameters (non-quantized)", loaded);
+        let expected = params.len();
+        eprintln!("Text decoder: loaded {}/{} parameters (non-quantized)", loaded, expected);
+        if loaded < expected {
+            eprintln!("WARNING: {} text decoder parameters missing — model may produce incorrect output",
+                expected - loaded);
+        }
         eval(params.values().map(|v| &**v))?;
         Ok(model)
     }
@@ -539,7 +549,7 @@ impl Qwen3ASR {
             .and_then(|v| v.as_object());
 
         let mut eos_ids = Vec::new();
-        for key in &["eos_token", "pad_token"] {
+        for key in &["eos_token"] {
             if let Some(token_content) = config.get(key).and_then(|v| v.as_str()) {
                 if let Some(ref tokens) = added_tokens {
                     for (id_str, info) in tokens.iter() {
@@ -666,9 +676,8 @@ impl Qwen3ASR {
         language: &str,
         config: &SamplingConfig,
     ) -> Result<String> {
-        // 1. Compute mel spectrogram
+        // 1. Compute mel spectrogram (CPU-side FFT, already concrete)
         let mel = self.mel_frontend.compute_mel_spectrogram(samples)?;
-        eval([&mel])?;
 
         // 2. Encode audio
         let audio_features = self.audio_tower.forward_encoder(&mel)?;
@@ -677,9 +686,8 @@ impl Qwen3ASR {
         let num_audio_tokens = audio_features.shape()[0];
         eprintln!("Audio: {} mel frames -> {} audio tokens", mel.shape()[1], num_audio_tokens);
 
-        // 3. Build prompt
+        // 3. Build prompt (from_slice, already concrete)
         let input_ids = self.build_prompt(num_audio_tokens, language)?;
-        eval([&input_ids])?;
 
         // 4. Build input embeddings with audio merged in
         let inputs_embeds = self.build_inputs_embeds(&input_ids, &audio_features)?;
@@ -783,7 +791,7 @@ impl Qwen3ASR {
         eval([&token])?;
         let mut token_id = token.item::<i32>();
 
-        let mut recent_tokens: Vec<i32> = Vec::new();
+        let mut recent_tokens: std::collections::VecDeque<i32> = std::collections::VecDeque::with_capacity(11);
 
         for _ in 0..config.max_tokens {
             if eos_tokens.contains(&token_id) {
@@ -791,9 +799,9 @@ impl Qwen3ASR {
             }
 
             // Repetition detection
-            recent_tokens.push(token_id);
+            recent_tokens.push_back(token_id);
             if recent_tokens.len() > 10 {
-                recent_tokens.remove(0);
+                recent_tokens.pop_front();
             }
             if recent_tokens.len() >= 10 && recent_tokens.iter().all(|&t| t == token_id) {
                 break;

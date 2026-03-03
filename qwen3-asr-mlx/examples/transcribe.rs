@@ -94,7 +94,7 @@ fn load_audio(path: &std::path::Path) -> (Vec<f32>, u32) {
 
     // Convert non-WAV to WAV using ffmpeg
     eprintln!("Converting {} to WAV via ffmpeg...", ext.to_uppercase());
-    let tmp_wav = std::env::temp_dir().join("qwen3_asr_temp.wav");
+    let tmp_wav = std::env::temp_dir().join(format!("qwen3_asr_{}.wav", std::process::id()));
 
     let status = std::process::Command::new("ffmpeg")
         .args([

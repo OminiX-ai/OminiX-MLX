@@ -1677,7 +1677,6 @@ impl VoiceCloner {
         };
         let logits = self.t2s.forward(input)
             .map_err(|e| Error::Message(e.to_string()))?;
-        eval([&logits]).map_err(|e| Error::Message(e.to_string()))?;
 
         // First token - include prompt_tokens in repetition penalty (Python behavior)
         let seq_len = logits.shape()[1];
@@ -1729,7 +1728,6 @@ impl VoiceCloner {
 
             let logits = self.t2s.forward(input)
                 .map_err(|e| Error::Message(e.to_string()))?;
-            eval([&logits]).map_err(|e| Error::Message(e.to_string()))?;
 
             let seq_len = logits.shape()[1];
             let last_logits = logits.index((.., seq_len - 1, ..)).squeeze()

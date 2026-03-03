@@ -715,3 +715,16 @@ mod tests {
         assert_eq!(config.max_length, 30.0);
     }
 }
+
+/// Check if audio chunk is silence (below RMS energy threshold).
+///
+/// Returns `true` if the audio energy in dB is below `threshold_db`.
+/// Typical threshold for speech detection: -40.0 dB.
+pub fn is_silent(samples: &[f32], threshold_db: f32) -> bool {
+    if samples.is_empty() {
+        return true;
+    }
+    let rms = (samples.iter().map(|&s| s * s).sum::<f32>() / samples.len() as f32).sqrt();
+    let db = 20.0 * rms.max(1e-10).log10();
+    db < threshold_db
+}

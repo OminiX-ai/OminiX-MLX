@@ -23,6 +23,59 @@ pub fn build_eos_suppression_mask(vocab_size: usize, eos_token: u32) -> Array {
     Array::from_slice(&mask, &[vocab_size as i32])
 }
 
+/// Build an EOS unit mask for dynamic logit steering.
+/// Shape [vocab_size] with 1.0 at eos_token and 0.0 elsewhere.
+/// Multiply by a bias value and add to logits to encourage/suppress EOS.
+pub fn build_eos_unit_mask(vocab_size: usize, eos_token: u32) -> Array {
+    let mut mask = vec![0.0f32; vocab_size];
+    if (eos_token as usize) < vocab_size {
+        mask[eos_token as usize] = 1.0;
+    }
+    Array::from_slice(&mask, &[vocab_size as i32])
+}
+
+/// Compute EOS logit steering bias for a given generation step.
+///
+/// Based on the "Segment-Aware Conditioning" approach (arxiv 2601.03170):
+/// - Before 60% of target: suppress EOS (negative bias)
+/// - 60%-100% of target: linear ramp from suppression to neutral
+/// - 100%-140% of target: linear ramp from neutral to encouragement
+/// - After 140% of target: strong EOS encouragement
+///
+/// Returns a bias value to multiply with the EOS unit mask.
+pub fn compute_eos_steering_bias(step: usize, target_frames: usize, speed_factor: f32) -> f32 {
+    if (speed_factor - 1.0).abs() < 0.01 || target_frames == 0 {
+        return 0.0;
+    }
+
+    let t = step as f32;
+    let target = target_frames as f32;
+
+    // The model's EOS logit is typically very negative (-20 to -40) during
+    // active speech, so we need strong biases to have any effect.
+    let suppress_strength = -30.0; // suppress EOS before target
+    let encourage_strength = 40.0; // encourage EOS after target
+
+    let phase_start = 0.6 * target; // start ramping from suppression
+    let phase_end = 1.4 * target; // max encouragement
+
+    if t < phase_start {
+        // Strong EOS suppression — don't stop early
+        suppress_strength
+    } else if t < target {
+        // Linear ramp: suppress → neutral
+        let progress = (t - phase_start) / (target - phase_start);
+        suppress_strength * (1.0 - progress)
+    } else if t < phase_end {
+        // Linear ramp: neutral → encourage
+        let progress = (t - target) / (phase_end - target);
+        encourage_strength * progress
+    } else {
+        // Strong EOS encouragement — time to stop
+        encourage_strength
+    }
+}
+
 /// PRNG state for seeded sampling. Splits key after each sample.
 pub struct SamplingKey {
     key: Array,
@@ -157,15 +210,13 @@ pub fn sample_logits_with_mask(
     // Temperature scaling
     logits = logits.multiply(array!(1.0f32 / temperature))?;
 
-    // Top-k filtering
+    // Top-k filtering (GPU-resident, no CPU roundtrip)
     if top_k > 0 {
-        mlx_rs::transforms::eval(std::iter::once(&logits))?;
         logits = apply_top_k(&logits, top_k)?;
     }
 
-    // Top-p (nucleus) filtering
+    // Top-p (nucleus) filtering (GPU-resident, no CPU roundtrip)
     if top_p > 0.0 && top_p < 1.0 {
-        mlx_rs::transforms::eval(std::iter::once(&logits))?;
         logits = apply_top_p(&logits, top_p)?;
     }
 
@@ -199,71 +250,40 @@ fn apply_repetition_penalty(
     Ok(Array::from_slice(&logits_vec, &[vocab]))
 }
 
+/// GPU-resident top-k: keep only the k largest logits, mask rest to -inf.
 fn apply_top_k(logits: &Array, k: i32) -> Result<Array, Exception> {
-    let logits_vec: Vec<f32> = logits.as_slice::<f32>().to_vec();
-    let vocab_size = logits_vec.len();
-    if k as usize >= vocab_size {
-        return Ok(logits.clone());
-    }
-
-    // Find threshold: k-th largest value
-    let mut sorted = logits_vec.clone();
-    sorted.sort_by(|a, b| b.partial_cmp(a).unwrap_or(std::cmp::Ordering::Equal));
-    let threshold = sorted[k as usize];
-
-    // Mask out values below threshold
-    let masked: Vec<f32> = logits_vec
-        .iter()
-        .map(|&v| if v < threshold { f32::NEG_INFINITY } else { v })
-        .collect();
-    Ok(Array::from_slice(&masked, &[vocab_size as i32]))
+    // topk returns the k largest values (unsorted)
+    let top_values = mlx_rs::ops::indexing::topk(logits, k)?;
+    // Threshold = minimum of the top-k values
+    let threshold = top_values.min_axis(-1, true)?;
+    // Mask everything below threshold
+    let below = logits.lt(&threshold)?;
+    mlx_rs::ops::r#where(&below, &array!(f32::NEG_INFINITY), logits)
 }
 
-/// Top-p (nucleus) sampling: keep smallest set of tokens with cumulative probability >= p.
+/// GPU-resident top-p (nucleus) sampling: keep smallest set of tokens with cumulative probability >= p.
 fn apply_top_p(logits: &Array, p: f32) -> Result<Array, Exception> {
-    let logits_vec: Vec<f32> = logits.as_slice::<f32>().to_vec();
-    let vocab_size = logits_vec.len();
+    // Sort logits descending (negate → ascending sort → negate back)
+    let sorted = mlx_rs::ops::sort_axis(&logits.negative()?, -1)?.negative()?;
 
-    // Sort indices by descending logit
-    let mut indices: Vec<usize> = (0..vocab_size).collect();
-    indices.sort_by(|&a, &b| {
-        logits_vec[b]
-            .partial_cmp(&logits_vec[a])
-            .unwrap_or(std::cmp::Ordering::Equal)
-    });
+    // Softmax on sorted logits → probabilities in descending order
+    let sorted_probs = mlx_rs::ops::softmax_axis(&sorted, -1, None::<bool>)?;
 
-    // Compute softmax on sorted logits
-    let max_logit = logits_vec[indices[0]];
-    let sorted_exp: Vec<f32> = indices
-        .iter()
-        .map(|&i| (logits_vec[i] - max_logit).exp())
-        .collect();
-    let sum_exp: f32 = sorted_exp.iter().sum();
-    let sorted_probs: Vec<f32> = sorted_exp.iter().map(|&e| e / sum_exp).collect();
+    // Cumulative sum of sorted probabilities
+    let cum_probs = mlx_rs::ops::cumsum(&sorted_probs, Some(-1), None, None)?;
 
-    // Find cutoff: cumulative probability exceeds p
-    let mut cum_prob = 0.0f32;
-    let mut cutoff_idx = vocab_size;
-    for (i, &prob) in sorted_probs.iter().enumerate() {
-        cum_prob += prob;
-        if cum_prob >= p {
-            cutoff_idx = i + 1;
-            break;
-        }
-    }
+    // Mask: remove tokens where cumsum (before this token) >= p.
+    // shifted_cum = cumsum - current_prob gives the cumsum BEFORE this token.
+    // Keep tokens where shifted_cum < p (includes the token that crosses p).
+    let shifted_cum = cum_probs.subtract(&sorted_probs)?;
+    let to_remove = shifted_cum.ge(&array!(p))?;
 
-    // Always keep at least 1 token
-    cutoff_idx = cutoff_idx.max(1);
+    // Find threshold: the minimum logit value among kept tokens in sorted space.
+    // Replace removed tokens with +MAX so they don't affect the min.
+    let kept_sorted = mlx_rs::ops::r#where(&to_remove, &array!(f32::MAX), &sorted)?;
+    let threshold = kept_sorted.min_axis(-1, true)?;
 
-    // Build mask: keep tokens in top-p set, set others to -inf
-    let mut keep = vec![false; vocab_size];
-    for &idx in &indices[..cutoff_idx] {
-        keep[idx] = true;
-    }
-    let masked: Vec<f32> = logits_vec
-        .iter()
-        .enumerate()
-        .map(|(i, &v)| if keep[i] { v } else { f32::NEG_INFINITY })
-        .collect();
-    Ok(Array::from_slice(&masked, &[vocab_size as i32]))
+    // Apply threshold to original (unsorted) logits
+    let below = logits.lt(&threshold)?;
+    mlx_rs::ops::r#where(&below, &array!(f32::NEG_INFINITY), logits)
 }

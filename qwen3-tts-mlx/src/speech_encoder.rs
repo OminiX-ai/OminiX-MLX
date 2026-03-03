@@ -165,6 +165,8 @@ struct EncoderTransformerLayer {
     mlp_layer_scale: Array, // [D]
     num_heads: i32,
     head_dim: i32,
+    /// Precomputed inverse frequency vector for RoPE [half_dim]
+    inv_freqs: Vec<f32>,
 }
 
 impl EncoderTransformerLayer {
@@ -193,18 +195,13 @@ impl EncoderTransformerLayer {
         let mut k = ops::matmul(x, &self.k_proj.t())?.reshape(&[b, t, self.num_heads, self.head_dim])?.transpose_axes(&[0, 2, 1, 3])?;
         let v = ops::matmul(x, &self.v_proj.t())?.reshape(&[b, t, self.num_heads, self.head_dim])?.transpose_axes(&[0, 2, 1, 3])?;
 
-        // RoPE (theta=10000, stride-based like Qwen)
-        let hd = self.head_dim as usize;
-        let half = hd / 2;
-        let mut freqs_data = vec![0.0f32; half];
-        for i in 0..half {
-            freqs_data[i] = 1.0 / (10000.0f32).powf(2.0 * i as f32 / hd as f32);
-        }
+        // RoPE using precomputed inverse frequencies
+        let half = self.inv_freqs.len();
         let mut cos_data = vec![0.0f32; t_usize * half];
         let mut sin_data = vec![0.0f32; t_usize * half];
         for pos in 0..t_usize {
             for i in 0..half {
-                let angle = pos as f32 * freqs_data[i];
+                let angle = pos as f32 * self.inv_freqs[i];
                 cos_data[pos * half + i] = angle.cos();
                 sin_data[pos * half + i] = angle.sin();
             }
@@ -526,6 +523,13 @@ fn load_encoder_transformer_layer(
     let fc2 = get_weight(weights, &format!("{prefix}.mlp.fc2.weight"))?;
     let mlp_layer_scale = get_weight(weights, &format!("{prefix}.mlp_layer_scale.scale"))?;
 
+    // Precompute inverse frequencies for RoPE (theta=10000)
+    let hd = head_dim as usize;
+    let half = hd / 2;
+    let inv_freqs: Vec<f32> = (0..half)
+        .map(|i| 1.0 / (10000.0f32).powf(2.0 * i as f32 / hd as f32))
+        .collect();
+
     Ok(EncoderTransformerLayer {
         input_layernorm,
         q_proj,
@@ -539,6 +543,7 @@ fn load_encoder_transformer_layer(
         mlp_layer_scale,
         num_heads,
         head_dim,
+        inv_freqs,
     })
 }
 

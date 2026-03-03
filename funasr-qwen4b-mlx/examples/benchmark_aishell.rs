@@ -15,7 +15,7 @@
 //! cargo run --example benchmark_aishell --release -- /tmp/data_aishell [--max N] [--model-dir DIR]
 //! ```
 
-use funasr_qwen4b_mlx::FunASRQwen4B;
+use funasr_qwen4b_mlx::{FunASRQwen4B, TranscribeConfig};
 use funasr_qwen4b_mlx::audio::{load_wav, resample};
 use std::collections::HashMap;
 use std::fs;
@@ -227,7 +227,8 @@ fn main() -> anyhow::Result<()> {
 
         total_audio_secs += samples.len() as f64 / 16000.0;
 
-        let hypothesis = match model.transcribe_samples(&samples, 16000) {
+        // Use greedy config for benchmark (best CER)
+        let hypothesis = match model.transcribe_samples_with_config(&samples, 16000, "语音转写成中文：", &TranscribeConfig::greedy()) {
             Ok(h) => h,
             Err(e) => {
                 eprintln!("[{}/{}] {} - Transcribe error: {:?}", idx + 1, num_to_test, utt_id, e);

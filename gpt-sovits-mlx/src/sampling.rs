@@ -291,12 +291,9 @@ pub fn sample_top_k_simple(logits: &Array, top_k: i32, temperature: f32) -> Resu
     } else {
         logits.clone()
     };
-    eval([&scaled]).map_err(|e| Error::Message(e.to_string()))?;
-
     let flat_logits = scaled
         .flatten(None, None)
         .map_err(|e| Error::Message(e.to_string()))?;
-    eval([&flat_logits]).map_err(|e| Error::Message(e.to_string()))?;
 
     let probs = ops::softmax_axis(&flat_logits, -1, None).map_err(|e| Error::Message(e.to_string()))?;
     eval([&probs]).map_err(|e| Error::Message(e.to_string()))?;

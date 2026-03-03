@@ -78,19 +78,14 @@ impl MelFrontend {
         let hop_length = self.config.hop_length;
         let n_mels = self.config.n_mels;
 
-        if samples.len() < hop_length {
+        if samples.len() < n_fft {
             return Err(Error::audio_too_short(
                 (samples.len() as u64 * 1000) / self.config.sample_rate as u64,
-                (hop_length as u64 * 1000) / self.config.sample_rate as u64,
+                (n_fft as u64 * 1000) / self.config.sample_rate as u64,
             ));
         }
 
         let n_frames = 1 + (samples.len() - n_fft) / hop_length;
-        if n_frames == 0 {
-            return Err(Error::AudioFormat {
-                message: format!("Audio too short for FFT: {} samples < n_fft={}", samples.len(), n_fft),
-            });
-        }
 
         let mut fft_buffer: Vec<Complex<f32>> = vec![Complex::new(0.0, 0.0); n_fft];
         let mut mel_spec = vec![0.0f32; n_mels * n_frames];

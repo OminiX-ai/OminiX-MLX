@@ -241,8 +241,13 @@ impl Synthesizer {
         if let Some(n) = opts.max_new_tokens {
             gen_config.max_new_tokens = n;
         }
-        if let Some(s) = opts.speed_factor {
-            gen_config.speed_factor = s;
+
+        // Speed control: EOS steering for slow-down, WSOLA for speed-up
+        let requested_speed = opts.speed_factor.unwrap_or(1.0);
+        if requested_speed < 1.0 {
+            gen_config.speed_factor = requested_speed;
+        } else {
+            gen_config.speed_factor = 1.0;
         }
 
         // Tokenize text
@@ -283,9 +288,23 @@ impl Synthesizer {
 
         // Decode to waveform
         let decode_start = Instant::now();
-        let samples = self.decoder.decode(&codes)?;
+        let mut samples = self.decoder.decode(&codes)?;
         mlx_rs::transforms::eval(std::iter::empty::<&mlx_rs::Array>())?;
         let decode_ms = decode_start.elapsed().as_secs_f64() * 1000.0;
+
+        // Apply WSOLA time-stretching for speed > 1.0
+        if requested_speed > 1.01 {
+            let original_len = samples.len();
+            samples = time_stretch_wsola(&samples, requested_speed, self.sample_rate);
+            info!(
+                "WSOLA {:.2}x: {} → {} samples ({:.2}s → {:.2}s)",
+                requested_speed,
+                original_len,
+                samples.len(),
+                original_len as f32 / self.sample_rate as f32,
+                samples.len() as f32 / self.sample_rate as f32,
+            );
+        }
 
         let total_ms = total_start.elapsed().as_secs_f64() * 1000.0;
 
@@ -345,8 +364,13 @@ impl Synthesizer {
         if let Some(n) = opts.max_new_tokens {
             gen_config.max_new_tokens = n;
         }
-        if let Some(s) = opts.speed_factor {
-            gen_config.speed_factor = s;
+
+        // Speed control: EOS steering for slow-down, WSOLA for speed-up
+        let requested_speed = opts.speed_factor.unwrap_or(1.0);
+        if requested_speed < 1.0 {
+            gen_config.speed_factor = requested_speed;
+        } else {
+            gen_config.speed_factor = 1.0;
         }
 
         // Tokenize text
@@ -399,9 +423,23 @@ impl Synthesizer {
         info!("Decoding {} codec frames to audio...", codes.len());
 
         let decode_start = Instant::now();
-        let samples = self.decoder.decode(&codes)?;
+        let mut samples = self.decoder.decode(&codes)?;
         mlx_rs::transforms::eval(std::iter::empty::<&mlx_rs::Array>())?;
         let decode_ms = decode_start.elapsed().as_secs_f64() * 1000.0;
+
+        // Apply WSOLA time-stretching for speed > 1.0
+        if requested_speed > 1.01 {
+            let original_len = samples.len();
+            samples = time_stretch_wsola(&samples, requested_speed, self.sample_rate);
+            info!(
+                "WSOLA {:.2}x: {} → {} samples ({:.2}s → {:.2}s)",
+                requested_speed,
+                original_len,
+                samples.len(),
+                original_len as f32 / self.sample_rate as f32,
+                samples.len() as f32 / self.sample_rate as f32,
+            );
+        }
 
         let total_ms = total_start.elapsed().as_secs_f64() * 1000.0;
 
@@ -466,8 +504,17 @@ impl Synthesizer {
         if let Some(n) = opts.max_new_tokens {
             gen_config.max_new_tokens = n;
         }
-        if let Some(s) = opts.speed_factor {
-            gen_config.speed_factor = s;
+
+        // Speed control strategy:
+        // - speed < 1.0: EOS steering (suppress EOS → model extends output naturally)
+        // - speed > 1.0: WSOLA post-processing (time-compress audio, preserves pitch)
+        let requested_speed = opts.speed_factor.unwrap_or(1.0);
+        if requested_speed < 1.0 {
+            // Use EOS steering for slow-down
+            gen_config.speed_factor = requested_speed;
+        } else {
+            // Generate at normal speed, apply WSOLA after
+            gen_config.speed_factor = 1.0;
         }
 
         // Tokenize text
@@ -520,9 +567,23 @@ impl Synthesizer {
         info!("Decoding {} codec frames to audio...", codes.len());
 
         let decode_start = Instant::now();
-        let samples = self.decoder.decode(&codes)?;
+        let mut samples = self.decoder.decode(&codes)?;
         mlx_rs::transforms::eval(std::iter::empty::<&mlx_rs::Array>())?;
         let decode_ms = decode_start.elapsed().as_secs_f64() * 1000.0;
+
+        // Apply WSOLA time-stretching for speed > 1.0
+        if requested_speed > 1.01 {
+            let original_len = samples.len();
+            samples = time_stretch_wsola(&samples, requested_speed, self.sample_rate);
+            info!(
+                "WSOLA {:.2}x: {} → {} samples ({:.2}s → {:.2}s)",
+                requested_speed,
+                original_len,
+                samples.len(),
+                original_len as f32 / self.sample_rate as f32,
+                samples.len() as f32 / self.sample_rate as f32,
+            );
+        }
 
         let total_ms = total_start.elapsed().as_secs_f64() * 1000.0;
 
@@ -901,4 +962,137 @@ pub fn normalize_audio(samples: &[f32], target_peak: f32) -> Vec<f32> {
     }
     let gain = target_peak / peak;
     samples.iter().map(|s| s * gain).collect()
+}
+
+/// WSOLA (Waveform Similarity Overlap-Add) time-stretching.
+///
+/// Changes tempo without changing pitch. This preserves voice character
+/// while making speech faster or slower.
+///
+/// - `speed_factor > 1.0` = faster speech (shorter output)
+/// - `speed_factor < 1.0` = slower speech (longer output)
+/// - `speed_factor = 1.0` = no change (returns clone)
+pub fn time_stretch_wsola(samples: &[f32], speed_factor: f32, sample_rate: u32) -> Vec<f32> {
+    if (speed_factor - 1.0).abs() < 0.01 || samples.is_empty() {
+        return samples.to_vec();
+    }
+
+    // Frame size ~43ms at 24kHz, scales with sample rate
+    let frame_size = (sample_rate as f32 * 0.043) as usize;
+    let half_frame = frame_size / 2;
+    let search_range = frame_size / 8; // search window for cross-correlation
+
+    let output_len = (samples.len() as f32 / speed_factor) as usize;
+    let mut output = vec![0.0f32; output_len + frame_size];
+    let mut norm = vec![0.0f32; output_len + frame_size];
+
+    // Hann window
+    let window: Vec<f32> = (0..frame_size)
+        .map(|i| {
+            0.5 * (1.0 - (2.0 * std::f32::consts::PI * i as f32 / frame_size as f32).cos())
+        })
+        .collect();
+
+    let mut in_pos: f32 = 0.0;
+    let mut out_pos: usize = 0;
+
+    while (in_pos as usize) + frame_size < samples.len()
+        && out_pos + frame_size <= output_len + frame_size
+    {
+        let nominal_in = in_pos as usize;
+
+        // Find best alignment via cross-correlation with existing output
+        let best_offset = if out_pos > 0 {
+            wsola_find_best_overlap(
+                samples,
+                &output,
+                &norm,
+                nominal_in,
+                out_pos,
+                frame_size,
+                search_range,
+            )
+        } else {
+            0
+        };
+
+        let actual_in = (nominal_in as i32 + best_offset).max(0) as usize;
+        if actual_in + frame_size > samples.len() {
+            break;
+        }
+
+        // Overlap-add with Hann window
+        for i in 0..frame_size {
+            if out_pos + i < output.len() {
+                output[out_pos + i] += samples[actual_in + i] * window[i];
+                norm[out_pos + i] += window[i];
+            }
+        }
+
+        in_pos += half_frame as f32 * speed_factor;
+        out_pos += half_frame;
+    }
+
+    // Normalize by window sum
+    for i in 0..output_len {
+        if norm[i] > 1e-6 {
+            output[i] /= norm[i];
+        }
+    }
+
+    output.truncate(output_len);
+    output
+}
+
+/// Find the best overlap offset for WSOLA via normalized cross-correlation.
+fn wsola_find_best_overlap(
+    input: &[f32],
+    output: &[f32],
+    norm: &[f32],
+    nominal_in: usize,
+    out_pos: usize,
+    frame_size: usize,
+    search_range: usize,
+) -> i32 {
+    let mut best_offset = 0i32;
+    let mut best_corr = f32::NEG_INFINITY;
+    let compare_len = frame_size.min(256);
+
+    let min_offset = -(search_range as i32);
+    let max_offset = search_range as i32;
+
+    for offset in min_offset..=max_offset {
+        let in_start = nominal_in as i32 + offset;
+        if in_start < 0 || (in_start as usize) + compare_len > input.len() {
+            continue;
+        }
+        let in_start = in_start as usize;
+
+        let mut corr = 0.0f32;
+        let mut energy_in = 0.0f32;
+        let mut energy_out = 0.0f32;
+
+        for i in 0..compare_len {
+            if out_pos + i < output.len() && norm[out_pos + i] > 1e-6 {
+                let out_sample = output[out_pos + i] / norm[out_pos + i];
+                let in_sample = input[in_start + i];
+                corr += out_sample * in_sample;
+                energy_in += in_sample * in_sample;
+                energy_out += out_sample * out_sample;
+            }
+        }
+
+        let normalized_corr = if energy_in > 1e-10 && energy_out > 1e-10 {
+            corr / (energy_in.sqrt() * energy_out.sqrt())
+        } else {
+            0.0
+        };
+
+        if normalized_corr > best_corr {
+            best_corr = normalized_corr;
+            best_offset = offset;
+        }
+    }
+
+    best_offset
 }

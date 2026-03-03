@@ -19,73 +19,14 @@ use tracing::info;
 
 use crate::config::{GenerationConfig, Qwen3TtsConfig, TalkerConfig};
 use crate::error::Result;
-use crate::sampling::{build_eos_suppression_mask, build_suppression_mask, sample_logits_with_mask, RepetitionPenaltyMask, SamplingKey};
+use crate::sampling::{build_eos_suppression_mask, build_eos_unit_mask, build_suppression_mask, compute_eos_steering_bias, sample_logits_with_mask, RepetitionPenaltyMask, SamplingKey};
 use crate::talker::Talker;
 
-/// Interpolate text embeddings for speed control (GPT-SoVITS-style).
-///
-/// Given trailing text embeddings [1, N, hidden] (text tokens + tts_eos at end),
-/// resizes the text portion via linear interpolation while preserving the tts_eos
-/// embedding exactly. Returns (new_embeds, new_len).
-///
-/// speed_factor > 1.0 → shorter sequence → faster speech
-/// speed_factor < 1.0 → longer sequence → slower speech
-fn interpolate_text_embeddings_for_speed(
-    embeds: &Array,
-    speed_factor: f32,
-) -> Result<(Array, usize)> {
-    let total_len = embeds.dim(1) as usize;
-    if total_len <= 1 || (speed_factor - 1.0).abs() < 1e-6 {
-        return Ok((embeds.clone(), total_len));
-    }
-
-    // Split: text embeddings [0..N-1] and eos embedding [N-1]
-    let text_len = total_len - 1;
-    let text_embeds = embeds.index((.., ..text_len as i32, ..));
-    let eos_embed = embeds.index((.., text_len as i32.., ..));
-
-    let new_text_len = ((text_len as f32 / speed_factor).round() as usize).max(1);
-    if new_text_len == text_len {
-        return Ok((embeds.clone(), total_len));
-    }
-
-    // Linear interpolation of text embeddings
-    let mut slices: Vec<Array> = Vec::with_capacity(new_text_len + 1);
-    let scale = if new_text_len == 1 {
-        0.0
-    } else {
-        (text_len - 1) as f32 / (new_text_len - 1) as f32
-    };
-
-    for i in 0..new_text_len {
-        let src = i as f32 * scale;
-        let lo = src.floor() as usize;
-        let hi = (lo + 1).min(text_len - 1);
-        let w = src - lo as f32;
-
-        if w.abs() < 1e-6 {
-            slices.push(text_embeds.index((.., lo as i32..lo as i32 + 1, ..)));
-        } else {
-            let lo_e = text_embeds.index((.., lo as i32..lo as i32 + 1, ..));
-            let hi_e = text_embeds.index((.., hi as i32..hi as i32 + 1, ..));
-            slices.push(&lo_e * (1.0 - w) + &hi_e * w);
-        }
-    }
-
-    // Append tts_eos at the end (preserved exactly)
-    slices.push(eos_embed);
-
-    let refs: Vec<&Array> = slices.iter().collect();
-    let result = mlx_rs::ops::concatenate_axis(&refs, 1)?;
-    let new_total = new_text_len + 1;
-
-    info!(
-        "Speed {:.2}x: text embeddings {} → {} (total {} → {})",
-        speed_factor, text_len, new_text_len, total_len, new_total
-    );
-
-    Ok((result, new_total))
-}
+/// Average ratio of generated codec frames to text tokens.
+/// Empirically determined from Chinese text: ~4.0 frames per text token.
+/// (12Hz codec, typical Chinese text generates ~3.3 frames per character,
+/// but BPE tokens are coarser so ratio per token is higher)
+const AVG_FRAMES_PER_TEXT_TOKEN: f32 = 4.0;
 
 /// Timing information for each phase of generation.
 #[derive(Debug, Clone)]
@@ -163,6 +104,142 @@ fn resolve_language_id(talker_config: &TalkerConfig, language: &str) -> Result<u
                 talker_config.codec_language_id.keys().collect::<Vec<_>>()
             ))
         })
+}
+
+// ============================================================================
+// Shared generation loop — used by all generate_* functions
+// ============================================================================
+
+/// Configuration for the shared autoregressive generation loop.
+/// Each `generate_*` function does its own unique prefill, then delegates
+/// to `run_generation_loop()` for the autoregressive decoding.
+struct GenerationLoopParams {
+    trailing_len: usize,
+    eos_token: u32,
+    pad_id: u32,
+    temperature: f32,
+    top_k: i32,
+    top_p: f32,
+    repetition_penalty: f32,
+    max_new_tokens: usize,
+    /// Optional EOS steering: (target_frames, speed_factor)
+    eos_steering: Option<(usize, f32)>,
+}
+
+/// Run the shared autoregressive generation loop.
+///
+/// Takes initial logits/hidden from prefill and generates codec frames
+/// until EOS or max_new_tokens is reached.
+fn run_generation_loop(
+    talker: &mut Talker,
+    mut logits: Array,
+    mut hidden: Array,
+    trailing_text_embeds: &Array,
+    tts_pad_embed: &Array,
+    params: &GenerationLoopParams,
+    rng_key: &mut Option<SamplingKey>,
+    vocab_size: usize,
+) -> Result<Vec<[u32; 16]>> {
+    let min_new_tokens: usize = 2;
+
+    // Pre-build suppression masks (GPU arrays, built once)
+    let suppress_mask = build_suppression_mask(vocab_size, params.eos_token);
+    let eos_suppress_mask = build_eos_suppression_mask(vocab_size, params.eos_token);
+    let combined_mask = suppress_mask.add(&eos_suppress_mask)?;
+    let mut penalty_mask = RepetitionPenaltyMask::new(vocab_size, params.repetition_penalty)?;
+
+    // EOS logit steering (optional)
+    let eos_unit_mask = if params.eos_steering.is_some() {
+        Some(build_eos_unit_mask(vocab_size, params.eos_token))
+    } else {
+        None
+    };
+
+    let mut all_codes: Vec<[u32; 16]> = Vec::new();
+
+    for step in 0..params.max_new_tokens {
+        let base_mask = if step < min_new_tokens {
+            &combined_mask
+        } else {
+            &suppress_mask
+        };
+
+        // Apply EOS logit steering bias (avoid cloning: use reference when no bias needed)
+        let steered_mask;
+        let effective_mask: &Array = if let Some((target, speed)) = params.eos_steering {
+            if step >= min_new_tokens {
+                let bias = compute_eos_steering_bias(step, target, speed);
+                if bias.abs() > 0.01 {
+                    let unit_mask = eos_unit_mask.as_ref().unwrap();
+                    let bias_mask = unit_mask.multiply(mlx_rs::array!(bias))?;
+                    steered_mask = base_mask.add(&bias_mask)?;
+                    &steered_mask
+                } else {
+                    base_mask
+                }
+            } else {
+                base_mask
+            }
+        } else {
+            base_mask
+        };
+
+        let token0 = sample_logits_with_mask(
+            &logits,
+            params.temperature,
+            params.top_k,
+            params.top_p,
+            params.repetition_penalty,
+            &[],
+            rng_key.as_mut(),
+            Some(effective_mask),
+            Some(&penalty_mask),
+        )?;
+
+        if token0 == params.eos_token {
+            info!("EOS at step {} (target={:?})", step, params.eos_steering.map(|(t, _)| t));
+            break;
+        }
+
+        penalty_mask.record_token(token0)?;
+
+        // Generate codebooks 1-15 via code predictor
+        let hidden_slice = hidden.index((.., -1.., ..));
+        let code0_arr = Array::from_slice(&[token0 as i32], &[1, 1]);
+        let code0_embed = talker.codec_embedding.forward(&code0_arr)?;
+        let sub_codes = talker
+            .code_predictor
+            .generate_codes(&hidden_slice, &code0_embed)?;
+
+        let mut frame = [params.pad_id; 16];
+        frame[0] = token0;
+        for (g, &code) in sub_codes.iter().enumerate() {
+            frame[g + 1] = code;
+        }
+        all_codes.push(frame);
+
+        // Build next input: codec_embed(prev_codes) + trailing_text or tts_pad
+        let text_embed_indexed;
+        let text_embed: &Array = if step < params.trailing_len {
+            let s = step as i32;
+            text_embed_indexed = trailing_text_embeds.index((.., s..s + 1, ..));
+            &text_embed_indexed
+        } else {
+            tts_pad_embed
+        };
+
+        let input_embed = talker.build_generation_embedding_with_text(&frame, text_embed)?;
+        let result = talker.forward_step(input_embed)?;
+        logits = result.0;
+        hidden = result.1;
+        eval([&logits])?;
+
+        if step > 0 && step % 256 == 0 {
+            unsafe { mlx_sys::mlx_clear_cache() };
+        }
+    }
+
+    Ok(all_codes)
 }
 
 /// Run the full generation loop (streaming text, batched prefill).
@@ -256,6 +333,7 @@ pub fn generate(
 
     // Reset caches
     talker.reset_caches();
+    talker.set_rope_speed_factor(1.0);
 
     let prefill_start = Instant::now();
 
@@ -267,10 +345,10 @@ pub fn generate(
         &codec_tokens,
         3, // first 3 positions have no codec
     )?;
-    let (prefill_logits, prefill_hidden) = talker.forward_step(&input_embed)?;
+    let (prefill_logits, prefill_hidden) = talker.forward_step(input_embed)?;
     // Extract only the last position from batched output
-    let mut logits = prefill_logits.index((.., -1.., ..)); // [1, 1, 3072]
-    let mut hidden = prefill_hidden.index((.., -1.., ..)); // [1, 1, hidden_size]
+    let logits = prefill_logits.index((.., -1.., ..)); // [1, 1, 3072]
+    let hidden = prefill_hidden.index((.., -1.., ..)); // [1, 1, hidden_size]
     eval([&logits, &hidden])?;
     let prefill_time = prefill_start.elapsed();
 
@@ -278,88 +356,34 @@ pub fn generate(
     // Phase 2: Autoregressive generation with streaming text
     // ====================================================================
     let gen_start = Instant::now();
-    let mut all_codes: Vec<[u32; 16]> = Vec::new();
-
-    let min_new_tokens: usize = 2;
-
-    // Pre-build suppression masks (GPU arrays, built once)
     let vocab_size = tts_config.talker_config.vocab_size as usize;
-    let suppress_mask = build_suppression_mask(vocab_size, eos_token);
-    let eos_suppress_mask = build_eos_suppression_mask(vocab_size, eos_token);
-    // Combined mask: control tokens + EOS suppressed (for min_new_tokens)
-    let combined_mask = suppress_mask.add(&eos_suppress_mask)?;
+    let speed = gen_config.speed_factor;
+    let eos_steering = if (speed - 1.0).abs() > 0.01 {
+        let t = (trailing_len as f32 * AVG_FRAMES_PER_TEXT_TOKEN / speed) as usize;
+        info!("EOS steering: target_frames={}, speed={:.2}x, trailing_len={}", t, speed, trailing_len);
+        Some((t, speed))
+    } else {
+        None
+    };
 
-    // GPU-resident repetition penalty mask (no CPU roundtrip per step)
-    let mut penalty_mask = RepetitionPenaltyMask::new(vocab_size, gen_config.repetition_penalty)?;
+    let params = GenerationLoopParams {
+        trailing_len,
+        eos_token,
+        pad_id,
+        temperature: gen_config.temperature,
+        top_k: gen_config.top_k,
+        top_p: gen_config.top_p,
+        repetition_penalty: gen_config.repetition_penalty,
+        max_new_tokens: gen_config.max_new_tokens as usize,
+        eos_steering,
+    };
 
-    for step in 0..gen_config.max_new_tokens as usize {
-        // Use combined mask (suppress control tokens + EOS) before min_new_tokens,
-        // otherwise just suppress control tokens
-        let mask = if step < min_new_tokens {
-            &combined_mask
-        } else {
-            &suppress_mask
-        };
-
-        // Sample codebook-0 from current logits (GPU penalty mask, no CPU token list)
-        let token0 = sample_logits_with_mask(
-            &logits,
-            gen_config.temperature,
-            gen_config.top_k,
-            gen_config.top_p,
-            gen_config.repetition_penalty,
-            &[],
-            rng_key.as_mut(),
-            Some(mask),
-            Some(&penalty_mask),
-        )?;
-
-        // Check EOS
-        if token0 == eos_token {
-            info!("EOS at step {}", step);
-            break;
-        }
-
-        // Update GPU penalty mask
-        penalty_mask.record_token(token0)?;
-
-        // Generate codebooks 1-15 via code predictor
-        let hidden_slice = hidden.index((.., -1.., ..));
-        let code0_arr = Array::from_slice(&[token0 as i32], &[1, 1]);
-        let code0_embed = talker.codec_embedding.forward(&code0_arr)?;
-        let sub_codes = talker
-            .code_predictor
-            .generate_codes(&hidden_slice, &code0_embed)?;
-
-        // Build full 16-code frame
-        let mut frame = [pad_id; 16];
-        frame[0] = token0;
-        for (g, &code) in sub_codes.iter().enumerate() {
-            frame[g + 1] = code;
-        }
-        all_codes.push(frame);
-
-        // Build next input: codec_embed(prev_codes) + trailing_text or tts_pad
-        let text_embed = if step < trailing_len {
-            let s = step as i32;
-            trailing_text_embeds.index((.., s..s + 1, ..))
-        } else {
-            tts_pad_embed.clone()
-        };
-
-        let input_embed = talker.build_generation_embedding_with_text(&frame, &text_embed)?;
-        let result = talker.forward_step(&input_embed)?;
-        logits = result.0;
-        hidden = result.1;
-        eval([&logits])?;
-
-        if step > 0 && step % 256 == 0 {
-            unsafe { mlx_sys::mlx_clear_cache() };
-        }
-    }
+    let all_codes = run_generation_loop(
+        talker, logits, hidden, &trailing_text_embeds, &tts_pad_embed,
+        &params, &mut rng_key, vocab_size,
+    )?;
 
     let gen_time = gen_start.elapsed();
-    info!("Generation complete: {} frames", all_codes.len());
 
     let timing = GenerationTiming {
         prefill_ms: prefill_time.as_secs_f64() * 1000.0,
@@ -414,6 +438,7 @@ pub fn generate_voice_design(
     );
 
     talker.reset_caches();
+    talker.set_rope_speed_factor(1.0);
 
     let prefill_start = Instant::now();
 
@@ -424,80 +449,32 @@ pub fn generate_voice_design(
         codec_prefix,
         tts_config,
     )?;
-    let (prefill_logits, prefill_hidden) = talker.forward_step(&input_embed)?;
-    let mut logits = prefill_logits.index((.., -1.., ..));
-    let mut hidden = prefill_hidden.index((.., -1.., ..));
+    let (prefill_logits, prefill_hidden) = talker.forward_step(input_embed)?;
+    let logits = prefill_logits.index((.., -1.., ..));
+    let hidden = prefill_hidden.index((.., -1.., ..));
     eval([&logits, &hidden])?;
     let prefill_time = prefill_start.elapsed();
 
-    // Generation loop (identical to CustomVoice)
+    // Generation loop (delegates to shared loop)
     let gen_start = Instant::now();
-    let mut all_codes: Vec<[u32; 16]> = Vec::new();
-
-    let min_new_tokens: usize = 2;
     let vocab_size = tts_config.talker_config.vocab_size as usize;
-    let suppress_mask = build_suppression_mask(vocab_size, eos_token);
-    let eos_suppress_mask = build_eos_suppression_mask(vocab_size, eos_token);
-    let combined_mask = suppress_mask.add(&eos_suppress_mask)?;
-    let mut penalty_mask = RepetitionPenaltyMask::new(vocab_size, gen_config.repetition_penalty)?;
 
-    for step in 0..gen_config.max_new_tokens as usize {
-        let mask = if step < min_new_tokens {
-            &combined_mask
-        } else {
-            &suppress_mask
-        };
+    let params = GenerationLoopParams {
+        trailing_len,
+        eos_token,
+        pad_id,
+        temperature: gen_config.temperature,
+        top_k: gen_config.top_k,
+        top_p: gen_config.top_p,
+        repetition_penalty: gen_config.repetition_penalty,
+        max_new_tokens: gen_config.max_new_tokens as usize,
+        eos_steering: None,
+    };
 
-        let token0 = sample_logits_with_mask(
-            &logits,
-            gen_config.temperature,
-            gen_config.top_k,
-            gen_config.top_p,
-            gen_config.repetition_penalty,
-            &[],
-            rng_key.as_mut(),
-            Some(mask),
-            Some(&penalty_mask),
-        )?;
-
-        if token0 == eos_token {
-            info!("EOS at step {}", step);
-            break;
-        }
-
-        penalty_mask.record_token(token0)?;
-
-        let hidden_slice = hidden.index((.., -1.., ..));
-        let code0_arr = Array::from_slice(&[token0 as i32], &[1, 1]);
-        let code0_embed = talker.codec_embedding.forward(&code0_arr)?;
-        let sub_codes = talker
-            .code_predictor
-            .generate_codes(&hidden_slice, &code0_embed)?;
-
-        let mut frame = [pad_id; 16];
-        frame[0] = token0;
-        for (g, &code) in sub_codes.iter().enumerate() {
-            frame[g + 1] = code;
-        }
-        all_codes.push(frame);
-
-        let text_embed = if step < trailing_len {
-            let s = step as i32;
-            trailing_text_embeds.index((.., s..s + 1, ..))
-        } else {
-            tts_pad_embed.clone()
-        };
-
-        let input_embed = talker.build_generation_embedding_with_text(&frame, &text_embed)?;
-        let result = talker.forward_step(&input_embed)?;
-        logits = result.0;
-        hidden = result.1;
-        eval([&logits])?;
-
-        if step > 0 && step % 256 == 0 {
-            unsafe { mlx_sys::mlx_clear_cache() };
-        }
-    }
+    let all_codes = run_generation_loop(
+        talker, logits, hidden, &trailing_text_embeds, &tts_pad_embed,
+        &params, &mut rng_key, vocab_size,
+    )?;
 
     let gen_time = gen_start.elapsed();
     info!("VoiceDesign generation complete: {} frames", all_codes.len());
@@ -548,6 +525,7 @@ pub fn generate_voice_clone(
     );
 
     talker.reset_caches();
+    talker.set_rope_speed_factor(1.0);
 
     let prefill_start = Instant::now();
 
@@ -559,83 +537,43 @@ pub fn generate_voice_clone(
         tts_config,
     )?;
 
-    let (prefill_logits, prefill_hidden) = talker.forward_step(&input_embed)?;
-    let mut logits = prefill_logits.index((.., -1.., ..));
-    let mut hidden = prefill_hidden.index((.., -1.., ..));
+    let (prefill_logits, prefill_hidden) = talker.forward_step(input_embed)?;
+    let logits = prefill_logits.index((.., -1.., ..));
+    let hidden = prefill_hidden.index((.., -1.., ..));
     eval([&logits, &hidden])?;
     let prefill_time = prefill_start.elapsed();
 
-    // Generation loop (identical to CustomVoice)
+    // Generation loop with EOS logit steering for speed control
     let gen_start = Instant::now();
-    let mut all_codes: Vec<[u32; 16]> = Vec::new();
-
-    let min_new_tokens: usize = 2;
     let vocab_size = tts_config.talker_config.vocab_size as usize;
-    let suppress_mask = build_suppression_mask(vocab_size, eos_token);
-    let eos_suppress_mask = build_eos_suppression_mask(vocab_size, eos_token);
-    let combined_mask = suppress_mask.add(&eos_suppress_mask)?;
-    let mut penalty_mask = RepetitionPenaltyMask::new(vocab_size, gen_config.repetition_penalty)?;
+    let speed = gen_config.speed_factor;
+    let eos_steering = if (speed - 1.0).abs() > 0.01 {
+        let t = (trailing_len as f32 * AVG_FRAMES_PER_TEXT_TOKEN / speed) as usize;
+        info!("EOS steering: target_frames={}, speed={:.2}x, trailing_len={}", t, speed, trailing_len);
+        Some((t, speed))
+    } else {
+        None
+    };
 
-    for step in 0..gen_config.max_new_tokens as usize {
-        let mask = if step < min_new_tokens {
-            &combined_mask
-        } else {
-            &suppress_mask
-        };
+    let params = GenerationLoopParams {
+        trailing_len,
+        eos_token,
+        pad_id,
+        temperature: gen_config.temperature,
+        top_k: gen_config.top_k,
+        top_p: gen_config.top_p,
+        repetition_penalty: gen_config.repetition_penalty,
+        max_new_tokens: gen_config.max_new_tokens as usize,
+        eos_steering,
+    };
 
-        let token0 = sample_logits_with_mask(
-            &logits,
-            gen_config.temperature,
-            gen_config.top_k,
-            gen_config.top_p,
-            gen_config.repetition_penalty,
-            &[],
-            rng_key.as_mut(),
-            Some(mask),
-            Some(&penalty_mask),
-        )?;
-
-        if token0 == eos_token {
-            info!("EOS at step {}", step);
-            break;
-        }
-
-        penalty_mask.record_token(token0)?;
-
-        let hidden_slice = hidden.index((.., -1.., ..));
-        let code0_arr = Array::from_slice(&[token0 as i32], &[1, 1]);
-        let code0_embed = talker.codec_embedding.forward(&code0_arr)?;
-        let sub_codes = talker
-            .code_predictor
-            .generate_codes(&hidden_slice, &code0_embed)?;
-
-        let mut frame = [pad_id; 16];
-        frame[0] = token0;
-        for (g, &code) in sub_codes.iter().enumerate() {
-            frame[g + 1] = code;
-        }
-        all_codes.push(frame);
-
-        let text_embed = if step < trailing_len {
-            let s = step as i32;
-            trailing_text_embeds.index((.., s..s + 1, ..))
-        } else {
-            tts_pad_embed.clone()
-        };
-
-        let input_embed = talker.build_generation_embedding_with_text(&frame, &text_embed)?;
-        let result = talker.forward_step(&input_embed)?;
-        logits = result.0;
-        hidden = result.1;
-        eval([&logits])?;
-
-        if step > 0 && step % 256 == 0 {
-            unsafe { mlx_sys::mlx_clear_cache() };
-        }
-    }
+    let all_codes = run_generation_loop(
+        talker, logits, hidden, &trailing_text_embeds, &tts_pad_embed,
+        &params, &mut rng_key, vocab_size,
+    )?;
 
     let gen_time = gen_start.elapsed();
-    info!("VoiceClone generation complete: {} frames", all_codes.len());
+    info!("VoiceClone generation complete: {} frames (trailing_len={})", all_codes.len(), trailing_len);
 
     let timing = GenerationTiming {
         prefill_ms: prefill_time.as_secs_f64() * 1000.0,
@@ -686,6 +624,7 @@ pub fn generate_voice_clone_icl(
     );
 
     talker.reset_caches();
+    talker.set_rope_speed_factor(1.0);
 
     let prefill_start = Instant::now();
 
@@ -696,7 +635,7 @@ pub fn generate_voice_clone_icl(
         tts_config,
     )?;
     let prefill_len = prefill_embed.dim(1);
-    let (_, _) = talker.forward_step(&prefill_embed)?;
+    let (_, _) = talker.forward_step(prefill_embed)?;
     eval(std::iter::empty::<&Array>())?;
 
     // Phase 2: ICL extension — sum reference codec embeddings and build ICL prompt
@@ -711,95 +650,45 @@ pub fn generate_voice_clone_icl(
     )?;
 
     // Feed ICL prompt through transformer (extends KV cache)
-    let (icl_logits, icl_hidden) = talker.forward_step(&icl_embed)?;
+    let icl_len = icl_embed.dim(1);
+    let (icl_logits, icl_hidden) = talker.forward_step(icl_embed)?;
 
     // Extract last position logits/hidden
-    let mut logits = icl_logits.index((.., -1.., ..));
-    let mut hidden = icl_hidden.index((.., -1.., ..));
+    let logits = icl_logits.index((.., -1.., ..));
+    let hidden = icl_hidden.index((.., -1.., ..));
     eval([&logits, &hidden])?;
     let prefill_time = prefill_start.elapsed();
 
     info!(
         "ICL prefill complete: {} + {} ICL positions, trailing_len={}",
         prefill_len,
-        icl_embed.dim(1),
+        icl_len,
         trailing_len,
     );
 
     // Precompute tts_pad embedding for after trailing text exhausted
     let tts_pad_embed = talker.build_text_only_embedding(tts_config.tts_pad_token_id)?;
 
-    // Phase 3: Autoregressive generation
+    // Phase 3: Autoregressive generation (delegates to shared loop)
     let gen_start = Instant::now();
-    let mut all_codes: Vec<[u32; 16]> = Vec::new();
-
-    // Python reference uses min_new_tokens=2
-    let min_new_tokens: usize = 2;
     let vocab_size = tts_config.talker_config.vocab_size as usize;
-    let suppress_mask = build_suppression_mask(vocab_size, eos_token);
-    let eos_suppress_mask = build_eos_suppression_mask(vocab_size, eos_token);
-    let combined_mask = suppress_mask.add(&eos_suppress_mask)?;
-    let mut penalty_mask = RepetitionPenaltyMask::new(vocab_size, repetition_penalty)?;
 
-    for step in 0..max_new_tokens {
-        let mask = if step < min_new_tokens {
-            &combined_mask
-        } else {
-            &suppress_mask
-        };
+    let params = GenerationLoopParams {
+        trailing_len,
+        eos_token,
+        pad_id,
+        temperature: gen_config.temperature,
+        top_k: gen_config.top_k,
+        top_p: gen_config.top_p,
+        repetition_penalty,
+        max_new_tokens,
+        eos_steering: None,
+    };
 
-        let token0 = sample_logits_with_mask(
-            &logits,
-            gen_config.temperature,
-            gen_config.top_k,
-            gen_config.top_p,
-            repetition_penalty,
-            &[],
-            rng_key.as_mut(),
-            Some(mask),
-            Some(&penalty_mask),
-        )?;
-
-        if token0 == eos_token {
-            info!("EOS at step {}", step);
-            break;
-        }
-
-        penalty_mask.record_token(token0)?;
-
-        let hidden_slice = hidden.index((.., -1.., ..));
-        let code0_arr = Array::from_slice(&[token0 as i32], &[1, 1]);
-        let code0_embed = talker.codec_embedding.forward(&code0_arr)?;
-        let sub_codes = talker
-            .code_predictor
-            .generate_codes(&hidden_slice, &code0_embed)?;
-
-        let mut frame = [pad_id; 16];
-        frame[0] = token0;
-        for (g, &code) in sub_codes.iter().enumerate() {
-            frame[g + 1] = code;
-        }
-        all_codes.push(frame);
-
-        // Trailing text from ICL prompt surplus, then tts_pad
-        let text_embed = if trailing_len > 0 && step < trailing_len {
-            use mlx_rs::ops::indexing::IndexOp;
-            let s = step as i32;
-            trailing_text_embed.index((.., s..s + 1, ..))
-        } else {
-            tts_pad_embed.clone()
-        };
-
-        let input_embed = talker.build_generation_embedding_with_text(&frame, &text_embed)?;
-        let result = talker.forward_step(&input_embed)?;
-        logits = result.0;
-        hidden = result.1;
-        eval([&logits])?;
-
-        if step > 0 && step % 256 == 0 {
-            unsafe { mlx_sys::mlx_clear_cache() };
-        }
-    }
+    let all_codes = run_generation_loop(
+        talker, logits, hidden, &trailing_text_embed, &tts_pad_embed,
+        &params, &mut rng_key, vocab_size,
+    )?;
 
     let gen_time = gen_start.elapsed();
     info!("VoiceClone ICL generation complete: {} frames", all_codes.len());
@@ -889,10 +778,11 @@ impl GenerationState {
         let tts_pad_embed = talker.build_text_only_embedding(tts_config.tts_pad_token_id)?;
 
         talker.reset_caches();
+        talker.set_rope_speed_factor(1.0);
 
         // Prefill
         let input_embed = talker.build_batched_prefill_embedding(&text_tokens, &codec_tokens, 3)?;
-        let (prefill_logits, prefill_hidden) = talker.forward_step(&input_embed)?;
+        let (prefill_logits, prefill_hidden) = talker.forward_step(input_embed)?;
         let logits = prefill_logits.index((.., -1.., ..));
         let hidden = prefill_hidden.index((.., -1.., ..));
         eval([&logits, &hidden])?;
@@ -984,15 +874,17 @@ impl GenerationState {
             frames.push(frame);
 
             // Build next input
-            let text_embed = if self.step < self.trailing_len {
+            let text_embed_indexed;
+            let text_embed: &Array = if self.step < self.trailing_len {
                 let s = self.step as i32;
-                self.trailing_text_embeds.index((.., s..s + 1, ..))
+                text_embed_indexed = self.trailing_text_embeds.index((.., s..s + 1, ..));
+                &text_embed_indexed
             } else {
-                self.tts_pad_embed.clone()
+                &self.tts_pad_embed
             };
 
-            let input_embed = talker.build_generation_embedding_with_text(&frame, &text_embed)?;
-            let result = talker.forward_step(&input_embed)?;
+            let input_embed = talker.build_generation_embedding_with_text(&frame, text_embed)?;
+            let result = talker.forward_step(input_embed)?;
             self.logits = result.0;
             self.hidden = result.1;
             eval([&self.logits])?;

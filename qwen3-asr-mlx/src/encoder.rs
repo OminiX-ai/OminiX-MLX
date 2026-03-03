@@ -355,7 +355,7 @@ impl AudioEncoder {
             .iter()
             .map(|&l| get_feat_extract_output_lengths(l))
             .collect();
-        let max_len_after_cnn = *feature_lens_after_cnn.iter().max().unwrap();
+        let max_len_after_cnn = feature_lens_after_cnn.iter().copied().max().unwrap_or(0);
 
         // Conv2d expects [B, H, W, C] (NHWC), input is [B, n_mels, time]
         // Reshape to [B, n_mels, time, 1]

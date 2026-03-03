@@ -288,6 +288,9 @@ pub struct SpeechTokenizerDecoder {
 
 impl SpeechTokenizerDecoder {
     fn debug_tensor(name: &str, t: &Array) {
+        if !tracing::enabled!(tracing::Level::DEBUG) {
+            return;
+        }
         use mlx_rs::transforms::eval;
         let flat = t.flatten(0, -1).unwrap();
         let min = flat.min_axis(0, None).unwrap();

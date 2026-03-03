@@ -23,6 +23,7 @@ Part of the [OminiX-MLX](https://github.com/nicholasgasior/OminiX-MLX) ecosystem
   - [Voice Cloning](#voice-cloning)
   - [VoiceDesign (Text-Described Voices)](#voicedesign-text-described-voices)
   - [Streaming](#streaming)
+  - [Speed Control](#speed-control)
 - [API Reference](#api-reference)
   - [Synthesizer](#synthesizer)
   - [SynthesizeOptions](#synthesizeoptions)
@@ -185,6 +186,31 @@ while let Some(chunk) = session.next_chunk()? {
 }
 ```
 
+### Speed Control
+
+Control speech speed without changing pitch or voice character via the `speed_factor` option:
+
+```rust
+let opts = SynthesizeOptions {
+    speed_factor: Some(1.2), // 20% faster
+    ..Default::default()
+};
+let samples = synth.synthesize_voice_clone(text, &ref_audio, "chinese", &opts)?;
+```
+
+| speed_factor | Effect | Method |
+|-------------|--------|--------|
+| 0.5 - 0.99 | Slower speech | EOS logit steering (model generates longer output) |
+| 1.0 | Normal speed | No modification |
+| 1.01 - 2.0 | Faster speech | WSOLA time-stretching (post-processing) |
+
+**How it works:**
+
+- **Slower (< 1.0):** Biases the codec EOS logit during generation, suppressing early stopping so the model naturally extends its output with slower pacing. Based on the Segment-Aware Conditioning approach.
+- **Faster (> 1.0):** Generates audio at normal speed, then applies WSOLA (Waveform Similarity Overlap-Add) time-compression. This preserves pitch and voice character while shortening the audio. No words are skipped or cut.
+
+The `time_stretch_wsola()` function is also available as a standalone utility for post-processing any audio.
+
 ## API Reference
 
 ### Synthesizer
@@ -239,6 +265,7 @@ pub struct SynthesizeOptions<'a> {
     pub top_p: Option<f32>,        // Nucleus sampling threshold (config default: 1.0)
     pub max_new_tokens: Option<i32>, // Max codec frames (config default: 8192)
     pub seed: Option<u64>,         // Random seed for deterministic generation
+    pub speed_factor: Option<f32>, // Speech speed: >1.0 faster, <1.0 slower (default: 1.0)
 }
 ```
 
@@ -287,6 +314,10 @@ pub fn save_wav(samples: &[f32], sample_rate: u32, path: impl AsRef<Path>) -> Re
 
 /// Normalize audio to target peak amplitude
 pub fn normalize_audio(samples: &[f32], target_peak: f32) -> Vec<f32>;
+
+/// WSOLA time-stretching: change tempo without changing pitch
+/// speed_factor > 1.0 = faster, < 1.0 = slower
+pub fn time_stretch_wsola(samples: &[f32], speed_factor: f32, sample_rate: u32) -> Vec<f32>;
 ```
 
 ## CLI Reference

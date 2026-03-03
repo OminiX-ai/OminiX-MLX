@@ -25,16 +25,6 @@ const TOKEN_IM_END: u32 = 151645;          // <|im_end|>
 const TOKEN_START_OF_SPEECH: u32 = 151646; // <|startofspeech|>
 const TOKEN_END_OF_SPEECH: u32 = 151647;   // <|endofspeech|>
 
-// ── Generation parameters ────────────────────────────────────────────────────
-/// Tokens generated per second of audio (Chinese transcription).
-const TOKENS_PER_SEC_CHINESE: f32 = 5.0;
-/// Tokens generated per second of audio (English translation).
-const TOKENS_PER_SEC_ENGLISH: f32 = 8.0;
-/// Minimum number of tokens to generate regardless of audio duration.
-const MIN_GENERATED_TOKENS: usize = 30;
-/// Maximum number of tokens to generate regardless of audio duration.
-const MAX_GENERATED_TOKENS: usize = 400;
-
 // ── Repetition detection thresholds ──────────────────────────────────────────
 /// Minimum block size (in chars) to qualify as a repeated block.
 const MIN_REPEAT_BLOCK_CHARS: usize = 30;
@@ -44,6 +34,164 @@ const MIN_TEXT_LEN_FOR_REPEAT_DETECTION: usize = 60;
 const MIN_COMMON_CHARS: usize = 20;
 /// Minimum text length (in chars) before checking for text-level repetition.
 const MIN_TEXT_LEN_FOR_TEXT_REPETITION: usize = 40;
+
+// ── Hallucination detection patterns (data-driven, add new patterns here) ───
+//
+// These patterns indicate the 8-bit quantized model has mode-collapsed into
+// "helpful AI assistant" behavior instead of transcribing speech. Adding new
+// patterns here is all that's needed to handle new hallucination types.
+
+/// Phrases that indicate a hallucination block when found at a sentence boundary.
+/// If text after a period/sentence boundary starts with any of these, everything
+/// from that boundary onward is excised.
+const HALLUCINATION_MARKERS: &[&str] = &[
+    "你好，我是",
+    "我是一个",
+    "作为一个",
+    "好的，",
+    "首先",
+    "以下是",
+    "根据您",
+    "请问",
+    "您好",
+    "让我",
+    "需要注意",
+    "这段音频",
+    "这段语音",
+    "这是一段",
+    "总结一下",
+    "希望这",
+    "如果您",
+    "感谢您",
+    "很高兴",
+    "I'm an AI",
+    "I am an AI",
+    "As an AI",
+    "Let me ",
+    "Here is",
+    "Here's ",
+    "Based on",
+    "The audio",
+    "The speech",
+    "In summary",
+];
+
+/// Phrases that indicate meta-commentary (model talking about itself/the task
+/// rather than transcribing). If found anywhere in the text, the sentence
+/// containing it is removed.
+const META_COMMENTARY_MARKERS: &[&str] = &[
+    "AI助手",
+    "AI语言模型",
+    "语言模型",
+    "人工智能",
+    "自我介绍",
+    "我来帮",
+    "我来为您",
+    "我来分析",
+    "请告诉我",
+    "有什么可以帮",
+    "处理用户",
+    "用户的查询",
+    "用户的请求",
+    "用户提供",
+    "用户提到",
+    "用户的问题",
+    "这段话的转写",
+    "这段音频的转写",
+    "转写结果",
+    "chain of thought",
+    "chain-of-thought",
+    "step by step",
+];
+
+/// Configuration for audio transcription/translation.
+///
+/// Controls generation parameters, quality heuristics, and
+/// long-form chunking behavior. Use `Default::default()` for robust
+/// real-world transcription, or `TranscribeConfig::greedy()` for
+/// benchmark-optimal CER on clean audio.
+#[derive(Debug, Clone)]
+pub struct TranscribeConfig {
+    /// Sampling temperature (0.0 = greedy, 0.6 = Qwen3 recommended).
+    /// Greedy gives best CER on clean benchmarks but causes repetition
+    /// on real-world audio. Default: 0.6.
+    pub temperature: f32,
+    /// Top-k sampling (0 = disabled). Default: 20.
+    pub top_k: usize,
+    /// Presence penalty for previously generated tokens. Default: 1.0.
+    pub presence_penalty: f32,
+
+    /// Tokens generated per second of audio (Chinese). Default: 5.0.
+    pub tokens_per_sec_chinese: f32,
+    /// Tokens generated per second of audio (English). Default: 8.0.
+    pub tokens_per_sec_english: f32,
+    /// Minimum tokens to generate regardless of duration. Default: 30.
+    pub min_tokens: usize,
+    /// Maximum tokens to generate regardless of duration. Default: 400.
+    pub max_tokens: usize,
+
+    /// Enable entropy monitoring to detect degenerate generation. Default: true.
+    pub entropy_monitoring: bool,
+    /// Shannon entropy threshold below which generation is considered degenerate.
+    /// Default: 0.05.
+    pub entropy_threshold: f32,
+    /// Consecutive low-entropy steps before breaking. Default: 15.
+    pub entropy_window: usize,
+
+    /// Enable embedding collapse detection. Default: true.
+    pub detect_embedding_collapse: bool,
+    /// Cosine similarity threshold for embedding collapse. Default: 0.95.
+    pub embedding_collapse_threshold: f32,
+
+    /// Enable VAD to skip silent chunks in long-form processing. Default: true.
+    pub vad_enabled: bool,
+    /// Silence threshold in dB for VAD. Default: -40.0.
+    pub silence_threshold_db: f32,
+    /// Overlap in seconds between adjacent chunks. Default: 2.0.
+    pub chunk_overlap_secs: f32,
+    /// Enable fuzzy cross-chunk deduplication. Default: true.
+    pub fuzzy_dedup: bool,
+}
+
+impl Default for TranscribeConfig {
+    fn default() -> Self {
+        Self {
+            temperature: 0.6,
+            top_k: 20,
+            presence_penalty: 1.0,
+            tokens_per_sec_chinese: 5.0,
+            tokens_per_sec_english: 8.0,
+            min_tokens: 30,
+            max_tokens: 400,
+            entropy_monitoring: true,
+            entropy_threshold: 0.05,
+            entropy_window: 15,
+            detect_embedding_collapse: true,
+            embedding_collapse_threshold: 0.95,
+            vad_enabled: true,
+            silence_threshold_db: -40.0,
+            chunk_overlap_secs: 2.0,
+            fuzzy_dedup: true,
+        }
+    }
+}
+
+impl TranscribeConfig {
+    /// Greedy decoding config (best CER on clean benchmark audio like AISHELL).
+    /// Disables sampling heuristics for maximum accuracy.
+    pub fn greedy() -> Self {
+        Self {
+            temperature: 0.0,
+            presence_penalty: 0.0,
+            entropy_monitoring: false,
+            detect_embedding_collapse: false,
+            vad_enabled: false,
+            chunk_overlap_secs: 0.0,
+            fuzzy_dedup: false,
+            ..Default::default()
+        }
+    }
+}
 
 /// Speech tokens for multimodal prompts
 pub struct SpeechTokens {
@@ -268,7 +416,58 @@ impl FunASRQwen4B {
         self.process_long_samples(samples, sample_rate, chunk_secs, "Translate the speech to English:", " ")
     }
 
-    /// Process long audio samples with arbitrary prompt by splitting into chunks
+    /// Transcribe audio file with custom config
+    pub fn transcribe_with_config(&mut self, audio_path: &str, config: &TranscribeConfig) -> Result<String> {
+        let (samples, sample_rate) = load_wav(audio_path)?;
+        self.transcribe_samples_with_config(&samples, sample_rate, "语音转写成中文：", config)
+    }
+
+    /// Transcribe long audio with custom config (includes VAD, overlap, fuzzy dedup)
+    pub fn transcribe_long_with_config(
+        &mut self,
+        audio_path: &str,
+        chunk_secs: f32,
+        config: &TranscribeConfig,
+    ) -> Result<String> {
+        let (samples, sample_rate) = load_wav(audio_path)?;
+        self.transcribe_long_samples_with_config(&samples, sample_rate, chunk_secs, config)
+    }
+
+    /// Transcribe long audio samples with custom config (includes VAD, overlap, fuzzy dedup)
+    pub fn transcribe_long_samples_with_config(
+        &mut self,
+        samples: &[f32],
+        sample_rate: u32,
+        chunk_secs: f32,
+        config: &TranscribeConfig,
+    ) -> Result<String> {
+        self.process_long_samples_with_config(samples, sample_rate, chunk_secs, "语音转写成中文：", "", config)
+    }
+
+    /// Translate long audio to English with custom config
+    pub fn translate_long_with_config(
+        &mut self,
+        audio_path: &str,
+        chunk_secs: f32,
+        config: &TranscribeConfig,
+    ) -> Result<String> {
+        let (samples, sample_rate) = load_wav(audio_path)?;
+        self.translate_long_samples_with_config(&samples, sample_rate, chunk_secs, config)
+    }
+
+    /// Translate long audio samples to English with custom config
+    pub fn translate_long_samples_with_config(
+        &mut self,
+        samples: &[f32],
+        sample_rate: u32,
+        chunk_secs: f32,
+        config: &TranscribeConfig,
+    ) -> Result<String> {
+        self.process_long_samples_with_config(samples, sample_rate, chunk_secs, "Translate the speech to English:", " ", config)
+    }
+
+    /// Process long audio samples with arbitrary prompt by splitting into chunks.
+    /// Uses default greedy config for backward compatibility.
     fn process_long_samples(
         &mut self,
         samples: &[f32],
@@ -277,26 +476,107 @@ impl FunASRQwen4B {
         prompt: &str,
         separator: &str,
     ) -> Result<String> {
-        let chunk_size = (chunk_secs * sample_rate as f32) as usize;
-        let total_chunks = (samples.len() + chunk_size - 1) / chunk_size;
-        let mut results: Vec<String> = Vec::new();
+        let mut config = TranscribeConfig::greedy();
+        config.chunk_overlap_secs = 0.0;
+        config.vad_enabled = false;
+        config.fuzzy_dedup = false;
+        self.process_long_samples_with_config(samples, sample_rate, chunk_secs, prompt, separator, &config)
+    }
 
-        for (i, chunk) in samples.chunks(chunk_size).enumerate() {
-            if chunk.len() < (sample_rate as usize / 10) {
+    /// Process long audio samples with full config (VAD, overlap, fuzzy dedup).
+    fn process_long_samples_with_config(
+        &mut self,
+        samples: &[f32],
+        sample_rate: u32,
+        chunk_secs: f32,
+        prompt: &str,
+        separator: &str,
+        config: &TranscribeConfig,
+    ) -> Result<String> {
+        let chunk_size = (chunk_secs * sample_rate as f32) as usize;
+        let overlap_size = (config.chunk_overlap_secs * sample_rate as f32) as usize;
+        let step_size = if overlap_size >= chunk_size {
+            chunk_size // no overlap if overlap >= chunk
+        } else {
+            chunk_size - overlap_size
+        };
+
+        // Build chunk boundaries
+        let mut chunk_ranges: Vec<(usize, usize)> = Vec::new();
+        let mut start = 0usize;
+        while start < samples.len() {
+            let end = (start + chunk_size).min(samples.len());
+            if end - start < (sample_rate as usize / 10) {
                 break; // skip chunks shorter than 100ms
             }
+            chunk_ranges.push((start, end));
+            start += step_size;
+        }
+
+        let total_chunks = chunk_ranges.len();
+        let mut results: Vec<String> = Vec::new();
+
+        for (i, &(start, end)) in chunk_ranges.iter().enumerate() {
+            let chunk = &samples[start..end];
+
+            // VAD: skip silent chunks
+            if config.vad_enabled && crate::audio::is_silent(chunk, config.silence_threshold_db) {
+                eprint!("\r  Chunk {}/{} (silent, skipped)", i + 1, total_chunks);
+                continue;
+            }
+
             eprint!("\r  Chunk {}/{}", i + 1, total_chunks);
-            let text = self.transcribe_samples_with_prompt(chunk, sample_rate, prompt)?;
+            let text = self.transcribe_samples_with_config(chunk, sample_rate, prompt, config)?;
             if !text.is_empty() {
-                results.push(text);
+                // Trim overlap with previous chunk's text
+                if overlap_size > 0 && !results.is_empty() {
+                    let trimmed = Self::trim_overlap(results.last().unwrap(), &text);
+                    if !trimmed.is_empty() {
+                        results.push(trimmed);
+                    }
+                } else {
+                    results.push(text);
+                }
             }
         }
         eprintln!();
 
         let joined = results.join(separator);
 
-        // Final pass: remove repeated blocks in the joined text
-        Ok(Self::remove_repeated_blocks(&joined))
+        // Final pass: remove repeated blocks (fuzzy or exact), then excise hallucination
+        let deduped = if config.fuzzy_dedup {
+            Self::remove_repeated_blocks_fuzzy(&joined)
+        } else {
+            Self::remove_repeated_blocks(&joined)
+        };
+        let cleaned = Self::excise_hallucination_blocks(&deduped);
+        let cleaned = Self::remove_meta_commentary(&cleaned);
+        Ok(cleaned)
+    }
+
+    /// Trim overlapping text between adjacent chunk transcriptions.
+    /// Finds the longest suffix of `prev` that matches a prefix of `current`.
+    fn trim_overlap(prev: &str, current: &str) -> String {
+        if prev.is_empty() || current.is_empty() {
+            return current.to_string();
+        }
+        let prev_chars: Vec<char> = prev.chars().collect();
+        let curr_chars: Vec<char> = current.chars().collect();
+        let max_check = prev_chars.len().min(curr_chars.len()).min(100);
+        let mut best_overlap = 0;
+        for len in (5..=max_check).rev() {
+            let suffix = &prev_chars[prev_chars.len() - len..];
+            let prefix = &curr_chars[..len];
+            if suffix == prefix {
+                best_overlap = len;
+                break;
+            }
+        }
+        if best_overlap > 0 {
+            curr_chars[best_overlap..].iter().collect()
+        } else {
+            current.to_string()
+        }
     }
 
     /// Remove repeated blocks of text from the joined output.
@@ -366,6 +646,104 @@ impl FunASRQwen4B {
         result
     }
 
+    /// Check if a character is CJK/ASCII punctuation.
+    fn is_dedup_punctuation(c: char) -> bool {
+        matches!(c,
+            '。' | '，' | '、' | '？' | '！' | '；' | '：' | '\u{201C}' | '\u{201D}' |
+            '\u{2018}' | '\u{2019}' | '【' | '】' | '《' | '》' | '（' | '）' | '—' |
+            '…' | '·' | '～' | '「' | '」' |
+            '.' | ',' | '?' | '!' | ';' | ':' | '"' | '\'' | '(' | ')' |
+            '[' | ']' | '{' | '}' | '-' | '/' | '~'
+        )
+    }
+
+    /// Remove repeated blocks with fuzzy matching (strips punctuation before matching).
+    ///
+    /// Handles the case where adjacent chunks produce identical text
+    /// but with different punctuation (e.g., "你好，" vs "你好。").
+    fn remove_repeated_blocks_fuzzy(text: &str) -> String {
+        let chars: Vec<char> = text.chars().collect();
+        let len = chars.len();
+        if len < MIN_TEXT_LEN_FOR_REPEAT_DETECTION {
+            return text.to_string();
+        }
+
+        // Build normalized text (no punctuation) with index mapping back to original
+        let mut norm_to_orig: Vec<usize> = Vec::new();
+        for (i, &c) in chars.iter().enumerate() {
+            if !Self::is_dedup_punctuation(c) && !c.is_whitespace() {
+                norm_to_orig.push(i);
+            }
+        }
+        let norm_chars: Vec<char> = norm_to_orig.iter().map(|&i| chars[i]).collect();
+        let norm_len = norm_chars.len();
+        let min_block = MIN_REPEAT_BLOCK_CHARS / 2; // lower threshold for normalized
+
+        if norm_len < min_block * 2 {
+            return text.to_string();
+        }
+
+        // Same algorithm as remove_repeated_blocks but on normalized chars
+        let mut skip_ranges: Vec<(usize, usize)> = Vec::new();
+        let mut pos = min_block;
+        while pos < norm_len {
+            let end = (pos + min_block).min(norm_len);
+            let block: String = norm_chars[pos..end].iter().collect();
+            let prefix: String = norm_chars[..pos].iter().collect();
+            if let Some(first_pos) = prefix.find(&block) {
+                let mut match_len = min_block;
+                while pos + match_len < norm_len
+                    && first_pos + match_len < pos
+                    && norm_chars[first_pos + match_len] == norm_chars[pos + match_len]
+                {
+                    match_len += 1;
+                }
+                if match_len >= min_block {
+                    // Map back to original char indices
+                    let orig_start = norm_to_orig[pos];
+                    let orig_end = if pos + match_len < norm_to_orig.len() {
+                        // Include any trailing punctuation after the matched region
+                        let raw_end = norm_to_orig[pos + match_len - 1] + 1;
+                        // Extend past trailing punctuation/whitespace
+                        let mut ext = raw_end;
+                        while ext < len && (Self::is_dedup_punctuation(chars[ext]) || chars[ext].is_whitespace()) {
+                            ext += 1;
+                        }
+                        ext
+                    } else {
+                        len
+                    };
+                    skip_ranges.push((orig_start, orig_end));
+                    pos += match_len;
+                    continue;
+                }
+            }
+            pos += 1;
+        }
+
+        if skip_ranges.is_empty() {
+            return text.to_string();
+        }
+
+        // Build result, skipping duplicate ranges
+        let mut result = String::new();
+        let mut i = 0;
+        for (start, end) in &skip_ranges {
+            if i < *start {
+                let segment: String = chars[i..*start].iter().collect();
+                result.push_str(&segment);
+            }
+            if *end > i {
+                i = *end;
+            }
+        }
+        if i < len {
+            let segment: String = chars[i..].iter().collect();
+            result.push_str(&segment);
+        }
+        result
+    }
+
     /// Transcribe raw audio samples to Chinese text
     ///
     /// This is useful for streaming audio or when you already have the samples.
@@ -404,6 +782,17 @@ impl FunASRQwen4B {
         sample_rate: u32,
         prompt: &str,
     ) -> Result<String> {
+        self.transcribe_samples_with_config(samples, sample_rate, prompt, &TranscribeConfig::greedy())
+    }
+
+    /// Transcribe/translate audio with a custom prompt and config.
+    pub fn transcribe_samples_with_config(
+        &mut self,
+        samples: &[f32],
+        sample_rate: u32,
+        prompt: &str,
+        config: &TranscribeConfig,
+    ) -> Result<String> {
         // Resample to 16kHz if needed
         let samples = if sample_rate != 16000 {
             resample(samples, sample_rate, 16000)?
@@ -412,12 +801,12 @@ impl FunASRQwen4B {
         };
 
         // Compute duration-proportional max_tokens to prevent hallucination
-        // Chinese: ~3-5 chars/sec ≈ 3-5 tokens/sec
-        // English: ~3-4 words/sec ≈ 5-8 tokens/sec
         let duration_secs = samples.len() as f32 / 16000.0;
         let is_chinese = prompt.contains("中文");
-        let tokens_per_sec = if is_chinese { TOKENS_PER_SEC_CHINESE } else { TOKENS_PER_SEC_ENGLISH };
-        let max_tokens = ((duration_secs * tokens_per_sec) as usize).max(MIN_GENERATED_TOKENS).min(MAX_GENERATED_TOKENS);
+        let tokens_per_sec = if is_chinese { config.tokens_per_sec_chinese } else { config.tokens_per_sec_english };
+        let max_tokens = ((duration_secs * tokens_per_sec) as usize)
+            .max(config.min_tokens)
+            .min(config.max_tokens);
 
         // Compute mel spectrogram
         let mel = compute_mel_spectrogram(&samples, &self.audio_config)?;
@@ -432,7 +821,7 @@ impl FunASRQwen4B {
         let adapted = self.adaptor.forward(&encoder_out)?;
 
         // Generate text with duration-proportional limit
-        let text = self.generate_from_audio_features(&adapted, prompt, max_tokens)?;
+        let text = self.generate_from_audio_features(&adapted, prompt, max_tokens, config)?;
 
         Ok(text)
     }
@@ -485,47 +874,42 @@ impl FunASRQwen4B {
 
     /// Generate text from audio features (multimodal)
     ///
-    /// Uses bare prompt format matching Phase 3 LoRA training:
-    /// [prompt_tokens | audio_features | no_think_tokens]
-    /// The no_think prefix (`<think>\n\n</think>\n\n`) bypasses Qwen3's
-    /// thinking mode so the model generates content directly.
+    /// Embedding layout:
+    ///   [prompt_tokens | audio_features | suffix_tokens]
+    ///
+    /// The suffix controls model behavior at generation time. For robust mode,
+    /// it includes `<think>\n\n</think>\n\n` to bypass Qwen3's thinking mode
+    /// and prevent chain-of-thought hallucination, followed by an instruction
+    /// to output only transcription text.
     fn generate_from_audio_features(
         &mut self,
         audio_features: &Array,
         prompt: &str,
         max_tokens: usize,
+        config: &TranscribeConfig,
     ) -> Result<String> {
-        // Encode the bare prompt (e.g., "语音转写成中文：" or "Translate the speech to English:")
-        let prompt_encoding = self.tokenizer.encode(prompt, false)
-            .map_err(|e| Error::Tokenizer(format!("Tokenization failed: {}", e)))?;
+        // Embedding collapse detection: skip chunk if embeddings are degenerate
+        if config.detect_embedding_collapse {
+            if Self::check_embedding_collapse(audio_features, config.embedding_collapse_threshold) {
+                return Ok(String::new());
+            }
+        }
 
-        let prompt_tokens: Vec<i32> = prompt_encoding.get_ids().iter()
-            .map(|&t| t as i32)
-            .collect();
+        // 1. Task prompt (e.g., "语音转写成中文：")
+        let prompt_embed = self.encode_text_to_embeddings(prompt)?;
 
-        // Get prompt embeddings
-        let token_array = Array::from_slice(&prompt_tokens, &[1, prompt_tokens.len() as i32]);
-        let prompt_embed = self.get_token_embeddings(&token_array)?;
-        mlx_rs::transforms::eval([&prompt_embed])?;
-
-        // Build suffix to append after audio features
-        // Chinese: anti-hallucination instruction to only output transcription
-        // English: no-think prefix + anti-hallucination instruction
-        let is_chinese_prompt = prompt.contains("中文");
-        let suffix_text = if is_chinese_prompt {
+        // 2. Suffix: determines model behavior at generation time
+        //    Chinese: anti-hallucination instruction suffix
+        //    English: no-think prefix to bypass Qwen3 thinking mode
+        let is_chinese = prompt.contains("中文");
+        let suffix_text = if is_chinese {
             "只输出转写文字，不要分析或解释："
         } else {
             "<think>\n\n</think>\n\n"
         };
-        let suffix_encoding = self.tokenizer.encode(suffix_text, false)
-            .map_err(|e| Error::Tokenizer(format!("Tokenization failed: {}", e)))?;
-        let suffix_tokens: Vec<i32> = suffix_encoding.get_ids().iter()
-            .map(|&t| t as i32)
-            .collect();
-        let suffix_array = Array::from_slice(&suffix_tokens, &[1, suffix_tokens.len() as i32]);
-        let suffix_embed = self.get_token_embeddings(&suffix_array)?;
-        mlx_rs::transforms::eval([&suffix_embed])?;
+        let suffix_embed = self.encode_text_to_embeddings(suffix_text)?;
 
+        // Concatenate: [prompt | audio | suffix]
         let combined = mlx_rs::ops::concatenate_axis(
             &[&prompt_embed, audio_features, &suffix_embed],
             1,
@@ -533,7 +917,20 @@ impl FunASRQwen4B {
         mlx_rs::transforms::eval([&combined])?;
 
         // Generate tokens from combined embeddings
-        self.generate_from_embeddings(&combined, max_tokens)
+        self.generate_from_embeddings(&combined, max_tokens, config)
+    }
+
+    /// Encode a text string into token embeddings [1, seq_len, hidden_dim].
+    fn encode_text_to_embeddings(&mut self, text: &str) -> Result<Array> {
+        let encoding = self.tokenizer.encode(text, false)
+            .map_err(|e| Error::Tokenizer(format!("Tokenization failed: {}", e)))?;
+        let token_ids: Vec<i32> = encoding.get_ids().iter()
+            .map(|&t| t as i32)
+            .collect();
+        let token_array = Array::from_slice(&token_ids, &[1, token_ids.len() as i32]);
+        let embed = self.get_token_embeddings(&token_array)?;
+        mlx_rs::transforms::eval([&embed])?;
+        Ok(embed)
     }
 
     /// Get token embeddings (for multimodal injection)
@@ -602,19 +999,21 @@ impl FunASRQwen4B {
 
     /// Generate text from pre-computed embeddings
     ///
-    /// Uses greedy decoding with n-gram repetition detection and
-    /// text-level dedup post-processing.
+    /// Uses configurable sampling with n-gram repetition detection,
+    /// entropy monitoring, and text-level dedup post-processing.
     fn generate_from_embeddings(
         &mut self,
         embeddings: &Array,
         max_tokens: usize,
+        config: &TranscribeConfig,
     ) -> Result<String> {
-        let temperature: f32 = 0.0; // greedy decoding for ASR
-        let top_k: usize = 20;
-        let presence_penalty: f32 = 0.0;
+        let temperature = config.temperature;
+        let top_k = config.top_k;
+        let presence_penalty = config.presence_penalty;
 
         let mut cache: Vec<Option<KVCache>> = Vec::new();
         let mut tokens: Vec<i32> = Vec::new();
+        let mut low_entropy_count: usize = 0;
 
         // Prefill: forward pass with full embeddings
         let logits = self.forward_embeddings(embeddings, &mut cache)?;
@@ -676,8 +1075,21 @@ impl FunASRQwen4B {
 
             // Sample from last position with penalties
             let last_logits = logits.index((.., -1, ..));
+
+            // Entropy monitoring: detect degenerate generation
+            if config.entropy_monitoring {
+                let entropy = Self::compute_entropy(&last_logits);
+                if entropy < config.entropy_threshold {
+                    low_entropy_count += 1;
+                    if low_entropy_count >= config.entropy_window {
+                        break;
+                    }
+                } else {
+                    low_entropy_count = 0;
+                }
+            }
+
             let token = Self::sample_top_k_p(&last_logits, temperature, top_k, &tokens, presence_penalty)?;
-            mlx_rs::transforms::eval([&token])?;
             token_id = token.item();
         }
 
@@ -696,11 +1108,11 @@ impl FunASRQwen4B {
         };
 
         // Post-process: remove text-level repetition
-        // Check if the text contains a repeated block (>20 chars)
         let text = Self::remove_text_repetition(&text);
 
-        // Post-process: cut off meta-commentary that the model sometimes generates
-        // after the actual transcription (e.g., "这段文字看起来像是...")
+        // Post-process: strip leaked suffix, excise hallucination blocks, remove meta-commentary
+        let text = Self::strip_leaked_instructions(&text);
+        let text = Self::excise_hallucination_blocks(&text);
         let text = Self::remove_meta_commentary(&text);
 
         // Post-process: add punctuation if model is available
@@ -749,160 +1161,172 @@ impl FunASRQwen4B {
         text.to_string()
     }
 
-    /// Remove meta-commentary that the model sometimes generates after transcription.
-    ///
-    /// The 8-bit quantized Qwen3 model sometimes enters analysis mode after generating
-    /// the actual transcription, producing text like "这段文字看起来像是..." or
-    /// "以下是我对这段文字的..." which is not part of the audio content.
-    fn remove_meta_commentary(text: &str) -> String {
-        // Chinese meta-commentary markers
-        let zh_markers = [
-            "这段文字看起来",
-            "这段话看起来",
-            "这段话有点长",
-            "这段话的中文",
-            "这段文字主要",
-            "这段文字似乎",
-            "这段文字确实",
-            "这段文字中有",
-            "这段文字是",
-            "看起来你提供的",
-            "看起来这段",
-            "看起来作者",
-            "以下是我对",
-            "以下是整理",
-            "以下是翻译",
-            "以下是可能",
-            "不过，这段",
-            "不过，原文",
-            "不过，内容",
-            "不过，根据",
-            "可能的正确",
-            "可能的原文",
-            "可能的中文",
-            "可能需要更多",
-            "如果需要",
-            "如果你有",
-            "如果你需要",
-            "如果你能",
-            "整理后的版本",
-            "转写后的中文",
-            "翻译内容：",
-            "我来帮你整理",
-            "我将尝试",
-            "我尝试解析",
-            "我尝试将",
-            "我需要先",
-            "我需要将",
-            "总结来说",
-            "总结：",
-            "总的来说",
-            "可能涉及",
-            "可能是在",
-            "首先，我需要",
-            "首先，原文",
-            "首先，这段",
-            "接下来，我",
-            "**转写",
-            "**翻译",
-            "**整理",
-            "**解释",
-            "---\n",
-            "用户输入",
-            "用户的问题",
-            "用户可能",
-            "需要进一步",
-            "按照要求",
-            "以下是转写",
-            "转写后的文字",
-            "转写后的中文",
-            "转写成中文",
-            "请转写成中文",
-            "当转写成中文",
-            "根据用户提供",
-            "根据用户输入",
-            "不进行任何分析",
-            "不进行分析",
-            "逻辑上，为什么",
-            "逻辑上，这家",
-        ];
-
-        // English meta-commentary markers
-        let en_markers = [
-            "Here's a translation",
-            "This text is a bit",
-            "This seems like",
-            "This is a",
-            "The text you provided",
-            "The text provided",
-            "The main idea",
-            "When translating",
-            "Hmm, this seems",
-            "First, I'll",
-            "Let me try",
-            "I need to",
-            "I think",
-            "The user",
-            "Okay, let's see",
-            "It seems like",
-            "Putting it all together",
-            "So, when we talk",
-            "But the user",
-        ];
-
-        let text_trimmed = text.trim();
-
-        // Strip suffix instruction text that sometimes leaks into output
-        let text_trimmed = text_trimmed
-            .replace("只输出转写文字，不要分析或解释：", "")
+    /// Strip our own injected suffix text that sometimes leaks into the output.
+    fn strip_leaked_instructions(text: &str) -> String {
+        text.replace("只输出转写文字，不要分析或解释：", "")
             .replace("只输出转写文字，不要分析或解释", "")
-            .replace("只输出转写文字", "");
-        let text_trimmed = text_trimmed.trim();
+            .replace("只输出转写文字", "")
+            .replace("输出转写文字，不要分析或解释", "")
+            .trim()
+            .to_string()
+    }
 
-        // Markers that indicate meta-commentary even at the start of output
-        // (these are never part of legitimate transcription)
-        let strict_markers = [
-            "按照要求",
-            "以下是转写",
-            "转写后的文字",
-            "转写后的中文",
-            "转写成中文",
-            "请转写成中文",
-            "当转写成中文",
-            "根据用户提供",
-            "根据用户输入",
-            "不进行任何分析",
-            "不进行分析",
-            "逻辑上，为什么",
-            "逻辑上，这家",
-        ];
+    /// Remove meta-commentary sentences (model talking about itself/the task).
+    ///
+    /// Uses the `META_COMMENTARY_MARKERS` pattern list. Any sentence containing
+    /// a marker is removed. To handle new hallucination types, add patterns to
+    /// the const array at the top of this file.
+    fn remove_meta_commentary(text: &str) -> String {
+        // Split on sentence-ending punctuation, check each sentence
+        let mut result = String::new();
+        let mut current_sentence = String::new();
 
-        // Find the earliest meta-commentary marker
-        let mut earliest_pos = text_trimmed.len();
+        for c in text.chars() {
+            current_sentence.push(c);
+            if matches!(c, '。' | '！' | '？' | '.' | '!' | '?' | '\n') {
+                let has_meta = META_COMMENTARY_MARKERS.iter()
+                    .any(|marker| current_sentence.contains(marker));
+                if !has_meta {
+                    result.push_str(&current_sentence);
+                }
+                current_sentence.clear();
+            }
+        }
 
-        // Strict markers: cut at any position (pos >= 0)
-        for marker in &strict_markers {
-            if let Some(pos) = text_trimmed.find(marker) {
-                if pos < earliest_pos {
-                    earliest_pos = pos;
+        // Handle trailing text without sentence-ending punctuation
+        if !current_sentence.is_empty() {
+            let has_meta = META_COMMENTARY_MARKERS.iter()
+                .any(|marker| current_sentence.contains(marker));
+            if !has_meta {
+                result.push_str(&current_sentence);
+            }
+        }
+
+        result.trim().to_string()
+    }
+
+    /// Excise hallucination blocks from transcription output.
+    ///
+    /// When the 8-bit quantized model mode-collapses, it generates "helpful AI
+    /// assistant" text mid-transcription. This function scans for sentence
+    /// boundaries (。！？.!?) and checks if the text after a boundary starts
+    /// with any `HALLUCINATION_MARKERS` pattern. If so, everything from that
+    /// boundary onward is cut.
+    ///
+    /// To handle new hallucination types, add patterns to the const array at
+    /// the top of this file.
+    fn excise_hallucination_blocks(text: &str) -> String {
+        let text = text.trim();
+        if text.is_empty() {
+            return String::new();
+        }
+
+        // Check if the entire text starts with a hallucination marker
+        let trimmed = text.trim_start();
+        for marker in HALLUCINATION_MARKERS {
+            if trimmed.starts_with(marker) {
+                return String::new();
+            }
+        }
+
+        // Scan for sentence boundaries and check what follows
+        let chars: Vec<char> = text.chars().collect();
+        let len = chars.len();
+
+        for i in 0..len {
+            if !matches!(chars[i], '。' | '！' | '？' | '.' | '!' | '?') {
+                continue;
+            }
+
+            // Found sentence boundary — check what follows
+            let rest_start = i + 1;
+            if rest_start >= len {
+                break;
+            }
+
+            // Skip whitespace after punctuation
+            let rest: String = chars[rest_start..].iter().collect();
+            let rest_trimmed = rest.trim_start();
+
+            for marker in HALLUCINATION_MARKERS {
+                if rest_trimmed.starts_with(marker) {
+                    // Cut everything from this boundary onward
+                    let result: String = chars[..=i].iter().collect();
+                    return result.trim().to_string();
                 }
             }
         }
 
-        // Regular markers: only cut if not at the very start (pos > 10)
-        for marker in zh_markers.iter().chain(en_markers.iter()) {
-            if let Some(pos) = text_trimmed.find(marker) {
-                if pos > 10 && pos < earliest_pos {
-                    earliest_pos = pos;
+        text.to_string()
+    }
+
+    /// Compute Shannon entropy of logits distribution.
+    /// Returns f32::MAX on error so generation continues safely.
+    fn compute_entropy(logits: &Array) -> f32 {
+        let flat = match logits.reshape(&[-1]) {
+            Ok(f) => f,
+            Err(_) => return f32::MAX,
+        };
+        if mlx_rs::transforms::eval([&flat]).is_err() {
+            return f32::MAX;
+        }
+        let vals: &[f32] = flat.as_slice();
+        if vals.is_empty() {
+            return f32::MAX;
+        }
+        let max_val = vals.iter().copied().fold(f32::NEG_INFINITY, f32::max);
+        let exp_vals: Vec<f32> = vals.iter().map(|&v| (v - max_val).exp()).collect();
+        let sum_exp: f32 = exp_vals.iter().sum();
+        if sum_exp == 0.0 {
+            return 0.0;
+        }
+        exp_vals.iter()
+            .map(|&e| {
+                let p = e / sum_exp;
+                if p > 0.0 { -p * p.ln() } else { 0.0 }
+            })
+            .sum()
+    }
+
+    /// Check if adaptor output embeddings have collapsed (all audio tokens ≈ same vector).
+    /// Returns true if mean pairwise cosine similarity > threshold.
+    fn check_embedding_collapse(embeddings: &Array, threshold: f32) -> bool {
+        if mlx_rs::transforms::eval([embeddings]).is_err() {
+            return false;
+        }
+        let shape = embeddings.shape();
+        if shape.len() < 3 || (shape[1] as usize) < 4 {
+            return false;
+        }
+        let seq_len = shape[1] as usize;
+        let indices = [0usize, seq_len / 3, 2 * seq_len / 3, seq_len - 1];
+        let embeds: Vec<Vec<f32>> = indices.iter().filter_map(|&i| {
+            let e = embeddings.index((.., i as i32, ..));
+            mlx_rs::transforms::eval([&e]).ok()?;
+            let f = e.reshape(&[-1]).ok()?;
+            mlx_rs::transforms::eval([&f]).ok()?;
+            Some(f.as_slice::<f32>().to_vec())
+        }).collect();
+        if embeds.len() < 2 {
+            return false;
+        }
+        let mut total_cos = 0.0f32;
+        let mut count = 0;
+        for i in 0..embeds.len() {
+            for j in (i + 1)..embeds.len() {
+                let dot: f32 = embeds[i].iter().zip(embeds[j].iter()).map(|(a, b)| a * b).sum();
+                let na: f32 = embeds[i].iter().map(|v| v * v).sum::<f32>().sqrt();
+                let nb: f32 = embeds[j].iter().map(|v| v * v).sum::<f32>().sqrt();
+                if na > 0.0 && nb > 0.0 {
+                    total_cos += dot / (na * nb);
+                    count += 1;
                 }
             }
         }
-
-        if earliest_pos < text_trimmed.len() {
-            return text_trimmed[..earliest_pos].trim().to_string();
+        if count == 0 {
+            return false;
         }
-
-        text_trimmed.to_string()
+        total_cos / count as f32 > threshold
     }
 
     /// Sample with top-k filtering and presence penalty

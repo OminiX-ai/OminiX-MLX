@@ -388,54 +388,34 @@ pub fn compute_speaker_mel(samples: &[f32], config: &SpeakerMelConfig) -> Result
         return Err(Error::Model("Audio too short for speaker encoder".into()));
     }
 
-    let mut magnitudes = vec![0.0f32; n_frames * n_freqs];
-
+    // Build windowed frames [n_frames, n_fft] on CPU, then GPU FFT
+    let mut frames_data = vec![0.0f32; n_frames * n_fft];
     for frame_idx in 0..n_frames {
         let start = frame_idx * hop_length;
-
-        // Apply window to padded signal
-        let mut windowed = vec![0.0f32; n_fft];
+        let out_offset = frame_idx * n_fft;
         for i in 0..win_length {
-            windowed[i] = padded[start + i] * window[i];
-        }
-
-        // Real FFT (magnitude)
-        for k in 0..n_freqs {
-            let mut re = 0.0f64;
-            let mut im = 0.0f64;
-            for fft_n in 0..n_fft {
-                let angle = -2.0 * std::f64::consts::PI * k as f64 * fft_n as f64 / n_fft as f64;
-                re += windowed[fft_n] as f64 * angle.cos();
-                im += windowed[fft_n] as f64 * angle.sin();
-            }
-            // Magnitude: sqrt(re^2 + im^2 + eps)
-            magnitudes[frame_idx * n_freqs + k] = ((re * re + im * im + 1e-9).sqrt()) as f32;
+            frames_data[out_offset + i] = padded[start + i] * window[i];
         }
     }
 
-    // Mel filterbank (Slaney normalization)
+    // GPU: rfft → abs (magnitude) → mel filterbank matmul → log
+    let frames_arr = Array::from_slice(&frames_data, &[n_frames as i32, n_fft as i32]);
+    let fft_result = mlx_rs::fft::rfft(&frames_arr, None, None)?; // [n_frames, n_freqs] complex
+    let magnitudes = fft_result.abs()?; // [n_frames, n_freqs] float32
+
+    // Mel filterbank (Slaney normalization) — built on CPU, applied as GPU matmul
     let filterbank = slaney_mel_filterbank(n_fft as i32, n_mels as i32, config.sample_rate as i32, config.fmin, config.fmax);
+    let fb_arr = Array::from_slice(&filterbank, &[n_mels as i32, n_freqs as i32]);
+    let fb_t = fb_arr.t(); // [n_freqs, n_mels]
 
-    // Apply mel filterbank: [n_frames, n_freqs] × [n_mels, n_freqs]^T → [n_frames, n_mels]
-    let mut mel_spec = vec![0.0f32; n_frames * n_mels];
-    for t in 0..n_frames {
-        for m in 0..n_mels {
-            let mut sum = 0.0f32;
-            for k in 0..n_freqs {
-                sum += magnitudes[t * n_freqs + k] * filterbank[m * n_freqs + k];
-            }
-            mel_spec[t * n_mels + m] = sum;
-        }
-    }
+    // [n_frames, n_freqs] @ [n_freqs, n_mels] → [n_frames, n_mels]
+    let mel_spec = mlx_rs::ops::matmul(&magnitudes, &fb_t)?;
 
     // Log mel: log(clamp(mel, 1e-5))
-    for v in &mut mel_spec {
-        *v = (*v).max(1e-5).ln();
-    }
+    let clamped = mlx_rs::ops::maximum(&mel_spec, &mlx_rs::array!(1e-5f32))?;
+    let log_mel = mlx_rs::ops::log(&clamped)?;
 
-    // Convert to Array [1, n_frames, n_mels]
-    let arr = Array::from_slice(&mel_spec, &[n_frames as i32, n_mels as i32]);
-    let arr = arr.reshape(&[1, n_frames as i32, n_mels as i32])?;
+    let arr = log_mel.reshape(&[1, n_frames as i32, n_mels as i32])?;
     Ok(arr)
 }
 

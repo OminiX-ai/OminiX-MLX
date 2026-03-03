@@ -14,10 +14,10 @@ pub mod adaptor;
 pub mod model;
 
 pub use error::{Error, Result};
-pub use model::FunASRQwen4B;
+pub use model::{FunASRQwen4B, TranscribeConfig};
 
 // Re-export audio utilities
-pub use audio::{load_wav, resample, AudioConfig, MelFrontend, MelFrontendMLX, compute_mel_spectrogram_mlx};
+pub use audio::{load_wav, resample, AudioConfig, MelFrontend, MelFrontendMLX, compute_mel_spectrogram_mlx, is_silent};
 
 // Re-export qwen3-mlx types for direct access
 pub use qwen3_mlx::{
