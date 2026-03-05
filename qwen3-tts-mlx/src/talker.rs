@@ -125,9 +125,11 @@ pub struct TalkerMlp {
 
 impl TalkerMlp {
     pub fn forward(&mut self, x: &Array) -> Result<Array> {
-        let gate = nn::silu(self.gate_proj.forward(x)?)?;
+        let gate_raw = self.gate_proj.forward(x)?;
         let up = self.up_proj.forward(x)?;
-        Ok(self.down_proj.forward(&gate.multiply(up)?)?)
+        let activated = mlx_rs_core::fused_swiglu(&up, &gate_raw)
+            .map_err(|e| crate::error::Error::Model(format!("fused_swiglu: {e}")))?;
+        Ok(self.down_proj.forward(&activated)?)
     }
 }
 
@@ -151,8 +153,10 @@ impl TalkerBlock {
     ) -> Result<Array> {
         let normed = self.input_layernorm.forward(x)?;
         let attn_out = self.self_attn.forward(&normed, mask, cache)?;
-        let h = x.add(attn_out)?;
-        let normed = self.post_attention_layernorm.forward(&h)?;
+        // Fused: h = x + attn_out, normed = rmsnorm(h, weight)
+        let (h, normed) = crate::metal_kernels::fused_residual_rmsnorm(
+            &attn_out, x, &self.post_attention_layernorm.weight,
+        ).map_err(|e| crate::error::Error::Model(format!("fused_residual_rmsnorm: {e}")))?;
         let mlp_out = self.mlp.forward(&normed)?;
         Ok(h.add(mlp_out)?)
     }
@@ -283,8 +287,10 @@ impl CodePredictorBlock {
     ) -> Result<Array> {
         let normed = self.input_layernorm.forward(x)?;
         let attn_out = self.self_attn.forward(&normed, mask, cache)?;
-        let h = x.add(attn_out)?;
-        let normed = self.post_attention_layernorm.forward(&h)?;
+        // Fused: h = x + attn_out, normed = rmsnorm(h, weight)
+        let (h, normed) = crate::metal_kernels::fused_residual_rmsnorm(
+            &attn_out, x, &self.post_attention_layernorm.weight,
+        ).map_err(|e| crate::error::Error::Model(format!("fused_residual_rmsnorm: {e}")))?;
         let mlp_out = self.mlp.forward(&normed)?;
         Ok(h.add(mlp_out)?)
     }
@@ -294,6 +300,10 @@ pub struct CodePredictor {
     pub layers: Vec<CodePredictorBlock>,
     pub norm: nn::RmsNorm,
     pub codec_embeddings: Vec<nn::Embedding>, // 15 embeddings for codebooks 1-15
+    /// Concatenated codebook weights [15*vocab, embed_dim] for batched gather+sum.
+    /// Codebook g is at rows [g*vocab .. (g+1)*vocab].
+    pub stacked_codec_weights: Array,
+    pub codec_vocab_size: i32,
     pub lm_heads: Vec<MaybeQuantized<nn::Linear>>, // 15 heads
     pub small_to_mtp_projection: MaybeQuantized<nn::Linear>,
     pub mtp_proj_bias: Option<Array>,
@@ -471,17 +481,22 @@ impl Talker {
             self.text_projection.forward(&embed)?
         };
 
-        // Codebook 0: talker's codec_embedding (start directly, no zeros allocation)
+        // Codebook 0: talker's codec_embedding
         let code0_arr = Array::from_slice(&[prev_codes[0] as i32], &[1, 1]);
-        let mut codec_embed = self.codec_embedding.forward(&code0_arr)?;
+        let codec0_embed = self.codec_embedding.forward(&code0_arr)?;
 
-        // Codebooks 1-15: code predictor's codec_embeddings
+        // Codebooks 1-15: batched gather+sum from stacked weights
+        let vocab = self.code_predictor.codec_vocab_size;
+        let mut indices = [0i32; 15];
         for g in 0..15 {
-            let code_arr = Array::from_slice(&[prev_codes[g + 1] as i32], &[1, 1]);
-            codec_embed = codec_embed.add(self.code_predictor.codec_embeddings[g].forward(&code_arr)?)?;
+            indices[g] = prev_codes[g + 1] as i32 + (g as i32) * vocab;
         }
+        let indices_arr = Array::from_slice(&indices, &[15]);
+        let gathered = self.code_predictor.stacked_codec_weights.index(&indices_arr);
+        let codec_1_15_sum = mlx_rs::ops::sum_axis(&gathered, 0, None)?
+            .reshape(&[1, 1, -1])?;
 
-        Ok(text_embed.add(codec_embed)?)
+        Ok(text_embed.add(codec0_embed)?.add(codec_1_15_sum)?)
     }
 
     /// Build embedding for prefill positions.
@@ -755,21 +770,27 @@ impl Talker {
     pub fn sum_ref_codec_embeddings(&mut self, ref_codes: &[[u32; 16]]) -> Result<Array> {
         let t = ref_codes.len();
 
-        // Build codes arrays for each codebook group
-        // Group 0: talker.codec_embedding
+        // Group 0: talker.codec_embedding [1, T, hidden]
         let codes_0: Vec<i32> = ref_codes.iter().map(|f| f[0] as i32).collect();
         let codes_0_arr = Array::from_slice(&codes_0, &[1, t as i32]);
-        let mut total = self.codec_embedding.forward(&codes_0_arr)?; // [1, T, hidden]
+        let total_0 = self.codec_embedding.forward(&codes_0_arr)?;
 
-        // Groups 1-15: code_predictor.codec_embeddings[i-1]
-        for g in 0..15 {
-            let codes_g: Vec<i32> = ref_codes.iter().map(|f| f[g + 1] as i32).collect();
-            let codes_g_arr = Array::from_slice(&codes_g, &[1, t as i32]);
-            let embed = self.code_predictor.codec_embeddings[g].forward(&codes_g_arr)?;
-            total = total.add(embed)?;
+        // Groups 1-15: batched gather+sum from stacked codebook weights
+        // Build offset-adjusted indices for all T frames × 15 codebooks
+        let vocab = self.code_predictor.codec_vocab_size;
+        let mut all_indices = Vec::with_capacity(t * 15);
+        for frame in ref_codes {
+            for g in 0..15 {
+                all_indices.push(frame[g + 1] as i32 + (g as i32) * vocab);
+            }
         }
+        let indices_arr = Array::from_slice(&all_indices, &[(t * 15) as i32]);
+        let gathered = self.code_predictor.stacked_codec_weights.index(&indices_arr); // [T*15, hidden]
+        let gathered = gathered.reshape(&[t as i32, 15, -1])?; // [T, 15, hidden]
+        let codec_1_15_sum = mlx_rs::ops::sum_axis(&gathered, 1, None)?; // [T, hidden]
+        let codec_1_15_sum = codec_1_15_sum.reshape(&[1, t as i32, -1])?; // [1, T, hidden]
 
-        Ok(total.as_dtype(mlx_rs::Dtype::Float32)?)
+        Ok(total_0.add(codec_1_15_sum)?.as_dtype(mlx_rs::Dtype::Float32)?)
     }
 
     /// Build ICL prompt for voice cloning.
@@ -872,17 +893,24 @@ impl Talker {
         prev_codes: &[u32; 16],
         text_embed: &Array,
     ) -> Result<Array> {
-        // Codebook 0: talker's codec_embedding (start directly, no zeros allocation)
+        // Codebook 0: talker's codec_embedding
         let code0_arr = Array::from_slice(&[prev_codes[0] as i32], &[1, 1]);
-        let mut codec_embed = self.codec_embedding.forward(&code0_arr)?;
+        let codec0_embed = self.codec_embedding.forward(&code0_arr)?;
 
-        // Codebooks 1-15: code predictor's codec_embeddings
+        // Codebooks 1-15: batched gather+sum from stacked weights
+        // Build offset-adjusted indices: codes[g+1] + g*vocab_size
+        let vocab = self.code_predictor.codec_vocab_size;
+        let mut indices = [0i32; 15];
         for g in 0..15 {
-            let code_arr = Array::from_slice(&[prev_codes[g + 1] as i32], &[1, 1]);
-            codec_embed = codec_embed.add(self.code_predictor.codec_embeddings[g].forward(&code_arr)?)?;
+            indices[g] = prev_codes[g + 1] as i32 + (g as i32) * vocab;
         }
+        let indices_arr = Array::from_slice(&indices, &[15]);
+        // Single gather [15, embed_dim] + sum along axis 0 → [embed_dim]
+        let gathered = self.code_predictor.stacked_codec_weights.index(&indices_arr);
+        let codec_1_15_sum = mlx_rs::ops::sum_axis(&gathered, 0, None)?
+            .reshape(&[1, 1, -1])?;
 
-        Ok(codec_embed.add(text_embed)?)
+        Ok(codec0_embed.add(codec_1_15_sum)?.add(text_embed)?)
     }
 }
 
@@ -1195,10 +1223,21 @@ pub fn load_talker(model_dir: &Path, config: &TalkerConfig, quant: Option<&Quant
         quant,
     )?;
 
+    // Stack codebook weights for batched gather+sum (optimization #1)
+    let codec_weight_refs: Vec<&Array> = codec_embeddings
+        .iter()
+        .map(|e| e.weight.as_ref())
+        .collect();
+    let stacked_codec_weights =
+        mlx_rs::ops::concatenate_axis(&codec_weight_refs, 0)?;
+    let codec_vocab_size = cp_config.vocab_size;
+
     let code_predictor = CodePredictor {
         layers: cp_layers,
         norm: cp_norm,
         codec_embeddings,
+        stacked_codec_weights,
+        codec_vocab_size,
         lm_heads,
         small_to_mtp_projection: mtp_proj,
         mtp_proj_bias,

@@ -74,21 +74,16 @@ impl CausalConvTranspose1d {
 // ============================================================================
 
 pub struct SnakeBeta {
-    pub alpha: Array, // [C]
-    pub beta: Array,  // [C]
+    pub alpha_exp: Array, // [1, 1, C] — pre-exponentiated at load time
+    pub beta_exp: Array,  // [1, 1, C] — pre-exponentiated at load time
 }
 
 impl SnakeBeta {
     pub fn forward(&self, x: &Array) -> Result<Array> {
-        // x: [B, T, C], alpha/beta stored in LOG SPACE: [C] → exp() then broadcast via [1, 1, C]
-        // Formula: x + (1 / (exp(beta) + 1e-9)) * sin^2(exp(alpha) * x)
-        let alpha = self.alpha.reshape(&[1, 1, -1])?.exp()?;
-        let beta = self.beta.reshape(&[1, 1, -1])?.exp()?;
-
-        let sin_val = (x.multiply(&alpha)?).sin()?;
-        let sin_sq = sin_val.multiply(&sin_val)?;
-        let recip_beta = beta.add(array!(1e-9f32))?.reciprocal()?;
-        Ok(x.add(sin_sq.multiply(&recip_beta)?)?)
+        // x: [B, T, C], alpha_exp/beta_exp: [1, 1, C] (exp already applied at load)
+        // Formula: x + sin^2(alpha_exp * x) / (beta_exp + 1e-9)
+        crate::metal_kernels::fused_snake_beta(x, &self.alpha_exp, &self.beta_exp)
+            .map_err(|e| crate::error::Error::Model(format!("SnakeBeta kernel: {e}")))
     }
 }
 
@@ -245,12 +240,15 @@ impl DecoderTransformerLayer {
         let attn_out = self.o_proj.forward(&attn_out)?;
         let attn_scale = self.attn_layer_scale.reshape(&[1, 1, -1])?;
         let attn_out = attn_out.multiply(&attn_scale)?;
-        let h = x.add(attn_out)?;
-
-        let normed = self.post_attention_layernorm.forward(&h)?;
-        let gate = nn::silu(self.gate_proj.forward(&normed)?)?;
+        // Fused: h = x + attn_out, normed = rmsnorm(h, weight)
+        let (h, normed) = crate::metal_kernels::fused_residual_rmsnorm(
+            &attn_out, x, &self.post_attention_layernorm.weight,
+        ).map_err(|e| crate::error::Error::Model(format!("fused_residual_rmsnorm: {e}")))?;
+        let gate_raw = self.gate_proj.forward(&normed)?;
         let up = self.up_proj.forward(&normed)?;
-        let mlp_out = self.down_proj.forward(&gate.multiply(up)?)?;
+        let activated = mlx_rs_core::fused_swiglu(&up, &gate_raw)
+            .map_err(|e| crate::error::Error::Model(format!("fused_swiglu: {e}")))?;
+        let mlp_out = self.down_proj.forward(&activated)?;
         let mlp_scale = self.mlp_layer_scale.reshape(&[1, 1, -1])?;
         let mlp_out = mlp_out.multiply(&mlp_scale)?;
 
@@ -500,7 +498,11 @@ fn load_causal_conv_transpose1d(
 fn load_snake_beta(weights: &HashMap<String, Array>, prefix: &str) -> Result<SnakeBeta> {
     let alpha = get_weight(weights, &format!("{prefix}.alpha"))?;
     let beta = get_weight(weights, &format!("{prefix}.beta"))?;
-    Ok(SnakeBeta { alpha, beta })
+    // Precompute exp() at load time — alpha/beta are stored in log space
+    let alpha_exp = alpha.reshape(&[1, 1, -1])?.exp()?;
+    let beta_exp = beta.reshape(&[1, 1, -1])?.exp()?;
+    eval([&alpha_exp, &beta_exp])?;
+    Ok(SnakeBeta { alpha_exp, beta_exp })
 }
 
 fn load_residual_unit(

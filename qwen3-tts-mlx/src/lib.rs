@@ -6,6 +6,7 @@
 pub mod config;
 pub mod error;
 pub mod generate;
+pub mod metal_kernels;
 pub mod mrope;
 pub mod sampling;
 pub mod speaker_encoder;
