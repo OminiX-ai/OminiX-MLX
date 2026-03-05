@@ -47,6 +47,7 @@ members = [
     "qwen3-tts-mlx",
     "qwen3.5-35B-mlx",
     "ominix-api",
+    "deepseek-ocr2-mlx",
 ]
 
 resolver = "2"

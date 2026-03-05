@@ -4,15 +4,18 @@
 //!   - ASR: POST /v1/audio/transcriptions (OpenAI Whisper-compatible)
 //!   - TTS: POST /v1/audio/speech (OpenAI TTS-compatible)
 //!   - LLM: POST /v1/chat/completions
+//!   - OCR: POST /v1/ocr (DeepSeek-OCR-2 vision-language)
 //!
 //! Usage:
 //!   cargo run --release -p ominix-api -- --asr-model ~/.OminiX/models/qwen3-asr-1.7b
 //!   cargo run --release -p ominix-api -- --tts-model ./models/Qwen3-TTS-12Hz-1.7B-CustomVoice-8bit
+//!   cargo run --release -p ominix-api --features ocr -- --ocr-model ./models/DeepSeek-OCR-2
 //!   cargo run --release -p ominix-api -- --port 9090 --language English
 //!
 //! Endpoints:
 //!   POST   /v1/audio/transcriptions  — Transcribe audio (multipart or JSON)
 //!   POST   /v1/audio/speech          — Synthesize speech from text
+//!   POST   /v1/ocr                   — OCR / document understanding (multipart or JSON)
 //!   GET    /v1/models                — List available models
 //!   POST   /v1/models/download       — Download model from HuggingFace
 //!   DELETE /v1/models/{id}           — Delete a downloaded model
@@ -75,6 +78,10 @@ struct Args {
     /// LLM model directory (omit to disable LLM)
     #[arg(long)]
     llm_model: Option<String>,
+
+    /// OCR model directory (omit to disable OCR)
+    #[arg(long)]
+    ocr_model: Option<String>,
 
     /// Models directory for management (default: ~/.ominix/models)
     #[arg(long)]
@@ -530,7 +537,7 @@ struct LlmResult {
     completion_tokens: usize,
 }
 
-#[cfg(feature = "llm")]
+#[cfg(any(feature = "llm", feature = "ocr"))]
 enum LlmStreamEvent {
     Token(String),
     Done {
@@ -545,6 +552,240 @@ struct LlmRequest {
     temperature: f32,
     max_tokens: u32,
     response: LlmResponseChannel,
+}
+
+// ============================================================================
+// OCR inference
+// ============================================================================
+
+#[cfg(feature = "ocr")]
+enum OcrResponseChannel {
+    Full(oneshot::Sender<std::result::Result<OcrResult, String>>),
+    Stream(mpsc::Sender<LlmStreamEvent>),
+}
+
+#[cfg(feature = "ocr")]
+struct OcrResult {
+    text: String,
+    prompt_tokens: usize,
+    completion_tokens: usize,
+}
+
+#[cfg(feature = "ocr")]
+struct OcrRequest {
+    image_data: Vec<u8>,
+    prompt: String,
+    temperature: f32,
+    max_tokens: u32,
+    base_size: u32,
+    image_size: u32,
+    response: OcrResponseChannel,
+}
+
+#[cfg(feature = "ocr")]
+fn ocr_inference_worker(
+    mut model: deepseek_ocr2_mlx::DeepseekOCR2,
+    tokenizer: tokenizers::Tokenizer,
+    mut rx: mpsc::Receiver<OcrRequest>,
+) {
+    use mlx_rs::module::Module;
+
+    while let Some(req) = rx.blocking_recv() {
+        let result = (|| -> std::result::Result<(), String> {
+            // Decode image
+            let img = image::load_from_memory(&req.image_data)
+                .map_err(|e| format!("Failed to decode image: {}", e))?
+                .to_rgb8();
+            let (w, h) = (img.width(), img.height());
+
+            // Determine if prompt contains <image>
+            let has_image = req.prompt.contains("<image>");
+            let prompt = if has_image {
+                req.prompt.clone()
+            } else {
+                format!("<image>\n{}", req.prompt)
+            };
+
+            // Determine crop ratio
+            let crop_ratio = if w > req.image_size || h > req.image_size {
+                deepseek_ocr2_mlx::find_best_crop_ratio(w, h, 2, 6)
+            } else {
+                (1, 1)
+            };
+
+            // Create global view
+            let base = req.base_size;
+            let mut global = image::RgbImage::new(base, base);
+            for pixel in global.pixels_mut() {
+                *pixel = image::Rgb([128, 128, 128]);
+            }
+            let scale = (base as f32 / w as f32).min(base as f32 / h as f32);
+            let new_w = (w as f32 * scale) as u32;
+            let new_h = (h as f32 * scale) as u32;
+            let resized = image::imageops::resize(
+                &img, new_w, new_h,
+                image::imageops::FilterType::Lanczos3,
+            );
+            let x_offset = (base - new_w) / 2;
+            let y_offset = (base - new_h) / 2;
+            image::imageops::overlay(&mut global, &resized, x_offset as i64, y_offset as i64);
+
+            let global_data: Vec<f32> = global.pixels()
+                .flat_map(|p| p.0.iter().map(|&v| v as f32 / 127.5 - 1.0))
+                .collect();
+            let global_arr = mlx_rs::Array::from_slice(
+                &global_data,
+                &[1, base as i32, base as i32, 3],
+            );
+
+            // Create crop patches
+            let crop_arr = if crop_ratio.0 > 1 || crop_ratio.1 > 1 {
+                let is = req.image_size;
+                let target_w = is * crop_ratio.0 as u32;
+                let target_h = is * crop_ratio.1 as u32;
+                let resized_full = image::imageops::resize(
+                    &img, target_w, target_h,
+                    image::imageops::FilterType::Lanczos3,
+                );
+                let n_crops = crop_ratio.0 * crop_ratio.1;
+                let mut crop_data: Vec<f32> =
+                    Vec::with_capacity((n_crops as usize) * (is * is * 3) as usize);
+                for cy in 0..crop_ratio.1 {
+                    for cx in 0..crop_ratio.0 {
+                        let x0 = cx as u32 * is;
+                        let y0 = cy as u32 * is;
+                        for y in y0..y0 + is {
+                            for x in x0..x0 + is {
+                                let pixel = resized_full.get_pixel(x, y);
+                                for &v in pixel.0.iter() {
+                                    crop_data.push(v as f32 / 127.5 - 1.0);
+                                }
+                            }
+                        }
+                    }
+                }
+                Some(mlx_rs::Array::from_slice(
+                    &crop_data,
+                    &[n_crops, is as i32, is as i32, 3],
+                ))
+            } else {
+                None
+            };
+
+            // Tokenize
+            let (token_ids, seq_mask) = deepseek_ocr2_mlx::tokenize_prompt(
+                &tokenizer,
+                &prompt,
+                true,
+                base as i32,
+                req.image_size as i32,
+                crop_ratio,
+            ).map_err(|e| format!("Tokenize error: {}", e))?;
+
+            let prompt_len = token_ids.len();
+
+            let input_ids = mlx_rs::Array::from_iter(
+                token_ids.iter().copied(),
+                &[1, token_ids.len() as i32],
+            );
+
+            // Encode image
+            let visual_features = model.encode_image(
+                crop_arr.as_ref(),
+                &global_arr,
+            ).map_err(|e| format!("Vision encode error: {}", e))?;
+
+            let seq_mask_bool = mlx_rs::Array::from_iter(
+                seq_mask.iter().map(|&b| b),
+                &[1, seq_mask.len() as i32],
+            );
+            let embeds = model.prepare_inputs(&input_ids, &seq_mask_bool, &visual_features)
+                .map_err(|e| format!("Prepare inputs error: {}", e))?;
+
+            // Generate
+            let mut cache = model.init_cache();
+            let eos_id = model.config.eos_token_id;
+
+            let mut gen = deepseek_ocr2_mlx::Generate {
+                model: &mut model,
+                cache: &mut cache,
+                temp: req.temperature,
+                state: deepseek_ocr2_mlx::GenerateState::Prefill { embeds },
+                eos_token_id: eos_id,
+                repetition_penalty: 1.1,
+                repetition_context_size: 512,
+                generated_tokens: Vec::new(),
+            };
+
+            match req.response {
+                OcrResponseChannel::Full(tx) => {
+                    let mut tokens: Vec<u32> = Vec::new();
+                    let mut tx = Some(tx);
+                    for token_result in gen.by_ref().take(req.max_tokens as usize) {
+                        match token_result {
+                            Ok(token) => {
+                                let token_id: i32 = token.item();
+                                if token_id == eos_id {
+                                    break;
+                                }
+                                tokens.push(token_id as u32);
+                            }
+                            Err(e) => {
+                                if let Some(tx) = tx.take() {
+                                    let _ = tx.send(Err(format!("Generation error: {}", e)));
+                                }
+                                break;
+                            }
+                        }
+                    }
+                    if let Some(tx) = tx {
+                        let text = tokenizer.decode(&tokens, true).unwrap_or_default();
+                        let _ = tx.send(Ok(OcrResult {
+                            text,
+                            prompt_tokens: prompt_len,
+                            completion_tokens: tokens.len(),
+                        }));
+                    }
+                }
+                OcrResponseChannel::Stream(tx) => {
+                    let mut all_tokens: Vec<u32> = Vec::new();
+                    let mut prev_text_len = 0;
+                    for token_result in gen.by_ref().take(req.max_tokens as usize) {
+                        match token_result {
+                            Ok(token) => {
+                                let token_id: i32 = token.item();
+                                if token_id == eos_id {
+                                    break;
+                                }
+                                all_tokens.push(token_id as u32);
+                                let text = tokenizer.decode(&all_tokens, true).unwrap_or_default();
+                                let new_text = text[prev_text_len..].to_string();
+                                if !new_text.is_empty() {
+                                    prev_text_len = text.len();
+                                    if tx.blocking_send(LlmStreamEvent::Token(new_text)).is_err() {
+                                        break;
+                                    }
+                                }
+                            }
+                            Err(e) => {
+                                eprintln!("[{}] OCR generation error: {}", timestamp(), e);
+                                break;
+                            }
+                        }
+                    }
+                    let _ = tx.blocking_send(LlmStreamEvent::Done {
+                        prompt_tokens: prompt_len,
+                        completion_tokens: all_tokens.len(),
+                    });
+                }
+            }
+            Ok(())
+        })();
+
+        if let Err(e) = result {
+            eprintln!("[{}] OCR worker error: {}", timestamp(), e);
+        }
+    }
 }
 
 // ============================================================================
@@ -722,6 +963,7 @@ fn tts_process_request(
         top_p: sr.top_p,
         max_new_tokens: None,
         seed: sr.seed,
+        speed_factor: None,
     };
 
     let result = if let Some(ref instruct) = sr.instruct {
@@ -1078,6 +1320,9 @@ struct ServerState {
     #[cfg(feature = "llm")]
     llm_model_name: String,
 
+    #[cfg(feature = "ocr")]
+    ocr_tx: Option<mpsc::Sender<OcrRequest>>,
+
     default_language: String,
     config: RwLock<OminixConfig>,
     loaded_models: Vec<String>,
@@ -1116,6 +1361,17 @@ async fn handle_request(
         (Method::POST, "/v1/chat/completions") => {
             let body = collect_body(req).await;
             handle_chat_completions(&body, &state).await
+        }
+
+        (Method::POST, "/v1/ocr") => {
+            let ct = req
+                .headers()
+                .get("content-type")
+                .and_then(|v| v.to_str().ok())
+                .unwrap_or("")
+                .to_string();
+            let body = collect_body_bytes(req).await;
+            handle_ocr(&body, &ct, &state).await
         }
 
         (Method::GET, "/v1/models") => handle_list_models(&state).await.map(wrap_full),
@@ -1679,6 +1935,286 @@ async fn handle_chat_completions(
                 Err(_) => Ok(wrap_full(json_response(
                     500,
                     json!({"error": {"message": "LLM inference channel closed", "type": "server_error"}}),
+                ))),
+            }
+        }
+    }
+}
+
+async fn handle_ocr(
+    body: &[u8],
+    content_type: &str,
+    state: &Arc<ServerState>,
+) -> std::result::Result<Response<ApiBody>, hyper::Error> {
+    #[cfg(not(feature = "ocr"))]
+    {
+        let _ = (body, content_type, state);
+        return Ok(wrap_full(json_response(
+            501,
+            json!({"error": {"message": "OCR not enabled. Build with --features ocr", "type": "not_implemented"}}),
+        )));
+    }
+
+    #[cfg(feature = "ocr")]
+    {
+        let ocr_tx = match &state.ocr_tx {
+            Some(tx) => tx,
+            None => {
+                return Ok(wrap_full(json_response(
+                    503,
+                    json!({"error": {"message": "No OCR model loaded. Start with --ocr-model <path>", "type": "service_unavailable"}}),
+                )));
+            }
+        };
+
+        // Parse request — multipart or JSON
+        let (image_data, prompt, temperature, max_tokens, stream) =
+            if content_type.contains("multipart/form-data") {
+                let boundary = match extract_boundary(content_type) {
+                    Some(b) => b,
+                    None => {
+                        return Ok(wrap_full(json_response(
+                            400,
+                            json!({"error": {"message": "Missing boundary in multipart", "type": "invalid_request_error"}}),
+                        )));
+                    }
+                };
+                let fields = parse_multipart(body, &boundary);
+                let image_data = match fields.iter().find(|f| f.name == "file" || f.name == "image") {
+                    Some(f) => f.data.clone(),
+                    None => {
+                        return Ok(wrap_full(json_response(
+                            400,
+                            json!({"error": {"message": "Missing 'file' or 'image' field", "type": "invalid_request_error"}}),
+                        )));
+                    }
+                };
+                let prompt = fields
+                    .iter()
+                    .find(|f| f.name == "prompt")
+                    .map(|f| String::from_utf8_lossy(&f.data).to_string())
+                    .unwrap_or_else(|| "<image>\n<|grounding|>Convert the document to markdown.".to_string());
+                let temperature: f32 = fields
+                    .iter()
+                    .find(|f| f.name == "temperature")
+                    .and_then(|f| String::from_utf8_lossy(&f.data).parse().ok())
+                    .unwrap_or(0.0);
+                let max_tokens: u32 = fields
+                    .iter()
+                    .find(|f| f.name == "max_tokens")
+                    .and_then(|f| String::from_utf8_lossy(&f.data).parse().ok())
+                    .unwrap_or(8192);
+                let stream: bool = fields
+                    .iter()
+                    .find(|f| f.name == "stream")
+                    .and_then(|f| String::from_utf8_lossy(&f.data).parse().ok())
+                    .unwrap_or(false);
+                (image_data, prompt, temperature, max_tokens, stream)
+            } else {
+                // JSON body with base64 image
+                let req: Value = match serde_json::from_slice(body) {
+                    Ok(v) => v,
+                    Err(e) => {
+                        return Ok(wrap_full(json_response(
+                            400,
+                            json!({"error": {"message": format!("Invalid JSON: {}", e), "type": "invalid_request_error"}}),
+                        )));
+                    }
+                };
+                let image_b64 = req["image"].as_str().unwrap_or("");
+                let image_data = match base64::Engine::decode(
+                    &base64::engine::general_purpose::STANDARD,
+                    image_b64,
+                ) {
+                    Ok(d) => d,
+                    Err(e) => {
+                        return Ok(wrap_full(json_response(
+                            400,
+                            json!({"error": {"message": format!("Invalid base64 image: {}", e), "type": "invalid_request_error"}}),
+                        )));
+                    }
+                };
+                let prompt = req["prompt"]
+                    .as_str()
+                    .unwrap_or("<image>\n<|grounding|>Convert the document to markdown.")
+                    .to_string();
+                let temperature = req["temperature"].as_f64().unwrap_or(0.0) as f32;
+                let max_tokens = req["max_tokens"].as_u64().unwrap_or(8192) as u32;
+                let stream = req["stream"].as_bool().unwrap_or(false);
+                (image_data, prompt, temperature, max_tokens, stream)
+            };
+
+        eprintln!(
+            "[{}] OCR: image={}B, prompt={}, temp={}, max_tokens={}, stream={}",
+            timestamp(),
+            image_data.len(),
+            &prompt[..prompt.len().min(80)],
+            temperature,
+            max_tokens,
+            stream,
+        );
+
+        let model_name = "deepseek-ocr2".to_string();
+        let request_id = format!("ocr-{}", uuid_simple());
+
+        if stream {
+            let (event_tx, event_rx) = mpsc::channel::<LlmStreamEvent>(32);
+            let ocr_request = OcrRequest {
+                image_data,
+                prompt,
+                temperature,
+                max_tokens,
+                base_size: 1024,
+                image_size: 768,
+                response: OcrResponseChannel::Stream(event_tx),
+            };
+
+            if ocr_tx.send(ocr_request).await.is_err() {
+                return Ok(wrap_full(json_response(
+                    500,
+                    json!({"error": {"message": "OCR inference worker unavailable", "type": "server_error"}}),
+                )));
+            }
+
+            let (frame_tx, frame_rx) =
+                mpsc::channel::<std::result::Result<Frame<Bytes>, Infallible>>(32);
+            let rid = request_id.clone();
+            let mn = model_name.clone();
+
+            tokio::spawn(async move {
+                let created = timestamp();
+                let chunk = ChatCompletionChunk {
+                    id: rid.clone(),
+                    object: "chat.completion.chunk",
+                    created,
+                    model: mn.clone(),
+                    choices: vec![ChunkChoice {
+                        index: 0,
+                        delta: ChunkDelta {
+                            role: Some("assistant".to_string()),
+                            content: None,
+                        },
+                        finish_reason: None,
+                    }],
+                };
+                let data = format!("data: {}\n\n", serde_json::to_string(&chunk).unwrap());
+                let _ = frame_tx.send(Ok(Frame::data(Bytes::from(data)))).await;
+
+                let mut event_rx = event_rx;
+                while let Some(event) = event_rx.recv().await {
+                    match event {
+                        LlmStreamEvent::Token(text) => {
+                            let chunk = ChatCompletionChunk {
+                                id: rid.clone(),
+                                object: "chat.completion.chunk",
+                                created,
+                                model: mn.clone(),
+                                choices: vec![ChunkChoice {
+                                    index: 0,
+                                    delta: ChunkDelta {
+                                        role: None,
+                                        content: Some(text),
+                                    },
+                                    finish_reason: None,
+                                }],
+                            };
+                            let data = format!("data: {}\n\n", serde_json::to_string(&chunk).unwrap());
+                            if frame_tx.send(Ok(Frame::data(Bytes::from(data)))).await.is_err() {
+                                break;
+                            }
+                        }
+                        LlmStreamEvent::Done { .. } => {
+                            let chunk = ChatCompletionChunk {
+                                id: rid.clone(),
+                                object: "chat.completion.chunk",
+                                created,
+                                model: mn.clone(),
+                                choices: vec![ChunkChoice {
+                                    index: 0,
+                                    delta: ChunkDelta {
+                                        role: None,
+                                        content: None,
+                                    },
+                                    finish_reason: Some("stop".to_string()),
+                                }],
+                            };
+                            let data = format!("data: {}\n\n", serde_json::to_string(&chunk).unwrap());
+                            let _ = frame_tx.send(Ok(Frame::data(Bytes::from(data)))).await;
+                            let _ = frame_tx.send(Ok(Frame::data(Bytes::from("data: [DONE]\n\n")))).await;
+                            break;
+                        }
+                    }
+                }
+            });
+
+            let stream_body = StreamBody::new(ReceiverStream::new(frame_rx));
+            let resp = Response::builder()
+                .status(StatusCode::OK)
+                .header("Content-Type", "text/event-stream")
+                .header("Cache-Control", "no-cache")
+                .header("Connection", "keep-alive")
+                .header("Access-Control-Allow-Origin", "*")
+                .body(ApiBody::Stream(stream_body))
+                .unwrap();
+            Ok(resp)
+        } else {
+            let (resp_tx, resp_rx) = oneshot::channel();
+            let ocr_request = OcrRequest {
+                image_data,
+                prompt,
+                temperature,
+                max_tokens,
+                base_size: 1024,
+                image_size: 768,
+                response: OcrResponseChannel::Full(resp_tx),
+            };
+
+            if ocr_tx.send(ocr_request).await.is_err() {
+                return Ok(wrap_full(json_response(
+                    500,
+                    json!({"error": {"message": "OCR inference worker unavailable", "type": "server_error"}}),
+                )));
+            }
+
+            match resp_rx.await {
+                Ok(Ok(result)) => {
+                    eprintln!(
+                        "[{}] OCR: {} prompt + {} completion tokens",
+                        timestamp(),
+                        result.prompt_tokens,
+                        result.completion_tokens,
+                    );
+                    let resp = ChatCompletionResponse {
+                        id: request_id,
+                        object: "chat.completion",
+                        created: timestamp(),
+                        model: model_name,
+                        choices: vec![ChatChoice {
+                            index: 0,
+                            message: ChatMessage {
+                                role: "assistant".to_string(),
+                                content: result.text,
+                            },
+                            finish_reason: "stop".to_string(),
+                        }],
+                        usage: ChatUsage {
+                            prompt_tokens: result.prompt_tokens,
+                            completion_tokens: result.completion_tokens,
+                            total_tokens: result.prompt_tokens + result.completion_tokens,
+                        },
+                    };
+                    Ok(wrap_full(json_response(
+                        200,
+                        serde_json::to_value(&resp).unwrap(),
+                    )))
+                }
+                Ok(Err(e)) => Ok(wrap_full(json_response(
+                    500,
+                    json!({"error": {"message": e, "type": "server_error"}}),
+                ))),
+                Err(_) => Ok(wrap_full(json_response(
+                    500,
+                    json!({"error": {"message": "OCR inference channel closed", "type": "server_error"}}),
                 ))),
             }
         }
@@ -2252,6 +2788,54 @@ async fn main() -> Result<()> {
     #[cfg(not(feature = "llm"))]
     eprintln!("LLM feature not enabled");
 
+    // --- OCR model ---
+    #[cfg(feature = "ocr")]
+    let ocr_tx = if let Some(ref ocr_path) = args.ocr_model {
+        let model_path = PathBuf::from(ocr_path);
+        eprintln!("Loading OCR model from: {}", model_path.display());
+        let t0 = Instant::now();
+        let tokenizer = deepseek_ocr2_mlx::load_tokenizer(&model_path)
+            .map_err(|e| anyhow::anyhow!("OCR tokenizer load error: {}", e))?;
+        let model = deepseek_ocr2_mlx::load_model(&model_path)
+            .map_err(|e| anyhow::anyhow!("OCR model load error: {}", e))?;
+        eprintln!("OCR model loaded in {:.1}s", t0.elapsed().as_secs_f64());
+
+        let canonical = std::fs::canonicalize(&model_path)
+            .unwrap_or(model_path.clone())
+            .to_string_lossy()
+            .to_string();
+        loaded_models.push(canonical.clone());
+
+        if !config.models.iter().any(|m| {
+            std::fs::canonicalize(&m.path).ok() == std::fs::canonicalize(&model_path).ok()
+        }) {
+            let id = model_path
+                .file_name()
+                .unwrap_or_default()
+                .to_string_lossy()
+                .to_string();
+            config.models.push(ModelEntry {
+                id,
+                repo_id: String::new(),
+                path: canonical,
+                model_type: "ocr".to_string(),
+                quantization: detect_quantization(&model_path),
+                size_bytes: Some(calculate_model_size(&model_path)),
+                downloaded_at: None,
+            });
+            let _ = save_config(&config);
+        }
+
+        let (tx, rx) = mpsc::channel::<OcrRequest>(1);
+        std::thread::spawn(move || ocr_inference_worker(model, tokenizer, rx));
+        Some(tx)
+    } else {
+        None
+    };
+
+    #[cfg(not(feature = "ocr"))]
+    eprintln!("OCR feature not enabled");
+
     eprintln!("Models dir: {}", config.models_dir);
     eprintln!(
         "Config: {} ({} models registered)",
@@ -2272,6 +2856,8 @@ async fn main() -> Result<()> {
         llm_tx,
         #[cfg(feature = "llm")]
         llm_model_name,
+        #[cfg(feature = "ocr")]
+        ocr_tx,
         default_language: args.language.clone(),
         config: RwLock::new(config),
         loaded_models,
@@ -2319,6 +2905,18 @@ async fn main() -> Result<()> {
         println!(
             "    POST   /v1/chat/completions      - LLM Chat [{}]",
             llm_status
+        );
+    }
+    #[cfg(feature = "ocr")]
+    {
+        let ocr_status = if state.ocr_tx.is_some() {
+            "ready"
+        } else {
+            "no model"
+        };
+        println!(
+            "    POST   /v1/ocr                   - OCR [{}]",
+            ocr_status
         );
     }
     println!("    GET    /v1/models                - List models");
