@@ -10,6 +10,7 @@ default = ["asr", "tts"]
 asr = ["dep:qwen3-asr-mlx"]
 tts = ["dep:qwen3-tts-mlx"]
 llm = ["dep:qwen3-5-35b-mlx", "dep:mlx-rs"]
+ocr = ["dep:deepseek-ocr2-mlx", "dep:image", "dep:tokenizers", "dep:mlx-rs"]
 
 [dependencies]
 # HTTP server
@@ -43,4 +44,7 @@ tokio-stream = "0.1"
 qwen3-asr-mlx = { path = "../qwen3-asr-mlx", optional = true }
 qwen3-tts-mlx = { path = "../qwen3-tts-mlx", optional = true }
 qwen3-5-35b-mlx = { path = "../qwen3.5-35B-mlx", optional = true }
+deepseek-ocr2-mlx = { path = "../deepseek-ocr2-mlx", optional = true }
+tokenizers = { version = "0.21", optional = true }
 mlx-rs = { path = "../mlx-rs", features = ["metal", "accelerate"], optional = true }
+image = { version = "0.25", optional = true }
