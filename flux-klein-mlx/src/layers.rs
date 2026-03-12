@@ -482,8 +482,8 @@ impl Mlp {
         let splits = proj.split_axis(&[self.hidden_features], -1)?;
         let gate = &splits[0];
         let up = &splits[1];
-        // SwiGLU: silu(gate) * up
-        let x = ops::multiply(&mlx_rs::nn::silu(gate)?, up)?;
+        // SwiGLU: fused silu(gate) * up
+        let x = mlx_rs_core::fused_swiglu(up, gate)?;
         self.fc2.forward(&x)
     }
 }
@@ -787,8 +787,8 @@ impl SingleStreamBlock {
         let attn_out = attn_out.transpose_axes(&[0, 2, 1, 3])?;
         let attn_out = attn_out.reshape(&[batch, seq_len, -1])?;
 
-        // SwiGLU MLP: silu(gate) * up
-        let mlp_out = ops::multiply(&mlx_rs::nn::silu(gate_proj)?, up_proj)?;
+        // SwiGLU MLP: fused silu(gate) * up
+        let mlp_out = mlx_rs_core::fused_swiglu(up_proj, gate_proj)?;
 
         // Concatenate attention output and MLP output, then project
         let combined = ops::concatenate_axis(&[attn_out, mlp_out], -1)?;

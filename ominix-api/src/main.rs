@@ -583,200 +583,285 @@ struct OcrRequest {
 }
 
 #[cfg(feature = "ocr")]
+fn ocr_process_single_image(
+    model: &mut deepseek_ocr2_mlx::DeepseekOCR2,
+    tokenizer: &tokenizers::Tokenizer,
+    img: &image::RgbImage,
+    prompt: &str,
+    temperature: f32,
+    max_tokens: usize,
+    base_size: u32,
+    image_size: u32,
+) -> std::result::Result<(String, usize, usize), String> {
+    use mlx_rs::module::Module;
+
+    let (w, h) = (img.width(), img.height());
+
+    let has_image = prompt.contains("<image>");
+    let prompt = if has_image {
+        prompt.to_string()
+    } else {
+        format!("<image>\n{}", prompt)
+    };
+
+    let crop_ratio = if w > image_size || h > image_size {
+        deepseek_ocr2_mlx::find_best_crop_ratio(w, h, 2, 6)
+    } else {
+        (1, 1)
+    };
+
+    // Create global view
+    let mut global = image::RgbImage::new(base_size, base_size);
+    for pixel in global.pixels_mut() {
+        *pixel = image::Rgb([128, 128, 128]);
+    }
+    let scale = (base_size as f32 / w as f32).min(base_size as f32 / h as f32);
+    let new_w = (w as f32 * scale) as u32;
+    let new_h = (h as f32 * scale) as u32;
+    let resized = image::imageops::resize(
+        img, new_w, new_h,
+        image::imageops::FilterType::Lanczos3,
+    );
+    let x_offset = (base_size - new_w) / 2;
+    let y_offset = (base_size - new_h) / 2;
+    image::imageops::overlay(&mut global, &resized, x_offset as i64, y_offset as i64);
+
+    let global_data: Vec<f32> = global.pixels()
+        .flat_map(|p| p.0.iter().map(|&v| v as f32 / 127.5 - 1.0))
+        .collect();
+    let global_arr = mlx_rs::Array::from_slice(
+        &global_data,
+        &[1, base_size as i32, base_size as i32, 3],
+    );
+
+    // Create crop patches
+    let crop_arr = if crop_ratio.0 > 1 || crop_ratio.1 > 1 {
+        let is = image_size;
+        let target_w = is * crop_ratio.0 as u32;
+        let target_h = is * crop_ratio.1 as u32;
+        let resized_full = image::imageops::resize(
+            img, target_w, target_h,
+            image::imageops::FilterType::Lanczos3,
+        );
+        let n_crops = crop_ratio.0 * crop_ratio.1;
+        let mut crop_data: Vec<f32> =
+            Vec::with_capacity((n_crops as usize) * (is * is * 3) as usize);
+        for cy in 0..crop_ratio.1 {
+            for cx in 0..crop_ratio.0 {
+                let x0 = cx as u32 * is;
+                let y0 = cy as u32 * is;
+                for y in y0..y0 + is {
+                    for x in x0..x0 + is {
+                        let pixel = resized_full.get_pixel(x, y);
+                        for &v in pixel.0.iter() {
+                            crop_data.push(v as f32 / 127.5 - 1.0);
+                        }
+                    }
+                }
+            }
+        }
+        Some(mlx_rs::Array::from_slice(
+            &crop_data,
+            &[n_crops, is as i32, is as i32, 3],
+        ))
+    } else {
+        None
+    };
+
+    // Tokenize
+    let (token_ids, seq_mask) = deepseek_ocr2_mlx::tokenize_prompt(
+        tokenizer,
+        &prompt,
+        true,
+        base_size as i32,
+        image_size as i32,
+        crop_ratio,
+    ).map_err(|e| format!("Tokenize error: {}", e))?;
+
+    let prompt_len = token_ids.len();
+
+    let input_ids = mlx_rs::Array::from_iter(
+        token_ids.iter().copied(),
+        &[1, token_ids.len() as i32],
+    );
+
+    // Encode image
+    let visual_features = model.encode_image(
+        crop_arr.as_ref(),
+        &global_arr,
+    ).map_err(|e| format!("Vision encode error: {}", e))?;
+
+    let seq_mask_bool = mlx_rs::Array::from_iter(
+        seq_mask.iter().map(|&b| b),
+        &[1, seq_mask.len() as i32],
+    );
+    let embeds = model.prepare_inputs(&input_ids, &seq_mask_bool, &visual_features)
+        .map_err(|e| format!("Prepare inputs error: {}", e))?;
+
+    // Generate
+    let mut cache = model.init_cache();
+    let eos_id = model.config.eos_token_id;
+
+    let mut gen = deepseek_ocr2_mlx::Generate {
+        model,
+        cache: &mut cache,
+        temp: temperature,
+        state: deepseek_ocr2_mlx::GenerateState::Prefill { embeds },
+        eos_token_id: eos_id,
+        repetition_penalty: 1.1,
+        repetition_context_size: 512,
+        generated_tokens: Vec::new(),
+    };
+
+    let mut tokens: Vec<u32> = Vec::new();
+    for token_result in gen.by_ref().take(max_tokens) {
+        match token_result {
+            Ok(token) => {
+                let token_id: i32 = token.item();
+                if token_id == eos_id {
+                    break;
+                }
+                tokens.push(token_id as u32);
+            }
+            Err(e) => return Err(format!("Generation error: {}", e)),
+        }
+    }
+
+    let text = tokenizer.decode(&tokens, true).unwrap_or_default();
+    Ok((text, prompt_len, tokens.len()))
+}
+
+#[cfg(feature = "ocr")]
 fn ocr_inference_worker(
     mut model: deepseek_ocr2_mlx::DeepseekOCR2,
     tokenizer: tokenizers::Tokenizer,
     mut rx: mpsc::Receiver<OcrRequest>,
 ) {
-    use mlx_rs::module::Module;
-
     while let Some(req) = rx.blocking_recv() {
         let result = (|| -> std::result::Result<(), String> {
-            // Decode image
-            let img = image::load_from_memory(&req.image_data)
-                .map_err(|e| format!("Failed to decode image: {}", e))?
-                .to_rgb8();
-            let (w, h) = (img.width(), img.height());
+            // Detect PDF vs image
+            let is_pdf = deepseek_ocr2_mlx::pdf::is_pdf(&req.image_data);
 
-            // Determine if prompt contains <image>
-            let has_image = req.prompt.contains("<image>");
-            let prompt = if has_image {
-                req.prompt.clone()
-            } else {
-                format!("<image>\n{}", req.prompt)
-            };
+            if is_pdf {
+                // PDF: render pages and process each
+                let pages = deepseek_ocr2_mlx::pdf::render_pdf_pages(&req.image_data, 200)
+                    .map_err(|e| format!("PDF render error: {}", e))?;
 
-            // Determine crop ratio
-            let crop_ratio = if w > req.image_size || h > req.image_size {
-                deepseek_ocr2_mlx::find_best_crop_ratio(w, h, 2, 6)
-            } else {
-                (1, 1)
-            };
-
-            // Create global view
-            let base = req.base_size;
-            let mut global = image::RgbImage::new(base, base);
-            for pixel in global.pixels_mut() {
-                *pixel = image::Rgb([128, 128, 128]);
-            }
-            let scale = (base as f32 / w as f32).min(base as f32 / h as f32);
-            let new_w = (w as f32 * scale) as u32;
-            let new_h = (h as f32 * scale) as u32;
-            let resized = image::imageops::resize(
-                &img, new_w, new_h,
-                image::imageops::FilterType::Lanczos3,
-            );
-            let x_offset = (base - new_w) / 2;
-            let y_offset = (base - new_h) / 2;
-            image::imageops::overlay(&mut global, &resized, x_offset as i64, y_offset as i64);
-
-            let global_data: Vec<f32> = global.pixels()
-                .flat_map(|p| p.0.iter().map(|&v| v as f32 / 127.5 - 1.0))
-                .collect();
-            let global_arr = mlx_rs::Array::from_slice(
-                &global_data,
-                &[1, base as i32, base as i32, 3],
-            );
-
-            // Create crop patches
-            let crop_arr = if crop_ratio.0 > 1 || crop_ratio.1 > 1 {
-                let is = req.image_size;
-                let target_w = is * crop_ratio.0 as u32;
-                let target_h = is * crop_ratio.1 as u32;
-                let resized_full = image::imageops::resize(
-                    &img, target_w, target_h,
-                    image::imageops::FilterType::Lanczos3,
+                eprintln!(
+                    "[{}] PDF: {} pages rendered at 200 DPI",
+                    timestamp(),
+                    pages.len()
                 );
-                let n_crops = crop_ratio.0 * crop_ratio.1;
-                let mut crop_data: Vec<f32> =
-                    Vec::with_capacity((n_crops as usize) * (is * is * 3) as usize);
-                for cy in 0..crop_ratio.1 {
-                    for cx in 0..crop_ratio.0 {
-                        let x0 = cx as u32 * is;
-                        let y0 = cy as u32 * is;
-                        for y in y0..y0 + is {
-                            for x in x0..x0 + is {
-                                let pixel = resized_full.get_pixel(x, y);
-                                for &v in pixel.0.iter() {
-                                    crop_data.push(v as f32 / 127.5 - 1.0);
-                                }
+
+                let max_tokens_per_page = req.max_tokens as usize / pages.len().max(1);
+
+                match req.response {
+                    OcrResponseChannel::Full(tx) => {
+                        let mut all_text = String::new();
+                        let mut total_prompt = 0;
+                        let mut total_completion = 0;
+
+                        for (i, page) in pages.iter().enumerate() {
+                            let img = image::RgbImage::from_raw(
+                                page.width, page.height, page.data.clone(),
+                            ).ok_or_else(|| "Failed to create image from PDF page".to_string())?;
+
+                            eprintln!("[{}] Processing PDF page {}/{}", timestamp(), i + 1, pages.len());
+                            let (text, prompt_tokens, completion_tokens) = ocr_process_single_image(
+                                &mut model, &tokenizer, &img,
+                                &req.prompt, req.temperature,
+                                max_tokens_per_page, req.base_size, req.image_size,
+                            )?;
+
+                            if !all_text.is_empty() {
+                                all_text.push_str("\n\n---\n\n");
                             }
+                            if pages.len() > 1 {
+                                all_text.push_str(&format!("## Page {}\n\n", i + 1));
+                            }
+                            all_text.push_str(&text);
+                            total_prompt += prompt_tokens;
+                            total_completion += completion_tokens;
                         }
-                    }
-                }
-                Some(mlx_rs::Array::from_slice(
-                    &crop_data,
-                    &[n_crops, is as i32, is as i32, 3],
-                ))
-            } else {
-                None
-            };
 
-            // Tokenize
-            let (token_ids, seq_mask) = deepseek_ocr2_mlx::tokenize_prompt(
-                &tokenizer,
-                &prompt,
-                true,
-                base as i32,
-                req.image_size as i32,
-                crop_ratio,
-            ).map_err(|e| format!("Tokenize error: {}", e))?;
-
-            let prompt_len = token_ids.len();
-
-            let input_ids = mlx_rs::Array::from_iter(
-                token_ids.iter().copied(),
-                &[1, token_ids.len() as i32],
-            );
-
-            // Encode image
-            let visual_features = model.encode_image(
-                crop_arr.as_ref(),
-                &global_arr,
-            ).map_err(|e| format!("Vision encode error: {}", e))?;
-
-            let seq_mask_bool = mlx_rs::Array::from_iter(
-                seq_mask.iter().map(|&b| b),
-                &[1, seq_mask.len() as i32],
-            );
-            let embeds = model.prepare_inputs(&input_ids, &seq_mask_bool, &visual_features)
-                .map_err(|e| format!("Prepare inputs error: {}", e))?;
-
-            // Generate
-            let mut cache = model.init_cache();
-            let eos_id = model.config.eos_token_id;
-
-            let mut gen = deepseek_ocr2_mlx::Generate {
-                model: &mut model,
-                cache: &mut cache,
-                temp: req.temperature,
-                state: deepseek_ocr2_mlx::GenerateState::Prefill { embeds },
-                eos_token_id: eos_id,
-                repetition_penalty: 1.1,
-                repetition_context_size: 512,
-                generated_tokens: Vec::new(),
-            };
-
-            match req.response {
-                OcrResponseChannel::Full(tx) => {
-                    let mut tokens: Vec<u32> = Vec::new();
-                    let mut tx = Some(tx);
-                    for token_result in gen.by_ref().take(req.max_tokens as usize) {
-                        match token_result {
-                            Ok(token) => {
-                                let token_id: i32 = token.item();
-                                if token_id == eos_id {
-                                    break;
-                                }
-                                tokens.push(token_id as u32);
-                            }
-                            Err(e) => {
-                                if let Some(tx) = tx.take() {
-                                    let _ = tx.send(Err(format!("Generation error: {}", e)));
-                                }
-                                break;
-                            }
-                        }
-                    }
-                    if let Some(tx) = tx {
-                        let text = tokenizer.decode(&tokens, true).unwrap_or_default();
                         let _ = tx.send(Ok(OcrResult {
-                            text,
-                            prompt_tokens: prompt_len,
-                            completion_tokens: tokens.len(),
+                            text: all_text,
+                            prompt_tokens: total_prompt,
+                            completion_tokens: total_completion,
                         }));
                     }
-                }
-                OcrResponseChannel::Stream(tx) => {
-                    let mut all_tokens: Vec<u32> = Vec::new();
-                    let mut prev_text_len = 0;
-                    for token_result in gen.by_ref().take(req.max_tokens as usize) {
-                        match token_result {
-                            Ok(token) => {
-                                let token_id: i32 = token.item();
-                                if token_id == eos_id {
+                    OcrResponseChannel::Stream(tx) => {
+                        let mut total_prompt = 0;
+                        let mut total_completion = 0;
+
+                        for (i, page) in pages.iter().enumerate() {
+                            let img = image::RgbImage::from_raw(
+                                page.width, page.height, page.data.clone(),
+                            ).ok_or_else(|| "Failed to create image from PDF page".to_string())?;
+
+                            // Send page header
+                            if pages.len() > 1 {
+                                let header = if i > 0 {
+                                    format!("\n\n---\n\n## Page {}\n\n", i + 1)
+                                } else {
+                                    format!("## Page {}\n\n", i + 1)
+                                };
+                                if tx.blocking_send(LlmStreamEvent::Token(header)).is_err() {
                                     break;
                                 }
-                                all_tokens.push(token_id as u32);
-                                let text = tokenizer.decode(&all_tokens, true).unwrap_or_default();
-                                let new_text = text[prev_text_len..].to_string();
-                                if !new_text.is_empty() {
-                                    prev_text_len = text.len();
-                                    if tx.blocking_send(LlmStreamEvent::Token(new_text)).is_err() {
-                                        break;
-                                    }
-                                }
                             }
-                            Err(e) => {
-                                eprintln!("[{}] OCR generation error: {}", timestamp(), e);
+
+                            let (text, prompt_tokens, completion_tokens) = ocr_process_single_image(
+                                &mut model, &tokenizer, &img,
+                                &req.prompt, req.temperature,
+                                max_tokens_per_page, req.base_size, req.image_size,
+                            )?;
+
+                            if tx.blocking_send(LlmStreamEvent::Token(text)).is_err() {
                                 break;
                             }
+                            total_prompt += prompt_tokens;
+                            total_completion += completion_tokens;
                         }
+
+                        let _ = tx.blocking_send(LlmStreamEvent::Done {
+                            prompt_tokens: total_prompt,
+                            completion_tokens: total_completion,
+                        });
                     }
-                    let _ = tx.blocking_send(LlmStreamEvent::Done {
-                        prompt_tokens: prompt_len,
-                        completion_tokens: all_tokens.len(),
-                    });
+                }
+            } else {
+                // Single image
+                let img = image::load_from_memory(&req.image_data)
+                    .map_err(|e| format!("Failed to decode image: {}", e))?
+                    .to_rgb8();
+
+                match req.response {
+                    OcrResponseChannel::Full(tx) => {
+                        let (text, prompt_tokens, completion_tokens) = ocr_process_single_image(
+                            &mut model, &tokenizer, &img,
+                            &req.prompt, req.temperature,
+                            req.max_tokens as usize, req.base_size, req.image_size,
+                        )?;
+                        let _ = tx.send(Ok(OcrResult {
+                            text,
+                            prompt_tokens,
+                            completion_tokens,
+                        }));
+                    }
+                    OcrResponseChannel::Stream(tx) => {
+                        // For streaming single image, use token-by-token generation
+                        let (text, prompt_tokens, completion_tokens) = ocr_process_single_image(
+                            &mut model, &tokenizer, &img,
+                            &req.prompt, req.temperature,
+                            req.max_tokens as usize, req.base_size, req.image_size,
+                        )?;
+                        let _ = tx.blocking_send(LlmStreamEvent::Token(text));
+                        let _ = tx.blocking_send(LlmStreamEvent::Done {
+                            prompt_tokens,
+                            completion_tokens,
+                        });
+                    }
                 }
             }
             Ok(())
@@ -952,7 +1037,10 @@ fn tts_process_request(
     let start = Instant::now();
     let sr = &req.speech_req;
 
-    let speaker = sr.voice.as_deref().unwrap_or(&req.default_speaker);
+    let speaker = match sr.voice.as_deref() {
+        Some("default") | None => &req.default_speaker,
+        Some(v) => v,
+    };
     let language = sr.language.as_deref().unwrap_or(&req.default_language);
 
     let opts = qwen3_tts_mlx::SynthesizeOptions {
@@ -1649,7 +1737,10 @@ async fn handle_speech(
             }
         }
 
-        let voice = speech_req.voice.as_deref().unwrap_or(&state.default_tts_speaker);
+        let voice = match speech_req.voice.as_deref() {
+            Some("default") | None => &state.default_tts_speaker,
+            Some(v) => v,
+        };
         let lang = speech_req.language.as_deref().unwrap_or(&state.default_tts_language);
         eprintln!(
             "[{}] TTS request: voice={}, language={}, text=\"{}\"",

@@ -502,16 +502,16 @@ impl KleinDoubleBlock {
         let img_mlp_in = modulate(&img_normed2, img_shift2, img_scale2)?;
         let txt_mlp_in = modulate(&txt_normed2, txt_shift2, txt_scale2)?;
 
-        // SwiGLU MLP for image: silu(gate) * up
+        // SwiGLU MLP for image: fused silu(gate) * up
         let img_proj = self.img_mlp_in.forward(&img_mlp_in)?;
         let img_splits = img_proj.split_axis(&[self.mlp_hidden], -1)?;
-        let img_swiglu_out = ops::multiply(&mlx_rs::nn::silu(&img_splits[0])?, &img_splits[1])?;
+        let img_swiglu_out = mlx_rs_core::fused_swiglu(&img_splits[1], &img_splits[0])?;
         let img_mlp_out = self.img_mlp_out.forward(&img_swiglu_out)?;
 
-        // SwiGLU MLP for text: silu(gate) * up
+        // SwiGLU MLP for text: fused silu(gate) * up
         let txt_proj = self.txt_mlp_in.forward(&txt_mlp_in)?;
         let txt_splits = txt_proj.split_axis(&[self.mlp_hidden], -1)?;
-        let txt_swiglu_out = ops::multiply(&mlx_rs::nn::silu(&txt_splits[0])?, &txt_splits[1])?;
+        let txt_swiglu_out = mlx_rs_core::fused_swiglu(&txt_splits[1], &txt_splits[0])?;
         let txt_mlp_out = self.txt_mlp_out.forward(&txt_swiglu_out)?;
 
         // Apply gate and residual
@@ -662,8 +662,8 @@ impl KleinSingleBlock {
         let attn_out = attn_out.transpose_axes(&[0, 2, 1, 3])?;
         let attn_out = attn_out.reshape(&[batch, seq_len, -1])?;
 
-        // SwiGLU MLP: silu(gate) * up (matching flux.c)
-        let mlp_out = ops::multiply(&mlx_rs::nn::silu(mlp_gate)?, mlp_up)?;
+        // SwiGLU MLP: fused silu(gate) * up
+        let mlp_out = mlx_rs_core::fused_swiglu(mlp_up, mlp_gate)?;
 
         // Concatenate attention and MLP output
         let combined = ops::concatenate_axis(&[attn_out, mlp_out], -1)?;

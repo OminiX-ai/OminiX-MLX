@@ -21,6 +21,8 @@
 //! ```
 
 pub mod error;
+#[cfg(feature = "pdf")]
+pub mod pdf;
 pub mod qwen2_encoder;
 pub mod vision;
 

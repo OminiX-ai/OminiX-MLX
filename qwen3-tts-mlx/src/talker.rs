@@ -333,6 +333,7 @@ impl CodePredictor {
         // Concatenate to form 2-token prefill: [past_hidden, code0_embed]
         let prefill_input =
             mlx_rs::ops::concatenate_axis(&[&proj_hidden, &proj_code0], 1)?;
+        eval(std::iter::once(&prefill_input))?;
 
         // Initialize KV caches for code predictor (fresh per time step)
         let mut caches: Vec<KVCache> = (0..self.layers.len())
@@ -344,13 +345,15 @@ impl CodePredictor {
         for (layer, cache) in self.layers.iter_mut().zip(caches.iter_mut()) {
             current_output = layer.forward(&current_output, None, cache)?;
         }
+        eval(std::iter::once(&current_output))?;
 
         // Sample codebook 1 from last position (code0 position) logits
         let normed = self.norm.forward(&current_output)?;
         use mlx_rs::ops::indexing::IndexOp;
         let last_normed = normed.index((.., -1.., ..)); // [B, 1, 1024]
         let logits = self.lm_heads[0].forward(&last_normed)?;
-        // Greedy decoding (argmax) — sample_logits evals internally
+        eval([&logits])?;
+        // Greedy decoding (argmax)
         let token = sample_logits(&logits, 0.0, 0, 1.0, 1.0, &[], None)?;
         codes.push(token);
 
@@ -367,10 +370,12 @@ impl CodePredictor {
             for (layer, cache) in self.layers.iter_mut().zip(caches.iter_mut()) {
                 current_input = layer.forward(&current_input, None, cache)?;
             }
+            eval(std::iter::once(&current_input))?;
 
             let normed = self.norm.forward(&current_input)?;
             let logits = self.lm_heads[g].forward(&normed)?;
-            // Greedy decoding (argmax) — sample_logits evals internally
+            eval([&logits])?;
+            // Greedy decoding (argmax)
             let token = sample_logits(&logits, 0.0, 0, 1.0, 1.0, &[], None)?;
             codes.push(token);
         }

@@ -13,6 +13,10 @@ pub trait KeyValueCache {
 
     /// Update cache with new keys/values and return full cache contents
     fn update_and_fetch(&mut self, keys: Array, values: Array) -> Result<(Array, Array), Exception>;
+
+    /// Reset the cache offset to 0 without deallocating buffers.
+    /// Default implementation does nothing (for caches that don't support reset).
+    fn reset(&mut self) {}
 }
 
 impl<T> KeyValueCache for &'_ mut T
@@ -29,6 +33,10 @@ where
 
     fn update_and_fetch(&mut self, keys: Array, values: Array) -> Result<(Array, Array), Exception> {
         T::update_and_fetch(self, keys, values)
+    }
+
+    fn reset(&mut self) {
+        T::reset(self)
     }
 }
 
@@ -107,6 +115,7 @@ impl KVCache {
             step,
         }
     }
+
 }
 
 impl KeyValueCache for KVCache {
@@ -116,6 +125,10 @@ impl KeyValueCache for KVCache {
 
     fn max_size(&self) -> Option<i32> {
         None
+    }
+
+    fn reset(&mut self) {
+        self.offset = 0;
     }
 
     fn update_and_fetch(&mut self, keys: Array, values: Array) -> Result<(Array, Array), Exception> {

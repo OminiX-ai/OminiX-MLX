@@ -44,7 +44,7 @@ tokio-stream = "0.1"
 qwen3-asr-mlx = { path = "../qwen3-asr-mlx", optional = true }
 qwen3-tts-mlx = { path = "../qwen3-tts-mlx", optional = true }
 qwen3-5-35b-mlx = { path = "../qwen3.5-35B-mlx", optional = true }
-deepseek-ocr2-mlx = { path = "../deepseek-ocr2-mlx", optional = true }
+deepseek-ocr2-mlx = { path = "../deepseek-ocr2-mlx", features = ["pdf"], optional = true }
 tokenizers = { version = "0.21", optional = true }
 mlx-rs = { path = "../mlx-rs", features = ["metal", "accelerate"], optional = true }
 image = { version = "0.25", optional = true }
