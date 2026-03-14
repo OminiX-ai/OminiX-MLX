@@ -6,6 +6,7 @@
 use crate::{Error, Result};
 use ort::session::Session;
 use std::collections::HashMap;
+use ort::session::builder::SessionBuilder;
 use std::path::Path;
 
 /// Punctuation classes output by CT-Transformer (6 classes)
@@ -39,8 +40,8 @@ impl PunctuationModel {
         }
 
         let session = Session::builder()
-            .and_then(|b| b.with_intra_threads(2))
-            .and_then(|b| b.commit_from_file(&model_path))
+            .and_then(|b| Ok(b.with_intra_threads(2)?))
+            .and_then(|b: SessionBuilder| b.commit_from_file(&model_path))
             .map_err(|e| Error::Model(format!("Failed to load ONNX punctuation model: {}", e)))?;
 
         // Load vocabulary
