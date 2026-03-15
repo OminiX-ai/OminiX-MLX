@@ -725,18 +725,16 @@ impl Synthesizer {
             return Ok((vec![], timing));
         }
 
-        // Text-ratio proportional trim: the model generates codec for the full text
-        // (ref_text + target_text). The first ref_ratio fraction corresponds to ref_text
-        // and must be trimmed. This matches the Python reference implementation.
-        let ref_ratio = ref_text_len as f64 / (ref_text_len + text_token_ids.len() + 1) as f64;
-        let trim_frames = (ref_ratio * gen_codes.len() as f64) as usize;
-        let target_codes = &gen_codes[trim_frames..];
+        // Trimming generated frames again using a text-token ratio heuristic is too
+        // aggressive for some samples and can remove valid target speech from the
+        // beginning of the utterance. Keep the full generated codec sequence here.
+        let trim_frames = 0usize;
+        let target_codes = &gen_codes[..];
 
         info!(
-            "ICL: {} ref frames, {} gen frames, ref_ratio={:.3}, trim={} frames, {} target frames",
+            "ICL: {} ref frames, {} gen frames, trim={} frames, {} target frames",
             ref_code_frames.len(),
             gen_codes.len(),
-            ref_ratio,
             trim_frames,
             target_codes.len(),
         );
