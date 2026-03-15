@@ -1,0 +1,14 @@
+[package]
+name = "zimage"
+version = "0.1.0"
+category = "image"
+description = "Z-Image Turbo 6B S3-DiT image generation"
+
+[capabilities]
+text_to_image = true
+quantization = true
+
+[models.default]
+repo = "uqer1244/MLX-z-image"
+size_gb = 12.0
+required = true

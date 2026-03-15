@@ -1,0 +1,15 @@
+[package]
+name = "deepseek-ocr2"
+version = "0.1.0"
+category = "ocr"
+description = "DeepSeek OCR-2 with document and PDF understanding"
+
+[capabilities]
+pdf = true
+document = true
+grounding = true
+
+[models.default]
+repo = "deepseek-ai/DeepSeek-OCR-2"
+size_gb = 10.0
+required = true

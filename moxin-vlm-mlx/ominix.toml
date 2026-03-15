@@ -1,0 +1,14 @@
+[package]
+name = "moxin-vlm"
+version = "0.1.0"
+category = "vlm"
+description = "Moxin 7B vision-language model with dual vision encoders"
+
+[capabilities]
+image_understanding = true
+quantization = true
+
+[models.default]
+repo = "moxin-org/moxin-llm-7b"
+size_gb = 7.0
+required = true

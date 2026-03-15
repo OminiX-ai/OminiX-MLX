@@ -1,0 +1,20 @@
+[package]
+name = "qwen3-asr"
+version = "0.1.0"
+category = "asr"
+description = "Qwen3 ASR with 30+ language support"
+
+[capabilities]
+streaming = false
+multilingual = true
+languages = ["english", "chinese", "japanese", "korean", "french", "german", "spanish"]
+
+[models.default]
+repo = "mlx-community/Qwen3-ASR-1.7B-8bit"
+size_gb = 2.5
+required = true
+
+[models.small]
+repo = "mlx-community/Qwen3-ASR-0.6B-8bit"
+size_gb = 1.0
+required = false

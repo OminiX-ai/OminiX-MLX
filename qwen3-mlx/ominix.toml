@@ -1,0 +1,15 @@
+[package]
+name = "qwen3-llm"
+version = "0.1.0"
+category = "llm"
+description = "Qwen3 language model for chat and generation"
+
+[capabilities]
+streaming = true
+tool_use = true
+thinking = true
+
+[models.8b]
+repo = "mlx-community/Qwen3-8B-8bit"
+size_gb = 8.0
+required = true

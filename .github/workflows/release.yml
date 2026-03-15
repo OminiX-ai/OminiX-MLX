@@ -1,0 +1,33 @@
+name: Release OminiX-MLX
+
+on:
+  push:
+    tags:
+      - "v[0-9]*"
+
+jobs:
+  release:
+    runs-on: blaze/macos-15
+    steps:
+      - uses: actions/checkout@v5
+        with:
+          submodules: true
+          fetch-depth: 0
+      - run: sudo xcodes select 16.4
+      - uses: actions-rust-lang/setup-rust-toolchain@v1
+      - uses: Swatinem/rust-cache@v2
+        with:
+          key: release
+
+      - name: Run tests
+        run: cargo test --workspace -- --test-threads=1
+
+      - name: Generate release notes
+        run: |
+          brew install git-cliff || true
+          git cliff --latest --strip header -o RELEASE_NOTES.md
+
+      - name: Create GitHub release
+        uses: softprops/action-gh-release@v2
+        with:
+          body_path: RELEASE_NOTES.md

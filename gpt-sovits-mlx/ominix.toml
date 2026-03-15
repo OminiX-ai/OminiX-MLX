@@ -1,0 +1,14 @@
+[package]
+name = "gpt-sovits"
+version = "0.1.0"
+category = "tts"
+description = "GPT-SoVITS voice cloning with Chinese-English support"
+
+[capabilities]
+voice_cloning = true
+languages = ["chinese", "english"]
+
+[models.default]
+repo = "primespeech/gpt-sovits-mlx"
+size_gb = 2.0
+required = true

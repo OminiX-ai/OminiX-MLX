@@ -1,0 +1,21 @@
+[package]
+name = "qwen3-tts"
+version = "1.0.0"
+category = "tts"
+description = "Qwen3 TTS with preset voices and voice cloning"
+
+[capabilities]
+streaming = true
+voice_cloning = true
+preset_voices = ["vivian", "emily", "serena", "chloe", "ethan", "mason", "isaac", "leo", "aria"]
+languages = ["english", "chinese", "japanese", "korean"]
+
+[models.custom-voice]
+repo = "mlx-community/Qwen3-TTS-12Hz-1.7B-CustomVoice-8bit"
+size_gb = 1.8
+required = true
+
+[models.base]
+repo = "mlx-community/Qwen3-TTS-12Hz-1.7B-Base-8bit"
+size_gb = 1.8
+required = false  # only needed for voice cloning

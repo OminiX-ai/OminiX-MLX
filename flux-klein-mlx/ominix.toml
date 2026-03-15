@@ -1,0 +1,19 @@
+[package]
+name = "flux-klein"
+version = "0.1.0"
+category = "image"
+description = "FLUX.2-klein 4B image generation with 4-step inference"
+
+[capabilities]
+quantization = true
+text_to_image = true
+
+[models.default]
+repo = "black-forest-labs/FLUX.2-klein-4B"
+size_gb = 13.0
+required = true
+
+[models.quantized]
+repo = "moxin-org/FLUX.2-klein-4B-8bit-mlx"
+size_gb = 12.0
+required = false
