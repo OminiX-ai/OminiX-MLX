@@ -640,13 +640,17 @@ pub fn generate_voice_clone_icl(
 
     // Phase 2: ICL extension — sum reference codec embeddings and build ICL prompt
     let ref_codec_embed = talker.sum_ref_codec_embeddings(ref_codes)?; // [1, T_ref, hidden]
-    // Default: streaming mode (non_streaming_mode=false) matching Python reference
+    // Non-streaming mode: text block then codec block (sequential).
+    // NOTE: Streaming mode (non_streaming_mode=false) matches Python reference (text+codec overlaid)
+    // but produces distorted/non-voice audio on Apple Silicon. Non-streaming produces coherent
+    // audio but with premature EOS. ICL voice cloning is fundamentally unreliable on Apple Silicon;
+    // use x_vector_only mode instead for reliable voice cloning.
     let (icl_embed, trailing_text_embed, trailing_len) = talker.build_icl_prompt(
         ref_text_ids,
         text_token_ids,
         &ref_codec_embed,
         tts_config,
-        true, // non-streaming: text block then codec block (better separation on Apple Silicon)
+        true,
     )?;
 
     // Feed ICL prompt through transformer (extends KV cache)

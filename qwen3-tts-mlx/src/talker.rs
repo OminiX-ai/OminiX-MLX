@@ -582,10 +582,10 @@ impl Talker {
     }
 
     /// Build batched prefill embedding for VoiceDesign mode.
-    /// Layout: [instruct_embed (N)] + [role_prefix (3)] + [codec_overlay (5)] + [first_text+bos (1)]
+    /// Layout: [instruct_embed (N)] + [role_prefix (3)] + [codec_overlay (P+1)] + [first_text+bos (1)]
     /// instruct_tokens: tokenized instruct text (ChatML-wrapped)
     /// text_tokens: the text to synthesize (first token used in last position)
-    /// codec_prefix: [think, think_bos, lang, think_eos] (4 tokens, no speaker)
+    /// codec_prefix: codec prefix tokens (4 for voice design, 5 for speaker+instruct)
     pub fn build_voice_design_prefill_embedding(
         &mut self,
         instruct_tokens: &[u32],
@@ -616,14 +616,14 @@ impl Talker {
         //    text: [tts_pad×4, tts_bos] projected
         //    codec: [think, think_bos, lang, think_eos, pad] embedded
         //    combined via addition
-        let mut text_overlay_ids = vec![tts_config.tts_pad_token_id; 4];
+        let mut text_overlay_ids = vec![tts_config.tts_pad_token_id; codec_prefix.len()];
         text_overlay_ids.push(tts_config.tts_bos_token_id);
         let text_overlay = self.build_projected_text_embeddings(&text_overlay_ids)?;
 
-        let mut codec_ids: Vec<u32> = codec_prefix.to_vec(); // [think, think_bos, lang, think_eos]
-        codec_ids.push(pad_id); // codec_pad at position 4
+        let mut codec_ids: Vec<u32> = codec_prefix.to_vec();
+        codec_ids.push(pad_id); // codec_pad at final position
         let codec_ids_i32: Vec<i32> = codec_ids.iter().map(|&c| c as i32).collect();
-        let codec_arr = Array::from_slice(&codec_ids_i32, &[1, 5]);
+        let codec_arr = Array::from_slice(&codec_ids_i32, &[1, codec_ids.len() as i32]);
         let codec_embed = self.codec_embedding.forward(&codec_arr)?;
         let codec_overlay = text_overlay.add(codec_embed)?;
 
@@ -638,7 +638,7 @@ impl Talker {
         let bos_embed = self.codec_embedding.forward(&bos_arr)?;
         let first_combined = first_text_embed.add(bos_embed)?;
 
-        // Concatenate all parts along sequence axis: [1, N+3+5+1, hidden]
+        // Concatenate all parts along sequence axis: [1, N+3+(P+1)+1, hidden]
         let all = mlx_rs::ops::concatenate_axis(
             &[&instruct_embed, &role_embed, &codec_overlay, &first_combined],
             1,

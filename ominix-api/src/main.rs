@@ -946,9 +946,15 @@ struct SpeechRequest {
     /// Transcript of reference audio (for ICL mode)
     #[serde(default)]
     reference_text: Option<String>,
-    /// Voice design instruction
+    /// Style prompt / voice design instruction (accepts both "prompt" and "instruct")
+    #[serde(default, alias = "instruct")]
+    prompt: Option<String>,
+    /// Speed factor: > 1.0 = faster, < 1.0 = slower
     #[serde(default)]
-    instruct: Option<String>,
+    speed: Option<f32>,
+    /// Repetition penalty (e.g. 1.05)
+    #[serde(default)]
+    repetition_penalty: Option<f32>,
 }
 
 #[cfg(feature = "tts")]
@@ -1051,14 +1057,11 @@ fn tts_process_request(
         top_p: sr.top_p,
         max_new_tokens: None,
         seed: sr.seed,
-        speed_factor: None,
+        speed_factor: sr.speed,
+        repetition_penalty: sr.repetition_penalty,
     };
 
-    let result = if let Some(ref instruct) = sr.instruct {
-        // Voice design mode
-        synth
-            .synthesize_voice_design_with_timing(&sr.input, instruct, language, &opts)
-    } else if let Some(ref ref_audio_b64) = sr.reference_audio {
+    let result = if let Some(ref ref_audio_b64) = sr.reference_audio {
         // Voice cloning mode
         use base64::Engine;
         let decoded = base64::prelude::BASE64_STANDARD
@@ -1103,6 +1106,14 @@ fn tts_process_request(
             synth.synthesize_voice_clone_with_timing(
                 &sr.input, &ref_samples, language, &opts,
             )
+        }
+    } else if let Some(ref instruct) = sr.prompt {
+        if sr.voice.is_some() && sr.voice.as_deref() != Some("default") {
+            // Combined speaker + instruct mode
+            synth.synthesize_with_speaker_instruct_with_timing(&sr.input, instruct, &opts)
+        } else {
+            // Voice design mode (no specific speaker)
+            synth.synthesize_voice_design_with_timing(&sr.input, instruct, language, &opts)
         }
     } else {
         // Standard preset speaker mode

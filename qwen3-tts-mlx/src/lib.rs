@@ -59,6 +59,8 @@ pub struct SynthesizeOptions<'a> {
     pub seed: Option<u64>,
     /// Speed factor: > 1.0 = faster, < 1.0 = slower. Default 1.0.
     pub speed_factor: Option<f32>,
+    /// Repetition penalty (e.g. 1.05). Overrides generation_config default if set.
+    pub repetition_penalty: Option<f32>,
 }
 
 impl Default for SynthesizeOptions<'_> {
@@ -72,6 +74,7 @@ impl Default for SynthesizeOptions<'_> {
             max_new_tokens: None,
             seed: None,
             speed_factor: None,
+            repetition_penalty: None,
         }
     }
 }
@@ -242,6 +245,9 @@ impl Synthesizer {
         if let Some(n) = opts.max_new_tokens {
             gen_config.max_new_tokens = n;
         }
+        if let Some(rp) = opts.repetition_penalty {
+            gen_config.repetition_penalty = rp;
+        }
 
         // Speed control: EOS steering for slow-down, WSOLA for speed-up
         let requested_speed = opts.speed_factor.unwrap_or(1.0);
@@ -365,6 +371,9 @@ impl Synthesizer {
         if let Some(n) = opts.max_new_tokens {
             gen_config.max_new_tokens = n;
         }
+        if let Some(rp) = opts.repetition_penalty {
+            gen_config.repetition_penalty = rp;
+        }
 
         // Speed control: EOS steering for slow-down, WSOLA for speed-up
         let requested_speed = opts.speed_factor.unwrap_or(1.0);
@@ -462,6 +471,140 @@ impl Synthesizer {
         Ok((samples, timing))
     }
 
+    /// Synthesize speech using a preset speaker combined with a style instruction.
+    /// Uses the speaker's codec prefix (with speaker token) + voice design generation.
+    /// `instruct` describes the desired speaking style (e.g., "Speak with excitement").
+    pub fn synthesize_with_speaker_instruct(
+        &mut self,
+        text: &str,
+        instruct: &str,
+        opts: &SynthesizeOptions,
+    ) -> Result<Vec<f32>> {
+        let (samples, _timing) = self.synthesize_with_speaker_instruct_with_timing(text, instruct, opts)?;
+        Ok(samples)
+    }
+
+    /// Synthesize speech using a preset speaker combined with a style instruction, with timing.
+    pub fn synthesize_with_speaker_instruct_with_timing(
+        &mut self,
+        text: &str,
+        instruct: &str,
+        opts: &SynthesizeOptions,
+    ) -> Result<(Vec<f32>, SynthesisTiming)> {
+        let total_start = Instant::now();
+
+        let mut gen_config = self.gen_config.clone();
+        if let Some(temp) = opts.temperature {
+            gen_config.temperature = temp;
+        }
+        if let Some(k) = opts.top_k {
+            gen_config.top_k = k;
+        }
+        if let Some(p) = opts.top_p {
+            gen_config.top_p = p;
+        }
+        if let Some(n) = opts.max_new_tokens {
+            gen_config.max_new_tokens = n;
+        }
+        if let Some(rp) = opts.repetition_penalty {
+            gen_config.repetition_penalty = rp;
+        }
+
+        let requested_speed = opts.speed_factor.unwrap_or(1.0);
+        if requested_speed < 1.0 {
+            gen_config.speed_factor = requested_speed;
+        } else {
+            gen_config.speed_factor = 1.0;
+        }
+
+        // Tokenize text
+        let encoding = self
+            .tokenizer
+            .encode(text, false)
+            .map_err(|e| Error::Model(format!("Tokenizer error: {e}")))?;
+        let text_token_ids: Vec<u32> = encoding.get_ids().to_vec();
+
+        // Tokenize instruct text with ChatML wrapping
+        let chatml_instruct = format!("<|im_start|>user\n{}<|im_end|>\n", instruct);
+        let instruct_encoding = self
+            .tokenizer
+            .encode(chatml_instruct.as_str(), false)
+            .map_err(|e| Error::Model(format!("Tokenizer error (instruct): {e}")))?;
+        let instruct_token_ids: Vec<u32> = instruct_encoding.get_ids().to_vec();
+
+        info!(
+            "Speaker+Instruct: {} text tokens, {} instruct tokens, speaker={}",
+            text_token_ids.len(),
+            instruct_token_ids.len(),
+            opts.speaker,
+        );
+
+        // Build codec prefix WITH speaker (5 tokens: think, think_bos, lang, think_eos, spk)
+        let codec_prefix =
+            build_codec_prefix(&self.tts_config.talker_config, opts.language, opts.speaker)?;
+
+        // Reuse voice design generation — it accepts any codec_prefix length
+        let (codes, gen_timing) = generate_voice_design(
+            &mut self.talker,
+            &text_token_ids,
+            &instruct_token_ids,
+            &codec_prefix,
+            &gen_config,
+            &self.tts_config,
+            opts.seed,
+        )?;
+
+        if codes.is_empty() {
+            let timing = SynthesisTiming {
+                prefill_ms: gen_timing.prefill_ms,
+                generation_ms: gen_timing.generation_ms,
+                generation_frames: 0,
+                decode_ms: 0.0,
+                total_ms: total_start.elapsed().as_secs_f64() * 1000.0,
+            };
+            return Ok((vec![], timing));
+        }
+
+        info!("Decoding {} codec frames to audio...", codes.len());
+
+        let decode_start = Instant::now();
+        let mut samples = self.decoder.decode(&codes)?;
+        mlx_rs::transforms::eval(std::iter::empty::<&mlx_rs::Array>())?;
+        let decode_ms = decode_start.elapsed().as_secs_f64() * 1000.0;
+
+        if requested_speed > 1.01 {
+            let original_len = samples.len();
+            samples = time_stretch_wsola(&samples, requested_speed, self.sample_rate);
+            info!(
+                "WSOLA {:.2}x: {} → {} samples ({:.2}s → {:.2}s)",
+                requested_speed,
+                original_len,
+                samples.len(),
+                original_len as f32 / self.sample_rate as f32,
+                samples.len() as f32 / self.sample_rate as f32,
+            );
+        }
+
+        let total_ms = total_start.elapsed().as_secs_f64() * 1000.0;
+
+        info!(
+            "Generated {:.2}s of audio ({} samples at {}Hz)",
+            samples.len() as f32 / self.sample_rate as f32,
+            samples.len(),
+            self.sample_rate
+        );
+
+        let timing = SynthesisTiming {
+            prefill_ms: gen_timing.prefill_ms,
+            generation_ms: gen_timing.generation_ms,
+            generation_frames: gen_timing.generation_frames,
+            decode_ms,
+            total_ms,
+        };
+
+        Ok((samples, timing))
+    }
+
     /// Synthesize speech using voice cloning (x_vector_only mode).
     /// Requires a Base model with speaker encoder.
     /// `reference_audio` is the reference audio samples (f32 at 24kHz).
@@ -504,6 +647,9 @@ impl Synthesizer {
         }
         if let Some(n) = opts.max_new_tokens {
             gen_config.max_new_tokens = n;
+        }
+        if let Some(rp) = opts.repetition_penalty {
+            gen_config.repetition_penalty = rp;
         }
 
         // Speed control strategy:
@@ -670,6 +816,9 @@ impl Synthesizer {
         if let Some(n) = opts.max_new_tokens {
             gen_config.max_new_tokens = n;
         }
+        if let Some(rp) = opts.repetition_penalty {
+            gen_config.repetition_penalty = rp;
+        }
         if let Some(s) = opts.speed_factor {
             gen_config.speed_factor = s;
         }
@@ -832,6 +981,9 @@ impl Synthesizer {
         }
         if let Some(n) = opts.max_new_tokens {
             gen_config.max_new_tokens = n;
+        }
+        if let Some(rp) = opts.repetition_penalty {
+            gen_config.repetition_penalty = rp;
         }
         if let Some(s) = opts.speed_factor {
             gen_config.speed_factor = s;

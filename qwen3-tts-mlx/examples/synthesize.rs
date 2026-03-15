@@ -17,9 +17,11 @@ struct Args {
     #[arg(short, long, default_value = "output.wav")]
     output: String,
 
-    /// Speaker name (e.g. vivian, serena, ryan, aiden, uncle_fu)
-    #[arg(short, long, default_value = "vivian")]
-    speaker: String,
+    /// Speaker name (e.g. vivian, serena, ryan, aiden, uncle_fu).
+    /// When combined with --instruct, uses speaker+instruct mode.
+    /// Without --instruct, defaults to "vivian" if not specified.
+    #[arg(short, long)]
+    speaker: Option<String>,
 
     /// Language (e.g. english, chinese, japanese, korean, french)
     #[arg(short, long, default_value = "english")]
@@ -72,6 +74,10 @@ struct Args {
     /// Speed factor for speech (0.5-2.0). <1.0 = slower, >1.0 = faster.
     #[arg(long)]
     speed: Option<f32>,
+
+    /// Repetition penalty (e.g. 1.05)
+    #[arg(long)]
+    repetition_penalty: Option<f32>,
 }
 
 fn main() -> std::result::Result<(), Box<dyn std::error::Error>> {
@@ -97,8 +103,11 @@ fn main() -> std::result::Result<(), Box<dyn std::error::Error>> {
         eprintln!("Using seed: {}", seed);
     }
 
+    let default_speaker = "vivian".to_string();
+    let speaker = args.speaker.as_deref().unwrap_or(&default_speaker);
+
     let opts = SynthesizeOptions {
-        speaker: &args.speaker,
+        speaker,
         language: &args.language,
         temperature: args.temperature,
         top_k: args.top_k,
@@ -106,6 +115,7 @@ fn main() -> std::result::Result<(), Box<dyn std::error::Error>> {
         max_new_tokens: args.max_tokens,
         seed: args.seed,
         speed_factor: args.speed,
+        repetition_penalty: args.repetition_penalty,
     };
 
     if let Some(ref ref_audio_path) = args.reference_audio {
@@ -168,14 +178,25 @@ fn main() -> std::result::Result<(), Box<dyn std::error::Error>> {
         save_wav(&samples, synth.sample_rate, &args.output)?;
         eprintln!("Saved to {}", args.output);
     } else if let Some(ref instruct) = args.instruct {
-        // VoiceDesign mode
-        eprintln!("VoiceDesign mode: \"{}\"", instruct);
-        let (samples, timing) = synth.synthesize_voice_design_with_timing(
-            &args.text,
-            instruct,
-            &args.language,
-            &opts,
-        )?;
+        // Voice design / combined speaker+instruct mode
+        let (samples, timing) = if args.speaker.is_some() {
+            // Combined: preset speaker + style instruction
+            eprintln!("Speaker+Instruct mode: speaker={}, instruct=\"{}\"", speaker, instruct);
+            synth.synthesize_with_speaker_instruct_with_timing(
+                &args.text,
+                instruct,
+                &opts,
+            )?
+        } else {
+            // Pure voice design (no specific speaker)
+            eprintln!("VoiceDesign mode: \"{}\"", instruct);
+            synth.synthesize_voice_design_with_timing(
+                &args.text,
+                instruct,
+                &args.language,
+                &opts,
+            )?
+        };
 
         if samples.is_empty() {
             eprintln!("No audio generated.");
