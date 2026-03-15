@@ -2,7 +2,7 @@
 
 High-performance Qwen3-TTS inference on Apple Silicon in pure Rust, powered by [MLX](https://github.com/ml-explore/mlx).
 
-Part of the [OminiX-MLX](https://github.com/nicholasgasior/OminiX-MLX) ecosystem.
+Part of the [OminiX-MLX](https://github.com/OminiX-ai/OminiX-MLX) ecosystem.
 
 ## Highlights
 
@@ -20,6 +20,7 @@ Part of the [OminiX-MLX](https://github.com/nicholasgasior/OminiX-MLX) ecosystem
 - [Models](#models)
 - [Synthesis Modes](#synthesis-modes)
   - [CustomVoice (Preset Speakers)](#customvoice-preset-speakers)
+  - [Speaker + Instruct (Emotion/Style Control)](#speaker--instruct-emotionstyle-control)
   - [Voice Cloning](#voice-cloning)
   - [VoiceDesign (Text-Described Voices)](#voicedesign-text-described-voices)
   - [Streaming](#streaming)
@@ -118,6 +119,58 @@ let opts = SynthesizeOptions {
 let samples = synth.synthesize("你好，欢迎使用语音合成。", &opts)?;
 ```
 
+### Speaker + Instruct (Emotion/Style Control)
+
+Combine a preset speaker with a natural-language style instruction. This allows emotion and delivery control while keeping a specific voice identity. Requires the CustomVoice model.
+
+```rust
+let opts = SynthesizeOptions {
+    language: "chinese",
+    ..Default::default()
+};
+let samples = synth.synthesize_with_speaker_instruct(
+    "我太开心了！终于完成了！",
+    "serena",                                       // preset speaker
+    "用兴奋激动的语气说话，充满热情和活力",              // style instruction
+    "chinese",
+    &opts,
+)?;
+```
+
+Or from the command line:
+
+```bash
+cargo run --release --example synthesize -- \
+    -m ./models/Qwen3-TTS-12Hz-1.7B-CustomVoice-8bit \
+    "我太开心了！终于完成了！" \
+    -s serena -l chinese \
+    --instruct "用兴奋激动的语气说话，充满热情和活力"
+```
+
+**Verified emotion prompts** (Chinese — tested to produce accurate style control):
+
+| Style | Prompt |
+|-------|--------|
+| Excited | `用兴奋激动的语气说话，充满热情和活力` |
+| Sad | `用悲伤失望的语气说话，声音低沉，语速缓慢` |
+| Cheerful | `用开朗愉快的语气说话，声音明亮上扬，节奏轻快` |
+| Shout | `用大声喊叫的方式说话，声音高亢有力，语速快` |
+| Sarcastic | `用讽刺嘲讽的语气说话，语调阴阳怪气，拖长尾音` |
+| Soft | `用温柔轻柔的语气说话` |
+| Panic | `用惊慌恐惧的语气说话，声音颤抖，语速急促` (use with `repetition_penalty: 1.3`) |
+
+Custom free-form prompts are also supported. Include emotion + timbre + pace descriptors for strongest control. The prompt can be in any language, but Chinese prompts are best tested.
+
+**Dispatch logic** — the method called determines the mode:
+
+| Condition | Method | Mode |
+|-----------|--------|------|
+| `reference_audio` provided | `synthesize_voice_clone()` | Voice cloning (x-vector) |
+| `reference_audio` + `instruct` | `synthesize_voice_clone_instruct()` | Voice cloning + emotion/style |
+| `instruct` + `speaker` | `synthesize_with_speaker_instruct()` | Combined speaker + style |
+| `voice_description` only | `synthesize_voice_design()` | Text-described voice |
+| Default | `synthesize()` | Preset speaker |
+
 ### Voice Cloning
 
 Clone a voice from a short reference audio clip (3-10 seconds recommended). Requires the Base model.
@@ -158,6 +211,25 @@ let samples = synth.synthesize_voice_clone_icl(
 ```
 
 > **Note**: ICL mode is experimental and unreliable on Apple Silicon. Use x-vector mode for production.
+
+**Voice cloning + emotion/style control** — combines x-vector cloning with an instruct prompt:
+
+```rust
+let samples = synth.synthesize_voice_clone_instruct(
+    "你好，很高兴认识你。",
+    &ref_samples,
+    "用悲伤的语气说",  // emotion instruction
+    "chinese",
+    &opts,
+)?;
+```
+
+> **Limitations**: Voice cloning + instruct is an experimental feature. The Base model was not
+> specifically trained for this combination — emotion/style effects are weaker and less consistent
+> than with preset speakers (Speaker + Instruct mode). Some emotions (sad, angry, soft) work
+> reasonably well; others (fearful, surprised) may sound flat. Short, direct instructions in
+> the `"用...语气说"` format work best. The upcoming **Qwen3-TTS-25Hz-VoiceEditing** model from
+> Alibaba is expected to provide native support for emotion control on cloned voices.
 
 ### VoiceDesign (Text-Described Voices)
 
@@ -241,9 +313,11 @@ impl Synthesizer {
 | Method | Model Type | Description |
 |--------|-----------|-------------|
 | `synthesize(text, opts)` | CustomVoice | Preset speaker synthesis |
+| `synthesize_with_speaker_instruct(text, speaker, instruct, lang, opts)` | CustomVoice | Speaker + emotion/style instruction |
 | `synthesize_voice_design(text, instruct, language, opts)` | VoiceDesign | Text-described voice |
 | `synthesize_voice_clone(text, ref_audio, language, opts)` | Base | x-vector voice cloning |
-| `synthesize_voice_clone_icl(text, ref_audio, ref_text, language, opts)` | Base | ICL voice cloning |
+| `synthesize_voice_clone_instruct(text, ref_audio, instruct, lang, opts)` | Base | Voice cloning + emotion/style (experimental) |
+| `synthesize_voice_clone_icl(text, ref_audio, ref_text, language, opts)` | Base | ICL voice cloning (disabled) |
 | `start_streaming(text, opts, chunk_frames)` | CustomVoice | Streaming chunks |
 
 **Model capability queries:**
@@ -258,14 +332,15 @@ impl Synthesizer {
 
 ```rust
 pub struct SynthesizeOptions<'a> {
-    pub speaker: &'a str,          // Preset speaker name (default: "vivian")
-    pub language: &'a str,         // Language code (default: "english")
-    pub temperature: Option<f32>,  // Sampling temperature (config default: 0.9)
-    pub top_k: Option<i32>,        // Top-k sampling (config default: 50)
-    pub top_p: Option<f32>,        // Nucleus sampling threshold (config default: 1.0)
-    pub max_new_tokens: Option<i32>, // Max codec frames (config default: 8192)
-    pub seed: Option<u64>,         // Random seed for deterministic generation
-    pub speed_factor: Option<f32>, // Speech speed: >1.0 faster, <1.0 slower (default: 1.0)
+    pub speaker: &'a str,              // Preset speaker name (default: "vivian")
+    pub language: &'a str,             // Language code (default: "english")
+    pub temperature: Option<f32>,      // Sampling temperature (config default: 0.9)
+    pub top_k: Option<i32>,            // Top-k sampling (config default: 50)
+    pub top_p: Option<f32>,            // Nucleus sampling threshold (config default: 1.0)
+    pub max_new_tokens: Option<i32>,   // Max codec frames (config default: 8192)
+    pub seed: Option<u64>,             // Random seed for deterministic generation
+    pub speed_factor: Option<f32>,     // Speech speed: >1.0 faster, <1.0 slower (default: 1.0)
+    pub repetition_penalty: Option<f32>, // Penalizes repeated tokens (config default: 1.05)
 }
 ```
 
@@ -340,7 +415,9 @@ qwen3-tts [OPTIONS] --model-dir <PATH> <TEXT>
 | `--seed <UINT>` | | None | Random seed for determinism |
 | `--streaming` | | off | Enable streaming mode |
 | `--chunk-frames <INT>` | | 10 | Frames per streaming chunk (~83ms each) |
-| `--instruct <TEXT>` | | None | Voice design instruction (VoiceDesign mode) |
+| `--speed <FLOAT>` | | 1.0 | Speech speed factor (0.5-2.0) |
+| `--repetition-penalty <FLOAT>` | | 1.05 | Repetition penalty (1.0-2.0) |
+| `--instruct <TEXT>` | | None | Style/emotion instruction (speaker+instruct mode) |
 | `--reference-audio <PATH>` | | None | Reference WAV for voice cloning (Base model) |
 | `--reference-text <TEXT>` | | None | Reference transcript (enables ICL mode) |
 
@@ -364,6 +441,25 @@ cargo run --release --example synthesize -- \
     -m ./models/Qwen3-TTS-12Hz-1.7B-CustomVoice-8bit \
     "This is a longer sentence to demonstrate streaming output." \
     --streaming --chunk-frames 10
+
+# Speaker + instruct (emotion control)
+cargo run --release --example synthesize -- \
+    -m ./models/Qwen3-TTS-12Hz-1.7B-CustomVoice-8bit \
+    "我太开心了！终于完成了！" \
+    -s serena -l chinese \
+    --instruct "用兴奋激动的语气说话，充满热情和活力"
+
+# Speed control (slower)
+cargo run --release --example synthesize -- \
+    -m ./models/Qwen3-TTS-12Hz-1.7B-CustomVoice-8bit \
+    "This is slower, more deliberate speech." \
+    -s ryan -l english --speed 0.7
+
+# Speed control (faster)
+cargo run --release --example synthesize -- \
+    -m ./models/Qwen3-TTS-12Hz-1.7B-CustomVoice-8bit \
+    "This is faster speech." \
+    -s vivian -l english --speed 1.5
 
 # Voice cloning (x-vector, recommended)
 cargo run --release --example synthesize -- \
@@ -526,11 +622,13 @@ Streaming mode adds minimal overhead per chunk — first audio chunk is availabl
 
 ## Known Limitations
 
-1. **ICL voice cloning is unreliable on Apple Silicon**: The ICL (In-Context Learning) voice cloning mode produces inconsistent results on MPS/Metal. Some text + seed combinations work, others produce distorted audio. This appears to be a model precision issue (bf16/quantized inference). **Use x-vector mode instead** — it reliably captures speaker identity.
+1. **ICL voice cloning is unreliable on Apple Silicon**: The ICL (In-Context Learning) voice cloning mode produces inconsistent results on MPS/Metal. This appears to be a precision issue (bf16/quantized inference). **Use x-vector mode instead** — it reliably captures speaker identity. ICL methods are disabled in the current release.
 
-2. **No real-time audio playback**: The library outputs WAV files or `Vec<f32>` buffers. Integrate with an audio playback library (e.g., `cpal`, `rodio`) for real-time output.
+2. **Voice cloning + emotion is experimental**: The `synthesize_voice_clone_instruct()` method injects instruct tokens into the voice cloning pipeline, but the Base model was not specifically trained for this combination. Emotion effects are weaker and less consistent than with preset speakers (Speaker + Instruct mode). Some emotions (sad, angry, soft) work reasonably well; others (fearful, surprised) may sound flat. Short direct prompts in the `"用...语气说"` format work best. Community parameter-tuning approaches (adjusting temperature/top_p per emotion) have negligible effect on actual prosody. The upcoming **Qwen3-TTS-25Hz-VoiceEditing** model from Alibaba is expected to provide native emotion control for cloned voices.
 
-3. **VoiceDesign model not publicly available**: The VoiceDesign synthesis path is implemented but requires the VoiceDesign model variant, which has not been officially released by Qwen as of this writing.
+3. **No real-time audio playback**: The library outputs WAV files or `Vec<f32>` buffers. Integrate with an audio playback library (e.g., `cpal`, `rodio`) for real-time output.
+
+4. **VoiceDesign model not publicly available**: The VoiceDesign synthesis path is implemented but requires the VoiceDesign model variant, which has not been officially released by Qwen as of this writing.
 
 4. **Long text handling**: Very long texts (>100 characters) may require manual chunking for best quality. The model generates a single continuous codec sequence, so extremely long inputs may degrade.
 
@@ -545,7 +643,7 @@ Streaming mode adds minimal overhead per chunk — first audio chunk is availabl
 
 ```bash
 # Clone the repository
-git clone https://github.com/nicholasgasior/OminiX-MLX.git
+git clone https://github.com/OminiX-ai/OminiX-MLX.git
 cd OminiX-MLX
 
 # Build the TTS crate

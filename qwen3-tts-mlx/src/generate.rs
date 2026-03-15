@@ -488,6 +488,86 @@ pub fn generate_voice_design(
     Ok((all_codes, timing))
 }
 
+/// Generate speech using voice cloning + instruct (emotion/style control).
+pub fn generate_voice_clone_instruct(
+    talker: &mut Talker,
+    text_token_ids: &[u32],
+    instruct_token_ids: &[u32],
+    codec_prefix: &[u32],
+    speaker_embedding: &Array,
+    gen_config: &GenerationConfig,
+    tts_config: &Qwen3TtsConfig,
+    seed: Option<u64>,
+) -> Result<(Vec<[u32; 16]>, GenerationTiming)> {
+    let eos_token = tts_config.talker_config.codec_eos_token_id;
+    let pad_id = tts_config.talker_config.codec_pad_id;
+
+    let mut rng_key = seed.map(|s| SamplingKey::new(s)).transpose()?;
+
+    let mut trailing_text_ids: Vec<u32> = Vec::new();
+    if text_token_ids.len() > 1 {
+        trailing_text_ids.extend_from_slice(&text_token_ids[1..]);
+    }
+    trailing_text_ids.push(tts_config.tts_eos_token_id);
+    let trailing_len = trailing_text_ids.len();
+
+    let trailing_text_embeds = talker.build_projected_text_embeddings(&trailing_text_ids)?;
+    let tts_pad_embed = talker.build_text_only_embedding(tts_config.tts_pad_token_id)?;
+
+    info!(
+        "VoiceClone+Instruct prefill: {} instruct tokens, {} text tokens, {} trailing",
+        instruct_token_ids.len(), text_token_ids.len(), trailing_len,
+    );
+
+    talker.reset_caches();
+    talker.set_rope_speed_factor(1.0);
+
+    let prefill_start = Instant::now();
+    let input_embed = talker.build_voice_clone_instruct_prefill_embedding(
+        instruct_token_ids, text_token_ids, codec_prefix, speaker_embedding, tts_config,
+    )?;
+    let (prefill_logits, prefill_hidden) = talker.forward_step(input_embed)?;
+    let logits = prefill_logits.index((.., -1.., ..));
+    let hidden = prefill_hidden.index((.., -1.., ..));
+    eval([&logits, &hidden])?;
+    let prefill_time = prefill_start.elapsed();
+
+    let gen_start = Instant::now();
+    let vocab_size = tts_config.talker_config.vocab_size as usize;
+    let speed = gen_config.speed_factor;
+    let eos_steering = if (speed - 1.0).abs() > 0.01 {
+        let t = (trailing_len as f32 * AVG_FRAMES_PER_TEXT_TOKEN / speed) as usize;
+        Some((t, speed))
+    } else {
+        None
+    };
+
+    let params = GenerationLoopParams {
+        trailing_len, eos_token, pad_id,
+        temperature: gen_config.temperature,
+        top_k: gen_config.top_k,
+        top_p: gen_config.top_p,
+        repetition_penalty: gen_config.repetition_penalty,
+        max_new_tokens: gen_config.max_new_tokens as usize,
+        eos_steering,
+    };
+
+    let all_codes = run_generation_loop(
+        talker, logits, hidden, &trailing_text_embeds, &tts_pad_embed,
+        &params, &mut rng_key, vocab_size,
+    )?;
+
+    let gen_time = gen_start.elapsed();
+    let n_frames = all_codes.len();
+    info!("VoiceClone+Instruct generation complete: {} frames", n_frames);
+
+    Ok((all_codes, GenerationTiming {
+        prefill_ms: prefill_time.as_secs_f64() * 1000.0,
+        generation_ms: gen_time.as_secs_f64() * 1000.0,
+        generation_frames: n_frames,
+    }))
+}
+
 /// Generate speech using voice cloning (x_vector_only mode).
 ///
 /// Uses a continuous speaker embedding from ECAPA-TDNN instead of discrete speaker token.

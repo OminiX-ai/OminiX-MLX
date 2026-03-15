@@ -32,6 +32,9 @@ pub use model::{Qwen3ASR, Qwen3ASRConfig, SamplingConfig};
 pub use audio::{AudioConfig, MelFrontend};
 pub use mlx_rs_core::{KVCache, ConcatKeyValueCache};
 
+/// Crate version (from Cargo.toml).
+pub const VERSION: &str = env!("CARGO_PKG_VERSION");
+
 /// Environment variable name for model path.
 pub const MODEL_PATH_ENV: &str = "QWEN3_ASR_MODEL_PATH";
 

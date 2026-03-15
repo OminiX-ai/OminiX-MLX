@@ -1,6 +1,6 @@
 [package]
 name = "qwen3-tts-mlx"
-version = "0.1.0"
+version = "1.0.0"
 edition = "2021"
 autoexamples = false
 description = "Qwen3-TTS text-to-speech inference on Apple Silicon using MLX"

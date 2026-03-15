@@ -195,7 +195,7 @@ curl http://localhost:8080/v1/audio/transcriptions \
     -d '{"file_path": "audio.wav", "language": "English", "response_format": "verbose_json"}'
 ```
 
-See the [OminiX-API](../ominix-api/) crate for full documentation.
+The same API server also supports TTS, LLM, and OCR endpoints. See the [OminiX-API README](../ominix-api/README.md) for full documentation.
 
 ## Building
 
