@@ -122,7 +122,6 @@ fn main() -> std::result::Result<(), Box<dyn std::error::Error>> {
         // Voice cloning mode
         eprintln!("VoiceClone mode: reference audio from {}", ref_audio_path);
         let (ref_samples, ref_sr) = mlx_rs_core::audio::load_wav(ref_audio_path)?;
-        // Resample to 24kHz if needed
         let ref_samples = if ref_sr != 24000 {
             eprintln!("Resampling reference audio from {}Hz to 24000Hz", ref_sr);
             mlx_rs_core::audio::resample(&ref_samples, ref_sr, 24000)
@@ -131,19 +130,22 @@ fn main() -> std::result::Result<(), Box<dyn std::error::Error>> {
         };
         eprintln!("Reference audio: {:.2}s ({} samples at 24kHz)", ref_samples.len() as f32 / 24000.0, ref_samples.len());
 
-        let (samples, timing) = if let Some(ref ref_text) = args.reference_text {
-            // ICL mode (full quality): uses both speaker embedding + reference codes
-            eprintln!("ICL mode: reference text = \"{}\"", ref_text);
-            synth.synthesize_voice_clone_icl_with_timing(
+        if args.reference_text.is_some() {
+            eprintln!("Warning: --reference-text ignored (ICL mode disabled). Using x-vector mode.");
+        }
+
+        let (samples, timing) = if let Some(ref instruct) = args.instruct {
+            // Voice clone + instruct (emotion/style control)
+            eprintln!("VoiceClone+Instruct mode: instruct=\"{}\"", instruct);
+            synth.synthesize_voice_clone_instruct_with_timing(
                 &args.text,
                 &ref_samples,
-                ref_text,
+                instruct,
                 &args.language,
                 &opts,
             )?
         } else {
-            // x_vector_only mode: uses only speaker embedding
-            eprintln!("x_vector_only mode (no --reference-text provided)");
+            eprintln!("x_vector mode");
             synth.synthesize_voice_clone_with_timing(
                 &args.text,
                 &ref_samples,

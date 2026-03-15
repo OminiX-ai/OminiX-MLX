@@ -1096,10 +1096,10 @@ fn tts_process_request(
             ref_samples
         };
 
-        if let Some(ref ref_text) = sr.reference_text {
-            // ICL voice cloning (note: may not work well on Apple Silicon)
-            synth.synthesize_voice_clone_icl_with_timing(
-                &sr.input, &ref_samples, ref_text, language, &opts,
+        if let Some(ref instruct) = sr.prompt {
+            // Voice clone + instruct (emotion/style control)
+            synth.synthesize_voice_clone_instruct_with_timing(
+                &sr.input, &ref_samples, instruct, language, &opts,
             )
         } else {
             // x_vector_only voice cloning
@@ -1480,7 +1480,45 @@ async fn handle_request(
             handle_download_model(&body, &state).await.map(wrap_full)
         }
 
-        (Method::GET, "/health") => Ok(wrap_full(json_response(200, json!({"status": "ok"})))),
+        (Method::GET, "/health") => {
+            let mut models = serde_json::Map::new();
+
+            #[cfg(feature = "asr")]
+            if state.asr_tx.is_some() {
+                models.insert("asr".into(), json!({
+                    "crate": "qwen3-asr-mlx",
+                    "version": qwen3_asr_mlx::VERSION,
+                }));
+            }
+
+            #[cfg(feature = "tts")]
+            if state.tts_tx.is_some() {
+                models.insert("tts".into(), json!({
+                    "crate": "qwen3-tts-mlx",
+                    "version": qwen3_tts_mlx::VERSION,
+                }));
+            }
+
+            #[cfg(feature = "llm")]
+            if state.llm_tx.is_some() {
+                models.insert("llm".into(), json!({
+                    "crate": "qwen3.5-35B-mlx",
+                }));
+            }
+
+            #[cfg(feature = "ocr")]
+            if state.ocr_tx.is_some() {
+                models.insert("ocr".into(), json!({
+                    "crate": "deepseek-ocr2-mlx",
+                }));
+            }
+
+            Ok(wrap_full(json_response(200, json!({
+                "status": "ok",
+                "version": env!("CARGO_PKG_VERSION"),
+                "models": models,
+            }))))
+        }
 
         (Method::OPTIONS, _) => Ok(Response::builder()
             .status(StatusCode::OK)

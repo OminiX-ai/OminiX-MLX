@@ -713,6 +713,75 @@ impl Talker {
         Ok(all.as_dtype(mlx_rs::Dtype::Float32)?)
     }
 
+    /// Build prefill embedding for voice cloning + instruct (emotion/style control).
+    /// Prepends instruct tokens to the voice clone layout so the model receives both
+    /// the style instruction and the continuous speaker embedding.
+    ///
+    /// Layout: [instruct(M), role(3), codec_prefix(N), spk_embed(1), tts_bos+pad(1), first_text+bos(1)]
+    pub fn build_voice_clone_instruct_prefill_embedding(
+        &mut self,
+        instruct_tokens: &[u32],
+        text_tokens: &[u32],
+        codec_prefix: &[u32],
+        speaker_embedding: &Array,
+        tts_config: &crate::config::Qwen3TtsConfig,
+    ) -> Result<Array> {
+        let pad_id = tts_config.talker_config.codec_pad_id;
+        let bos_id = tts_config.talker_config.codec_bos_id;
+        let n_prefix = codec_prefix.len();
+
+        // 1. Instruct embedding [1, M, hidden] — text projection only
+        let instruct_embed = if instruct_tokens.is_empty() {
+            zeros::<f32>(&[1, 0, self.config.hidden_size])?
+        } else {
+            self.build_projected_text_embeddings(instruct_tokens)?
+        };
+
+        // 2. Role prefix [1, 3, hidden]
+        let role_tokens = [
+            tts_config.im_start_token_id,
+            tts_config.assistant_token_id,
+            198u32,
+        ];
+        let role_embed = self.build_projected_text_embeddings(&role_tokens)?;
+
+        // 3. Codec prefix overlay [1, N, hidden]
+        let text_pad_n = vec![tts_config.tts_pad_token_id; n_prefix];
+        let text_pad_n_embed = self.build_projected_text_embeddings(&text_pad_n)?;
+        let codec_ids_i32: Vec<i32> = codec_prefix.iter().map(|&c| c as i32).collect();
+        let codec_arr = Array::from_slice(&codec_ids_i32, &[1, n_prefix as i32]);
+        let codec_embed = self.codec_embedding.forward(&codec_arr)?;
+        let codec_overlay = text_pad_n_embed.add(codec_embed)?;
+
+        // 4. Speaker embedding position [1, 1, hidden]
+        let spk_embed = speaker_embedding.reshape(&[1, 1, -1])?;
+        let tts_pad_one = self.build_projected_text_embeddings(&[tts_config.tts_pad_token_id])?;
+        let spk_pos = tts_pad_one.add(&spk_embed)?;
+
+        // 5. tts_bos + codec_pad [1, 1, hidden]
+        let tts_bos_embed = self.build_projected_text_embeddings(&[tts_config.tts_bos_token_id])?;
+        let pad_arr = Array::from_slice(&[pad_id as i32], &[1, 1]);
+        let pad_embed = self.codec_embedding.forward(&pad_arr)?;
+        let bos_pos = tts_bos_embed.add(pad_embed)?;
+
+        // 6. first_text + codec_bos [1, 1, hidden]
+        let first_text = if text_tokens.is_empty() {
+            tts_config.tts_pad_token_id
+        } else {
+            text_tokens[0]
+        };
+        let first_text_embed = self.build_projected_text_embeddings(&[first_text])?;
+        let bos_arr = Array::from_slice(&[bos_id as i32], &[1, 1]);
+        let bos_embed = self.codec_embedding.forward(&bos_arr)?;
+        let first_pos = first_text_embed.add(bos_embed)?;
+
+        let all = mlx_rs::ops::concatenate_axis(
+            &[&instruct_embed, &role_embed, &codec_overlay, &spk_pos, &bos_pos, &first_pos],
+            1,
+        )?;
+        Ok(all.as_dtype(mlx_rs::Dtype::Float32)?)
+    }
+
     /// Build ICL prefill embedding for voice cloning (9 positions, no first_text+bos).
     /// ICL mode excludes position 9 because all text goes into the ICL prompt instead.
     ///

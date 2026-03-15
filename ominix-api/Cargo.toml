@@ -1,6 +1,6 @@
 [package]
 name = "ominix-api"
-version = "0.1.0"
+version = "1.0.0"
 edition = "2021"
 description = "Unified OpenAI-compatible API server for OminiX-MLX models"
 license = "MIT OR Apache-2.0"

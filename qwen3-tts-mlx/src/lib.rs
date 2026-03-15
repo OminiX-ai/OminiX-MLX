@@ -3,6 +3,9 @@
 //! Supports the `mlx-community/Qwen3-TTS-12Hz-1.7B-CustomVoice-8bit` model
 //! with 9 preset speakers and multilingual support.
 
+/// Crate version (from Cargo.toml).
+pub const VERSION: &str = env!("CARGO_PKG_VERSION");
+
 pub mod config;
 pub mod error;
 pub mod generate;
@@ -21,7 +24,7 @@ use tracing::info;
 
 use config::{GenerationConfig, Qwen3TtsConfig, SpeechTokenizerConfig};
 use error::{Error, Result};
-use generate::{build_codec_prefix, build_codec_prefix_voice_design, generate, generate_voice_clone, generate_voice_clone_icl, generate_voice_design, GenerationState};
+use generate::{build_codec_prefix, build_codec_prefix_voice_design, generate, generate_voice_clone, generate_voice_clone_instruct, generate_voice_design, GenerationState};
 use speech_tokenizer::SpeechTokenizerDecoder;
 use talker::Talker;
 
@@ -752,110 +755,88 @@ impl Synthesizer {
         Ok((samples, timing))
     }
 
-    /// Synthesize speech using ICL voice cloning (full quality).
-    /// Requires a Base model with both speaker encoder and speech encoder.
-    /// Uses both speaker embedding AND reference audio codes for conditioning.
-    /// `reference_audio` is the reference audio samples (f32 at 24kHz).
-    /// `reference_text` is the transcript of the reference audio.
-    pub fn synthesize_voice_clone_icl(
+    /// Synthesize speech using voice cloning + instruct (emotion/style control).
+    /// Combines x-vector speaker embedding with a style/emotion instruction.
+    ///
+    /// **Limitations**: This is experimental — the Base model was not specifically trained
+    /// for clone+instruct. Emotion effects are weaker than Speaker+Instruct mode.
+    /// Some emotions (sad, angry, soft) work reasonably; others (fearful, surprised) may
+    /// sound flat. Use short direct prompts like `"用悲伤的语气说"`. The upcoming
+    /// Qwen3-TTS-25Hz-VoiceEditing model is expected to provide native support.
+    pub fn synthesize_voice_clone_instruct(
         &mut self,
         text: &str,
         reference_audio: &[f32],
-        reference_text: &str,
+        instruct: &str,
         language: &str,
         opts: &SynthesizeOptions,
     ) -> Result<Vec<f32>> {
-        let (samples, _timing) = self.synthesize_voice_clone_icl_with_timing(
-            text, reference_audio, reference_text, language, opts,
+        let (samples, _) = self.synthesize_voice_clone_instruct_with_timing(
+            text, reference_audio, instruct, language, opts,
         )?;
         Ok(samples)
     }
 
-    /// Synthesize speech using ICL voice cloning with timing breakdown.
-    pub fn synthesize_voice_clone_icl_with_timing(
+    /// Synthesize speech using voice cloning + instruct with timing breakdown.
+    pub fn synthesize_voice_clone_instruct_with_timing(
         &mut self,
         text: &str,
         reference_audio: &[f32],
-        reference_text: &str,
+        instruct: &str,
         language: &str,
         opts: &SynthesizeOptions,
     ) -> Result<(Vec<f32>, SynthesisTiming)> {
         let total_start = Instant::now();
 
-        // Check that we have both encoders
         let spk_encoder = self.speaker_encoder.as_mut().ok_or_else(|| {
-            Error::Model("ICL voice cloning requires a Base model with speaker encoder".into())
+            Error::Model("Voice cloning requires a Base model with speaker encoder".into())
         })?;
+
+        let mut gen_config = self.gen_config.clone();
+        if let Some(temp) = opts.temperature { gen_config.temperature = temp; }
+        if let Some(k) = opts.top_k { gen_config.top_k = k; }
+        if let Some(p) = opts.top_p { gen_config.top_p = p; }
+        if let Some(n) = opts.max_new_tokens { gen_config.max_new_tokens = n; }
+        if let Some(rp) = opts.repetition_penalty { gen_config.repetition_penalty = rp; }
+
+        let requested_speed = opts.speed_factor.unwrap_or(1.0);
+        if requested_speed < 1.0 {
+            gen_config.speed_factor = requested_speed;
+        } else {
+            gen_config.speed_factor = 1.0;
+        }
+
+        // Tokenize text
+        let encoding = self.tokenizer.encode(text, false)
+            .map_err(|e| Error::Model(format!("Tokenizer error: {e}")))?;
+        let text_token_ids: Vec<u32> = encoding.get_ids().to_vec();
+
+        // Tokenize instruct with ChatML wrapping
+        let chatml_instruct = format!("<|im_start|>user\n{}<|im_end|>\n", instruct);
+        let instruct_encoding = self.tokenizer.encode(chatml_instruct.as_str(), false)
+            .map_err(|e| Error::Model(format!("Tokenizer error (instruct): {e}")))?;
+        let instruct_token_ids: Vec<u32> = instruct_encoding.get_ids().to_vec();
+
+        // Compute speaker embedding
+        info!("Computing speaker embedding from reference audio ({} samples)...", reference_audio.len());
         let mel_config = speaker_encoder::SpeakerMelConfig::default();
         let mel = speaker_encoder::compute_speaker_mel(reference_audio, &mel_config)?;
         let speaker_embedding = spk_encoder.forward(&mel)?;
         mlx_rs::transforms::eval(std::iter::once(&speaker_embedding))?;
 
         info!(
-            "Speaker embedding: {:?}",
-            speaker_embedding.shape()
+            "VoiceClone+Instruct: {} text tokens, {} instruct tokens",
+            text_token_ids.len(), instruct_token_ids.len(),
         );
 
-        // Encode reference audio to codec frames via Mimi
-        let spch_encoder = self.speech_encoder.as_mut().ok_or_else(|| {
-            Error::Model("ICL voice cloning requires a Base model with speech encoder (Mimi)".into())
-        })?;
-        let ref_codes = spch_encoder.encode(reference_audio)?;
-        info!("Reference audio encoded: {} frames", ref_codes.len());
-
-        let mut gen_config = self.gen_config.clone();
-        if let Some(temp) = opts.temperature {
-            gen_config.temperature = temp;
-        }
-        if let Some(k) = opts.top_k {
-            gen_config.top_k = k;
-        }
-        if let Some(p) = opts.top_p {
-            gen_config.top_p = p;
-        }
-        if let Some(n) = opts.max_new_tokens {
-            gen_config.max_new_tokens = n;
-        }
-        if let Some(rp) = opts.repetition_penalty {
-            gen_config.repetition_penalty = rp;
-        }
-        if let Some(s) = opts.speed_factor {
-            gen_config.speed_factor = s;
-        }
-
-        // Tokenize target text
-        let encoding = self
-            .tokenizer
-            .encode(text, false)
-            .map_err(|e| Error::Model(format!("Tokenizer error: {e}")))?;
-        let text_token_ids: Vec<u32> = encoding.get_ids().to_vec();
-
-        // Tokenize reference text
-        let ref_encoding = self
-            .tokenizer
-            .encode(reference_text, false)
-            .map_err(|e| Error::Model(format!("Tokenizer error (ref text): {e}")))?;
-        let ref_text_ids: Vec<u32> = ref_encoding.get_ids().to_vec();
-
-        info!(
-            "ICL text tokens: target={:?} ({}), ref={:?} ({})",
-            text_token_ids, text_token_ids.len(),
-            ref_text_ids, ref_text_ids.len(),
-        );
-
-        // Build codec prefix for ICL: think + explicit language
-        // TrevorS's working implementation uses CODEC_THINK with explicit language
         let codec_prefix = generate::build_codec_prefix_voice_design(
-            &self.tts_config.talker_config,
-            language,
+            &self.tts_config.talker_config, language,
         )?;
 
-        // Generate codec frames
-        let (gen_codes, ref_code_frames, ref_text_len, gen_timing) = generate_voice_clone_icl(
+        let (codes, gen_timing) = generate_voice_clone_instruct(
             &mut self.talker,
             &text_token_ids,
-            &ref_text_ids,
-            &ref_codes,
+            &instruct_token_ids,
             &codec_prefix,
             &speaker_embedding,
             &gen_config,
@@ -863,82 +844,36 @@ impl Synthesizer {
             opts.seed,
         )?;
 
-        if gen_codes.is_empty() {
-            let timing = SynthesisTiming {
+        if codes.is_empty() {
+            return Ok((vec![], SynthesisTiming {
                 prefill_ms: gen_timing.prefill_ms,
                 generation_ms: gen_timing.generation_ms,
-                generation_frames: 0,
-                decode_ms: 0.0,
+                generation_frames: 0, decode_ms: 0.0,
                 total_ms: total_start.elapsed().as_secs_f64() * 1000.0,
-            };
-            return Ok((vec![], timing));
+            }));
         }
 
-        // Text-ratio proportional trim: the model generates codec for the full text
-        // (ref_text + target_text). The first ref_ratio fraction corresponds to ref_text
-        // and must be trimmed. This matches the Python reference implementation.
-        let ref_ratio = ref_text_len as f64 / (ref_text_len + text_token_ids.len() + 1) as f64;
-        let trim_frames = (ref_ratio * gen_codes.len() as f64) as usize;
-        let target_codes = &gen_codes[trim_frames..];
-
-        info!(
-            "ICL: {} ref frames, {} gen frames, ref_ratio={:.3}, trim={} frames, {} target frames",
-            ref_code_frames.len(),
-            gen_codes.len(),
-            ref_ratio,
-            trim_frames,
-            target_codes.len(),
-        );
-
-        // Prepend ref_codes as decoder warmup context (prevents cold-start artifacts),
-        // then decode, then cut the ref portion from the audio output.
+        info!("Decoding {} codec frames to audio...", codes.len());
         let decode_start = Instant::now();
-        let ref_len = ref_code_frames.len();
-        let mut codes_for_decode = Vec::with_capacity(ref_len + target_codes.len());
-        codes_for_decode.extend_from_slice(&ref_code_frames);
-        codes_for_decode.extend_from_slice(target_codes);
-        let total_decode_len = codes_for_decode.len();
-
-        let all_samples = self.decoder.decode(&codes_for_decode)?;
+        let mut samples = self.decoder.decode(&codes)?;
         mlx_rs::transforms::eval(std::iter::empty::<&mlx_rs::Array>())?;
+        let decode_ms = decode_start.elapsed().as_secs_f64() * 1000.0;
 
-        // Cut ref portion from decoded audio (proportional to ref frames in decode input)
-        let ref_audio_cut = if total_decode_len > 0 {
-            (ref_len as f64 / total_decode_len as f64 * all_samples.len() as f64) as usize
-        } else {
-            0
-        };
-        let mut samples = all_samples[ref_audio_cut..].to_vec();
-
-        // 50ms fade-in to eliminate residual decoder cold-start blip
-        let fade_len = (0.05 * self.sample_rate as f64) as usize;
-        if samples.len() > fade_len {
-            for i in 0..fade_len {
-                samples[i] *= i as f32 / fade_len as f32;
-            }
+        if requested_speed > 1.01 {
+            samples = time_stretch_wsola(&samples, requested_speed, self.sample_rate);
         }
 
-        let decode_ms = decode_start.elapsed().as_secs_f64() * 1000.0;
         let total_ms = total_start.elapsed().as_secs_f64() * 1000.0;
-
-        info!(
-            "Generated {:.2}s of audio ({} samples, trimmed {} gen frames, cut {} ref samples, 50ms fade-in)",
-            samples.len() as f32 / self.sample_rate as f32,
-            samples.len(),
-            trim_frames,
-            ref_audio_cut,
-        );
-
-        let timing = SynthesisTiming {
+        Ok((samples, SynthesisTiming {
             prefill_ms: gen_timing.prefill_ms,
             generation_ms: gen_timing.generation_ms,
             generation_frames: gen_timing.generation_frames,
-            decode_ms,
-            total_ms,
-        };
-
-        Ok((samples, timing))
+            decode_ms, total_ms,
+        }))
     }
+
+    // ICL voice cloning is disabled — unreliable on Apple Silicon.
+    // Use x-vector mode (synthesize_voice_clone) instead.
 
     /// Available speakers for CustomVoice model.
     pub fn speakers(&self) -> Vec<&str> {
