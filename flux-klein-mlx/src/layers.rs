@@ -7,7 +7,7 @@ use mlx_rs::{
     array,
     builder::Builder,
     error::Exception,
-    module::{Module, ModuleParameters},
+    module::Module,
     nn::{Linear, LinearBuilder, RmsNorm},
     ops,
     Array,
