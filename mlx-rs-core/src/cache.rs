@@ -74,12 +74,15 @@ impl KeyValueCache for ConcatKeyValueCache {
                 self.values = Some(values);
             }
         }
-        let shape = self.keys.as_ref().expect("Keys cannot be None").shape();
-        self.offset = shape[shape.len() - 2];
+        let k = self.keys.as_ref().ok_or_else(|| Exception::from("cache keys unavailable after update"))?;
+        self.offset = {
+            let shape = k.shape();
+            shape[shape.len() - 2]
+        };
 
         Ok((
-            self.keys.clone().expect("Keys cannot be None"),
-            self.values.clone().expect("Values cannot be None"),
+            self.keys.clone().ok_or_else(|| Exception::from("cache keys unavailable"))?,
+            self.values.clone().ok_or_else(|| Exception::from("cache values unavailable"))?,
         ))
     }
 }
