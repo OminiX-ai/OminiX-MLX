@@ -13,6 +13,23 @@ jobs:
         with:
           submodules: true
           fetch-depth: 0
+      - name: Verify version parity with OminiX-API
+        env:
+          GH_TOKEN: ${{ github.token }}
+        run: |
+          MLX_VER=$(grep '^version' Cargo.toml | head -1 | sed 's/.*"\(.*\)".*/\1/')
+          TAG_VER=${GITHUB_REF_NAME#v}
+          echo "MLX=$MLX_VER  TAG=$TAG_VER"
+          if [ "$MLX_VER" != "$TAG_VER" ]; then
+            echo "::error::Tag $TAG_VER does not match Cargo.toml version $MLX_VER"
+            exit 1
+          fi
+          # Warn if OminiX-API doesn't have a matching tag yet
+          API_TAG=$(gh api repos/OminiX-ai/OminiX-API/git/refs/tags/v${MLX_VER} 2>/dev/null | grep -c "refs/tags" || true)
+          if [ "$API_TAG" = "0" ]; then
+            echo "::warning::OminiX-API does not have tag v${MLX_VER} yet — remember to release it too"
+          fi
+
       - run: sudo xcodes select 16.4
       - uses: actions-rust-lang/setup-rust-toolchain@v1
       - uses: Swatinem/rust-cache@v2
