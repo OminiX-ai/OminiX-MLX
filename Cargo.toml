@@ -1,7 +1,7 @@
 [workspace.package]
 # All but mlx-sys should follow the same version. mlx-sys should follow
 # the version of mlx-c.
-version = "0.25.2"
+version = "1.0.0"
 edition = "2021"
 authors = [
     "Minghua Wu <michael.wu1107@gmail.com>",
@@ -46,7 +46,6 @@ members = [
     "qwen3-asr-mlx",
     "qwen3-tts-mlx",
     "qwen3.5-35B-mlx",
-    "ominix-api",
     "deepseek-ocr2-mlx",
 ]
 
@@ -55,11 +54,11 @@ resolver = "2"
 [workspace.dependencies]
 # workspace local dependencies
 mlx-sys = { version = "=0.2.0", path = "mlx-rs/mlx-sys" }
-mlx-macros = { version = "0.25", path = "mlx-rs/mlx-macros" }
-mlx-internal-macros = { version = "0.25", path = "mlx-rs/mlx-internal-macros" }
-mlx-rs = { version = "0.25", path = "mlx-rs" }
-mlx-lm-utils = { version = "0.0.1", path = "mlx-rs/mlx-lm-utils" }
-mlx-rs-core = { version = "0.1.0", path = "mlx-rs-core" }
+mlx-macros = { version = "1.0", path = "mlx-rs/mlx-macros" }
+mlx-internal-macros = { version = "1.0", path = "mlx-rs/mlx-internal-macros" }
+mlx-rs = { version = "1.0", path = "mlx-rs" }
+mlx-lm-utils = { version = "1.0", path = "mlx-rs/mlx-lm-utils" }
+mlx-rs-core = { version = "1.0", path = "mlx-rs-core" }
 
 # external dependencies
 thiserror = "2"
