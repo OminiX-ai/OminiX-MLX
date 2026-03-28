@@ -470,8 +470,8 @@ pub fn load_sam_encoder(
 
     // Transpose Conv2d weights from PyTorch [O,I,H,W] to MLX [O,H,W,I]
     let conv2d_weight = |key: &str| -> Result<Array, Error> {
-        let w = get(key)?;
-        Ok(w.transpose_axes(&[0, 2, 3, 1])?)
+        // Weights already in MLX format (C_out, kH, kW, C_in), no transpose needed
+        get(key)
     };
 
     // PatchEmbed: Conv2d(3, 768, k=16, s=16)

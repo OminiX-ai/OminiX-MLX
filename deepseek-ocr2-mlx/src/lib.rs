@@ -958,24 +958,24 @@ pub fn load_model(model_dir: impl AsRef<Path>) -> Result<DeepseekOCR2> {
 
     // Load SAM encoder
     eprintln!("Loading SAM encoder...");
-    let sam_model = vision::load_sam_encoder(&weights, "model.sam_model")?;
+    let sam_model = vision::load_sam_encoder(&weights, "sam_model")?;
 
     // Load Qwen2 encoder
     eprintln!("Loading Qwen2 encoder...");
-    let qwen2_model = qwen2_encoder::load_qwen2_encoder(&weights, "model.qwen2_model")?;
+    let qwen2_model = qwen2_encoder::load_qwen2_encoder(&weights, "vision_model.qwen2_encoder")?;
 
     // Load projector (linear: 896 -> 1280)
     let projector = nn::Linear {
-        weight: Param::new(get_weight(&weights, "model.projector.layers.weight")?),
-        bias: Param::new(Some(get_weight(&weights, "model.projector.layers.bias")?)),
+        weight: Param::new(get_weight(&weights, "projector.layers.weight")?),
+        bias: Param::new(Some(get_weight(&weights, "projector.layers.bias")?)),
     };
 
     // View separator
-    let view_seperator = get_weight(&weights, "model.view_seperator")?;
+    let view_seperator = get_weight(&weights, "view_separator")?;
 
     // Embed tokens
     let embed_tokens = nn::Embedding {
-        weight: Param::new(get_weight(&weights, "model.embed_tokens.weight")?),
+        weight: Param::new(get_weight(&weights, "language_model.model.embed_tokens.weight")?),
     };
 
     // LLM layers
@@ -984,7 +984,7 @@ pub fn load_model(model_dir: impl AsRef<Path>) -> Result<DeepseekOCR2> {
 
     let mut layers = Vec::new();
     for i in 0..config.num_hidden_layers {
-        let lp = format!("model.layers.{}", i);
+        let lp = format!("language_model.model.layers.{}", i);
         let is_moe = i >= config.first_k_dense_replace;
 
         // RoPE: DeepSeek-V2 uses standard stride-based RoPE (non-traditional)
@@ -1033,21 +1033,25 @@ pub fn load_model(model_dir: impl AsRef<Path>) -> Result<DeepseekOCR2> {
         };
 
         let (mlp, moe) = if is_moe {
-            // MoE layer
+            // MoE layer - switch_mlp packs all experts into [n_experts, ...] tensors
+            let sw = format!("{}.mlp.switch_mlp", lp);
+            let gate_all = get_weight(&weights, &format!("{}.gate_proj.weight", sw))?;
+            let up_all = get_weight(&weights, &format!("{}.up_proj.weight", sw))?;
+            let down_all = get_weight(&weights, &format!("{}.down_proj.weight", sw))?;
+
             let mut experts = Vec::new();
             for e in 0..config.n_routed_experts {
-                let ep = format!("{}.mlp.experts.{}", lp, e);
                 experts.push(MLP {
                     gate_proj: nn::Linear {
-                        weight: Param::new(get_weight(&weights, &format!("{}.gate_proj.weight", ep))?),
+                        weight: Param::new(gate_all.index(e as i32)),
                         bias: Param::new(None),
                     },
                     up_proj: nn::Linear {
-                        weight: Param::new(get_weight(&weights, &format!("{}.up_proj.weight", ep))?),
+                        weight: Param::new(up_all.index(e as i32)),
                         bias: Param::new(None),
                     },
                     down_proj: nn::Linear {
-                        weight: Param::new(get_weight(&weights, &format!("{}.down_proj.weight", ep))?),
+                        weight: Param::new(down_all.index(e as i32)),
                         bias: Param::new(None),
                     },
                 });
@@ -1130,13 +1134,13 @@ pub fn load_model(model_dir: impl AsRef<Path>) -> Result<DeepseekOCR2> {
 
     // Final norm
     let norm = nn::RmsNorm {
-        weight: Param::new(get_weight(&weights, "model.norm.weight")?),
+        weight: Param::new(get_weight(&weights, "language_model.model.norm.weight")?),
         eps: config.rms_norm_eps,
     };
 
     // LM head
     let lm_head = nn::Linear {
-        weight: Param::new(get_weight(&weights, "lm_head.weight")?),
+        weight: Param::new(get_weight(&weights, "language_model.lm_head.weight")?),
         bias: Param::new(None),
     };
 

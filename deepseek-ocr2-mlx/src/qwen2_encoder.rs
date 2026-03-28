@@ -312,7 +312,7 @@ pub fn load_qwen2_encoder(
 
     let mut layers = Vec::new();
     for i in 0..24 {
-        let lp = format!("{}.model.model.layers.{}", prefix, i);
+        let lp = format!("{}.layers.{}", prefix, i);
 
         let rope = nn::RopeBuilder::new(head_dim)
             .base(rope_theta)
@@ -381,12 +381,12 @@ pub fn load_qwen2_encoder(
     }
 
     let norm = nn::RmsNorm {
-        weight: Param::new(get(&format!("{}.model.model.norm.weight", prefix))?),
+        weight: Param::new(get(&format!("{}.norm.weight", prefix))?),
         eps: rms_eps,
     };
 
-    let query_768 = get(&format!("{}.query_768.weight", prefix))?;
-    let query_1024 = get(&format!("{}.query_1024.weight", prefix))?;
+    let query_768 = get(&format!("{}.query_768", prefix))?;
+    let query_1024 = get(&format!("{}.query_1024", prefix))?;
 
     Ok(Qwen2Encoder {
         layers,
