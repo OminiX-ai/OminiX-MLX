@@ -122,20 +122,16 @@ def apply_repetition_penalty(
     if penalty == 1.0:
         return logits
 
-    # Get unique tokens that have been generated
     batch_size = logits.shape[0]
     vocab_size = logits.shape[-1]
 
     for b in range(batch_size):
-        unique_tokens = mx.unique(generated_tokens[b])
-        for token in unique_tokens:
-            token_id = int(token.item())
-            if 0 <= token_id < vocab_size:
-                # Reduce probability of repeated tokens
-                if logits[b, token_id] > 0:
-                    logits = logits.at[b, token_id].set(logits[b, token_id] / penalty)
-                else:
-                    logits = logits.at[b, token_id].set(logits[b, token_id] * penalty)
+        tokens = mx.clip(generated_tokens[b], 0, vocab_size - 1)
+        presence = mx.zeros((vocab_size,), dtype=mx.float32)
+        presence = presence.at[tokens].add(mx.ones(tokens.shape[0], dtype=mx.float32))
+        present = presence > 0
+        scale = mx.where(logits[b] > 0, 1.0 / penalty, penalty)
+        logits = logits.at[b].set(mx.where(present, logits[b] * scale, logits[b]))
 
     return logits
 

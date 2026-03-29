@@ -30,7 +30,7 @@ except ImportError:
 from python.models.config import GPTConfig, VocoderConfig, SynthesisConfig, ModelPaths
 from python.models.gpt import GPTSoVITS, load_gpt_model
 from python.models.vocoder import SoVITSVocoder, load_vocoder
-from python.generate import generate_semantic_tokens, GenerationConfig
+from python.generate import generate_semantic_tokens, generate_streaming, GenerationConfig
 from python.encoders import load_audio_encoder, load_text_encoder
 from python.text.preprocessor import TextPreprocessor, PreprocessorOutput
 
@@ -83,6 +83,7 @@ class GPTSoVITSEngine:
         self._text_encoder = None
         self._gpt_model = None
         self._vocoder = None
+        self._compiled_voc = None
 
         # Text preprocessor
         self._text_preprocessor = TextPreprocessor()
@@ -160,11 +161,6 @@ class GPTSoVITSEngine:
                 config_path=config_path,
             )
             print(f"  GPT model loaded: {paths.gpt_weights_path}")
-
-            # Optionally compile the model
-            if self.use_compile:
-                # TODO: Apply mx.compile to forward pass
-                pass
         else:
             raise FileNotFoundError(f"GPT weights not found: {paths.gpt_weights_path}")
 
@@ -182,6 +178,13 @@ class GPTSoVITSEngine:
             # Create default vocoder for testing
             self._vocoder = SoVITSVocoder(VocoderConfig())
             print("  Using default vocoder (no weights found)")
+
+        if self.use_compile and self._vocoder is not None:
+            _voc = self._vocoder
+            self._compiled_voc = mx.compile(
+                lambda t, f, s: _voc(t, audio_features=f, speed_factor=s),
+                shapeless=True,
+            )
 
         # Cache reference audio features
         if paths.reference_audio_path and Path(paths.reference_audio_path).exists():
@@ -305,14 +308,34 @@ class GPTSoVITSEngine:
         Yields:
             Audio chunks as numpy arrays
         """
-        # For now, fall back to non-streaming
-        # TODO: Implement true streaming with incremental vocoding
-        result = self.synthesize(text, config)
+        if not self.is_loaded:
+            raise RuntimeError("No voice loaded. Call load_voice() first.")
 
-        # Yield in chunks
-        audio = result.audio
-        for i in range(0, len(audio), chunk_samples):
-            yield audio[i:i + chunk_samples]
+        if config is None:
+            config = SynthesisConfig()
+
+        phoneme_ids, _ = self._text_to_phonemes(text, config.language)
+        bert_features = self._extract_bert_features(text)
+
+        gen_config = GenerationConfig(
+            max_tokens=config.max_semantic_tokens,
+            min_tokens=config.min_semantic_tokens,
+            temperature=config.temperature,
+            top_k=config.top_k,
+            top_p=config.top_p,
+            repetition_penalty=config.repetition_penalty,
+        )
+
+        token_chunks = list(
+            generate_streaming(self._gpt_model, phoneme_ids, bert_features, config=gen_config)
+        )
+        semantic_tokens = mx.concatenate(token_chunks, axis=1)
+
+        audio = self._vocode(semantic_tokens, self._cached_audio_features, config)
+        audio_np = np.array(audio)
+
+        for i in range(0, len(audio_np), chunk_samples):
+            yield audio_np[i:i + chunk_samples]
 
     def _text_to_phonemes(self, text: str, language: str = "zh") -> Tuple[mx.array, PreprocessorOutput]:
         """Convert text to phoneme IDs.
@@ -370,14 +393,14 @@ class GPTSoVITSEngine:
             duration_samples = int(num_tokens * 0.02 * config.sample_rate)
             return mx.zeros((duration_samples,), dtype=mx.float32)
 
-        # Use the vocoder to synthesize audio
-        # semantic_tokens: [1, seq_len]
-        # audio_features: [1, time, 768]
-        audio = self._vocoder(
-            semantic_tokens,
-            audio_features=audio_features,
-            speed_factor=config.speed_factor,
-        )
+        if self._compiled_voc is not None:
+            audio = self._compiled_voc(semantic_tokens, audio_features, config.speed_factor)
+        else:
+            audio = self._vocoder(
+                semantic_tokens,
+                audio_features=audio_features,
+                speed_factor=config.speed_factor,
+            )
         mx.eval(audio)
 
         # audio is [batch, samples, 1], squeeze to [samples]

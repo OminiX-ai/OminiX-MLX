@@ -6,7 +6,8 @@ use std::fs::File;
 use std::io::{BufReader, Read, Seek, SeekFrom};
 use std::path::Path;
 
-use mlx_rs::Array;
+use mlx_rs::fft::rfft;
+use mlx_rs::{complex64, Array};
 use mlx_rs::error::Exception;
 
 /// Audio configuration for mel spectrogram computation
@@ -215,10 +216,11 @@ pub fn resample(samples: &[f32], src_rate: u32, target_rate: u32) -> Vec<f32> {
     let mut output = Vec::with_capacity((samples.len() as f64 * ratio).ceil() as usize + 100);
     let mut pos = 0;
 
-    // Process full chunks
+    let mut chunk_buf = vec![vec![0.0f32; chunk_size]];
+
     while pos + chunk_size <= samples.len() {
-        let chunk = vec![samples[pos..pos + chunk_size].to_vec()];
-        match resampler.process(&chunk, None) {
+        chunk_buf[0].copy_from_slice(&samples[pos..pos + chunk_size]);
+        match resampler.process(&chunk_buf, None) {
             Ok(out) => {
                 if !out.is_empty() {
                     output.extend_from_slice(&out[0]);
@@ -409,27 +411,19 @@ fn mel_filterbank(n_fft: i32, n_mels: i32, sample_rate: i32, fmin: f32, fmax: f3
     filterbank
 }
 
-/// Compute Short-Time Fourier Transform magnitude
-/// Returns [n_freqs, n_frames] where n_freqs = n_fft/2 + 1
-/// Uses center=False (no padding) to match GPT-SoVITS
 fn stft_magnitude(
     samples: &[f32],
     n_fft: i32,
     hop_length: i32,
     win_length: i32,
-) -> Vec<f32> {
-    use std::f32::consts::PI;
-
+) -> Result<Vec<f32>, Exception> {
     let n_fft = n_fft as usize;
     let hop_length = hop_length as usize;
     let win_length = win_length as usize;
     let n_freqs = n_fft / 2 + 1;
 
-    // Create window
     let window = hann_window(win_length);
 
-    // No center padding (center=False like Python)
-    // Number of frames with center=False
     let n_frames = if samples.len() >= n_fft {
         (samples.len() - n_fft) / hop_length + 1
     } else {
@@ -437,40 +431,33 @@ fn stft_magnitude(
     };
 
     if n_frames == 0 {
-        return vec![0.0f32; n_freqs];
+        return Ok(vec![0.0f32; n_freqs]);
     }
 
-    // Output magnitude spectrogram [n_freqs, n_frames]
-    let mut magnitude = vec![0.0f32; n_freqs * n_frames];
-
+    let mut frames = vec![0.0f32; n_frames * n_fft];
     for frame in 0..n_frames {
         let start = frame * hop_length;
-
-        // Apply window directly to samples (no padding)
-        // For n_fft == win_length, just apply window to the frame
-        let mut windowed = vec![0.0f32; n_fft];
+        let row = &mut frames[frame * n_fft..frame * n_fft + n_fft];
         for i in 0..win_length.min(n_fft) {
             if start + i < samples.len() {
-                windowed[i] = samples[start + i] * window[i];
+                row[i] = samples[start + i] * window[i];
             }
-        }
-
-        // DFT to compute magnitude
-        for k in 0..n_freqs {
-            let mut real = 0.0f32;
-            let mut imag = 0.0f32;
-
-            for n in 0..n_fft {
-                let angle = 2.0 * PI * k as f32 * n as f32 / n_fft as f32;
-                real += windowed[n] * angle.cos();
-                imag -= windowed[n] * angle.sin();
-            }
-
-            magnitude[k * n_frames + frame] = (real * real + imag * imag).sqrt();
         }
     }
 
-    magnitude
+    let frames_array = Array::from_slice(&frames, &[n_frames as i32, n_fft as i32]);
+    let fft_out = rfft(&frames_array, None, None)?;
+
+    let complex_data = fft_out.as_slice::<complex64>();
+    let mut magnitude = vec![0.0f32; n_freqs * n_frames];
+    for frame in 0..n_frames {
+        for k in 0..n_freqs {
+            let c = complex_data[frame * n_freqs + k];
+            magnitude[k * n_frames + frame] = (c.re * c.re + c.im * c.im).sqrt();
+        }
+    }
+
+    Ok(magnitude)
 }
 
 /// Compute STFT spectrogram from audio samples
@@ -485,13 +472,12 @@ pub fn compute_mel_spectrogram(
 ) -> Result<Array, Exception> {
     let n_freqs = (config.n_fft / 2 + 1) as usize;
 
-    // Compute STFT magnitude [n_freqs, n_frames]
     let stft_mag = stft_magnitude(
         samples,
         config.n_fft,
         config.hop_length,
         config.win_length,
-    );
+    )?;
 
     let n_frames = stft_mag.len() / n_freqs;
 

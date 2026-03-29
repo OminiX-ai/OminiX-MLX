@@ -164,33 +164,25 @@ class Attention(nn.Module):
         if cache is not None:
             k, v = cache.update(k, v)
 
-        # Compute attention scores
-        # Use MLX's optimized scaled_dot_product_attention if available
+        q_len = q.shape[2]
+        kv_len = k.shape[2]
+
+        if mask is None and q_len > 1:
+            mask = mx.triu(
+                mx.full((q_len, kv_len), float("-inf")),
+                k=kv_len - q_len + 1,
+            )
+
         if hasattr(mx, 'fast') and hasattr(mx.fast, 'scaled_dot_product_attention'):
-            # MLX's fused attention kernel
             output = mx.fast.scaled_dot_product_attention(
                 q, k, v,
                 scale=self.scale,
                 mask=mask,
             )
         else:
-            # Manual attention computation
             scores = (q @ k.transpose(0, 1, 3, 2)) * self.scale
-
-            # Apply mask (causal by default)
-            if mask is None:
-                # Create causal mask
-                kv_len = k.shape[2]
-                q_len = q.shape[2]
-                causal_mask = mx.triu(
-                    mx.full((q_len, kv_len), float("-inf")),
-                    k=kv_len - q_len + 1,
-                )
-                scores = scores + causal_mask
-            elif mask is not None:
+            if mask is not None:
                 scores = scores + mask
-
-            # Softmax and attention
             attn_weights = mx.softmax(scores, axis=-1)
             output = attn_weights @ v
 
