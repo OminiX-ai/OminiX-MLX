@@ -26,6 +26,10 @@ members = [
     "mlx-rs/mlx-tests",
     # OminiX shared utilities
     "mlx-rs-core",
+    # Backend-agnostic core crates
+    "qwen3-tts-core",
+    # FFI bindings (only built when targeting GGML/Ascend)
+    # "llama-sys",  # uncomment on Linux/Ascend builds
     # OminiX model crates
     "flux-klein-mlx",
     "zimage-mlx",

@@ -1,19 +1,12 @@
-use mlx_rs::error::Exception;
 use thiserror::Error;
 
 #[derive(Debug, Error)]
 pub enum Error {
     #[error(transparent)]
-    Mlx(#[from] Exception),
-
-    #[error(transparent)]
     Io(#[from] std::io::Error),
 
     #[error(transparent)]
     Json(#[from] serde_json::Error),
-
-    #[error("weight load error: {0}")]
-    WeightLoad(#[from] mlx_rs::error::IoError),
 
     #[error("weight not found: {0}")]
     WeightNotFound(String),
@@ -24,8 +17,11 @@ pub enum Error {
     #[error("config error: {0}")]
     Config(String),
 
-    #[error(transparent)]
-    Core(#[from] qwen3_tts_core::Error),
+    #[error("backend error: {0}")]
+    Backend(String),
+
+    #[error("sampling error: {0}")]
+    Sampling(String),
 }
 
 pub type Result<T> = std::result::Result<T, Error>;

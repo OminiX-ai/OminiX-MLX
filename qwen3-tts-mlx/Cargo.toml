@@ -9,6 +9,7 @@ categories = ["multimedia::audio"]
 license = "MIT OR Apache-2.0"
 
 [dependencies]
+qwen3-tts-core = { path = "../qwen3-tts-core" }
 mlx-rs = { path = "../mlx-rs" }
 mlx-sys = { path = "../mlx-rs/mlx-sys" }
 mlx-rs-core = { path = "../mlx-rs-core" }
