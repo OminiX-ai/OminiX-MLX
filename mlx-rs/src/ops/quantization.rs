@@ -152,56 +152,6 @@ pub fn dequantize_device(
     })
 }
 
-/// Perform matrix multiplication with gathered indices.
-///
-/// This operation allows efficient batched matrix multiplication where different
-/// rows/columns of the matrices are selected for each element. Useful for Mixture
-/// of Experts models where different experts are selected per token.
-///
-/// # Arguments
-/// * `a` - First input array
-/// * `b` - Second input array
-/// * `lhs_indices` - Optional indices for selecting rows from `a`
-/// * `rhs_indices` - Optional indices for selecting columns from `b`
-/// * `sorted_indices` - If true, indices are assumed to be sorted for optimization
-#[generate_macro]
-#[default_device]
-pub fn gather_mm_device<'lhs, 'rhs>(
-    a: impl AsRef<Array>,
-    b: impl AsRef<Array>,
-    #[optional] lhs_indices: impl Into<Option<&'lhs Array>>,
-    #[optional] rhs_indices: impl Into<Option<&'rhs Array>>,
-    #[optional] sorted_indices: impl Into<Option<bool>>,
-    #[optional] stream: impl AsRef<Stream>,
-) -> Result<Array> {
-    let a_ptr = a.as_ref().as_ptr();
-    let b_ptr = b.as_ref().as_ptr();
-    let sorted = sorted_indices.into().unwrap_or(false);
-
-    unsafe {
-        let lhs_ptr = lhs_indices
-            .into()
-            .map(|m| m.as_ptr())
-            .unwrap_or(mlx_sys::mlx_array_new());
-        let rhs_ptr = rhs_indices
-            .into()
-            .map(|m| m.as_ptr())
-            .unwrap_or(mlx_sys::mlx_array_new());
-
-        <Array as Guarded>::try_from_op(|res| {
-            mlx_sys::mlx_gather_mm(
-                res,
-                a_ptr,
-                b_ptr,
-                lhs_ptr,
-                rhs_ptr,
-                sorted,
-                stream.as_ref().as_ptr(),
-            )
-        })
-    }
-}
-
 /// Perform quantized matrix multiplication with gathered indices.
 ///
 /// This operation allows efficient batched quantized matrix multiplication where
