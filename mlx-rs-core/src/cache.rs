@@ -1,7 +1,7 @@
 //! KV Cache implementations for LLM inference
 
+use mlx_rs::ops::indexing::{Ellipsis, IndexMutOp, IndexOp};
 use mlx_rs::{error::Exception, ops::concatenate_axis, ops::zeros_dtype, Array};
-use mlx_rs::ops::indexing::{IndexMutOp, IndexOp, Ellipsis};
 
 /// Trait for key-value caches used in attention
 pub trait KeyValueCache {
@@ -13,6 +13,25 @@ pub trait KeyValueCache {
 
     /// Update cache with new keys/values and return full cache contents
     fn update_and_fetch(&mut self, keys: Array, values: Array) -> Result<(Array, Array), Exception>;
+
+    /// Return references to internal key/value arrays for batched eval.
+    fn arrays(&self) -> Vec<&Array> {
+        Vec::new()
+    }
+
+    /// Return the current sliced keys/values up to offset, if populated.
+    fn current_kv(&self) -> Option<(Array, Array)> {
+        None
+    }
+
+    /// Materialize cache arrays to break lazy computation graph chains.
+    fn eval(&self) -> Result<(), Exception> {
+        let arrays = self.arrays();
+        if !arrays.is_empty() {
+            mlx_rs::transforms::eval(arrays)?;
+        }
+        Ok(())
+    }
 
     /// Reset the cache offset to 0 without deallocating buffers.
     /// Default implementation does nothing (for caches that don't support reset).
@@ -33,6 +52,18 @@ where
 
     fn update_and_fetch(&mut self, keys: Array, values: Array) -> Result<(Array, Array), Exception> {
         T::update_and_fetch(self, keys, values)
+    }
+
+    fn arrays(&self) -> Vec<&Array> {
+        T::arrays(self)
+    }
+
+    fn current_kv(&self) -> Option<(Array, Array)> {
+        T::current_kv(self)
+    }
+
+    fn eval(&self) -> Result<(), Exception> {
+        T::eval(self)
     }
 
     fn reset(&mut self) {
@@ -61,6 +92,17 @@ impl KeyValueCache for ConcatKeyValueCache {
 
     fn max_size(&self) -> Option<i32> {
         None
+    }
+
+    fn arrays(&self) -> Vec<&Array> {
+        let mut out = Vec::with_capacity(2);
+        if let Some(ref k) = self.keys {
+            out.push(k);
+        }
+        if let Some(ref v) = self.values {
+            out.push(v);
+        }
+        out
     }
 
     fn update_and_fetch(&mut self, keys: Array, values: Array) -> Result<(Array, Array), Exception> {
@@ -115,7 +157,6 @@ impl KVCache {
             step,
         }
     }
-
 }
 
 impl KeyValueCache for KVCache {
@@ -125,6 +166,27 @@ impl KeyValueCache for KVCache {
 
     fn max_size(&self) -> Option<i32> {
         None
+    }
+
+    fn current_kv(&self) -> Option<(Array, Array)> {
+        match (&self.keys, &self.values) {
+            (Some(k), Some(v)) if self.offset > 0 => Some((
+                k.index((Ellipsis, ..self.offset, ..)),
+                v.index((Ellipsis, ..self.offset, ..)),
+            )),
+            _ => None,
+        }
+    }
+
+    fn arrays(&self) -> Vec<&Array> {
+        let mut out = Vec::with_capacity(2);
+        if let Some(ref k) = self.keys {
+            out.push(k);
+        }
+        if let Some(ref v) = self.values {
+            out.push(v);
+        }
+        out
     }
 
     fn reset(&mut self) {

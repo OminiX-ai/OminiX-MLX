@@ -39,6 +39,7 @@ members = [
     "qwen3-mlx",
     "glm4-mlx",
     "glm4-moe-mlx",
+    "gemma4-mlx",
     "mixtral-mlx",
     "mistral-mlx",
     "qwen-image-mlx",

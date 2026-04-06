@@ -1,0 +1,5 @@
+[target.aarch64-apple-darwin]
+rustflags = [
+  "-C", "link-arg=-mmacosx-version-min=15.0",
+  # or try 14.0 if you're stuck on Sonoma
+]
