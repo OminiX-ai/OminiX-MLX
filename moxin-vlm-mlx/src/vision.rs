@@ -525,30 +525,45 @@ fn load_vit_attention(
     let num_heads = config.num_heads;
     let head_dim = config.head_dim;
 
-    // Combined QKV weight: [3*dim, dim] -> split into 3 x [dim, dim]
-    let qkv_weight = get_weight(weights, &format!("{}.qkv.weight", prefix))?;
-    let qkv_bias = get_weight_opt(weights, &format!("{}.qkv.bias", prefix));
+    // Support both combined qkv and split q_proj/k_proj/v_proj formats
+    let (q_w, k_w, v_w, q_b, k_b, v_b) =
+        if weights.contains_key(&format!("{}.qkv.weight", prefix)) {
+            let qkv_weight = get_weight(weights, &format!("{}.qkv.weight", prefix))?;
+            let qkv_bias = get_weight_opt(weights, &format!("{}.qkv.bias", prefix));
+            let w_parts = qkv_weight.split(3, 0)?;
+            let (qb, kb, vb) = match qkv_bias {
+                Some(b) => {
+                    let parts = b.split(3, 0)?;
+                    (Some(parts[0].clone()), Some(parts[1].clone()), Some(parts[2].clone()))
+                }
+                None => (None, None, None),
+            };
+            (w_parts[0].clone(), w_parts[1].clone(), w_parts[2].clone(), qb, kb, vb)
+        } else {
+            (
+                get_weight(weights, &format!("{}.q_proj.weight", prefix))?,
+                get_weight(weights, &format!("{}.k_proj.weight", prefix))?,
+                get_weight(weights, &format!("{}.v_proj.weight", prefix))?,
+                get_weight_opt(weights, &format!("{}.q_proj.bias", prefix)),
+                get_weight_opt(weights, &format!("{}.k_proj.bias", prefix)),
+                get_weight_opt(weights, &format!("{}.v_proj.bias", prefix)),
+            )
+        };
 
-    let w_parts = qkv_weight.split(3, 0)?;
-    let b_parts = match &qkv_bias {
-        Some(b) => {
-            let parts = b.split(3, 0)?;
-            vec![
-                Some(parts[0].clone()),
-                Some(parts[1].clone()),
-                Some(parts[2].clone()),
-            ]
-        }
-        None => vec![None, None, None],
+    // Support both "proj" and "out_proj" naming
+    let out_proj_key = if weights.contains_key(&format!("{}.proj.weight", prefix)) {
+        format!("{}.proj", prefix)
+    } else {
+        format!("{}.out_proj", prefix)
     };
 
     Ok(ViTAttention {
-        q_proj: make_linear(w_parts[0].clone(), b_parts[0].clone()),
-        k_proj: make_linear(w_parts[1].clone(), b_parts[1].clone()),
-        v_proj: make_linear(w_parts[2].clone(), b_parts[2].clone()),
+        q_proj: make_linear(q_w, q_b),
+        k_proj: make_linear(k_w, k_b),
+        v_proj: make_linear(v_w, v_b),
         out_proj: make_linear(
-            get_weight(weights, &format!("{}.proj.weight", prefix))?,
-            get_weight_opt(weights, &format!("{}.proj.bias", prefix)),
+            get_weight(weights, &format!("{}.weight", out_proj_key))?,
+            get_weight_opt(weights, &format!("{}.bias", out_proj_key)),
         ),
         num_heads,
         head_dim,

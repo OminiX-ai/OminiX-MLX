@@ -14,7 +14,7 @@
 //!        [B, 256, 4096]  (256 visual tokens)
 //!              |
 //!   BOS + [visual tokens] + text tokens
-//!              | Mistral-7B decoder (36 layers)
+//!              | Moxin-7B LLM decoder (Mistral architecture, 36 layers)
 //!        logits -> autoregressive generation
 //! ```
 
@@ -572,6 +572,38 @@ fn make_linear(weight: Array, bias: Option<Array>) -> MaybeQuantized<nn::Linear>
     })
 }
 
+/// Load a linear layer that may already be stored in quantized form
+/// (inner.weight + scales + biases keys) or as a plain weight.
+fn get_maybe_quantized_linear(
+    weights: &HashMap<String, Array>,
+    prefix: &str,
+    group_size: i32,
+    bits: i32,
+) -> Result<MaybeQuantized<nn::Linear>> {
+    let inner_key = format!("{}.inner.weight", prefix);
+    if weights.contains_key(&inner_key) {
+        let inner_weight = get_weight(weights, &inner_key)?;
+        let scales = get_weight(weights, &format!("{}.scales", prefix))?;
+        let biases = get_weight(weights, &format!("{}.biases", prefix))?;
+        let bias = weights.get(&format!("{}.inner.bias", prefix)).cloned();
+        let inner = nn::Linear {
+            weight: Param::new(inner_weight),
+            bias: Param::new(bias),
+        };
+        Ok(MaybeQuantized::Quantized(nn::QuantizedLinear {
+            group_size,
+            bits,
+            scales: Param::new(scales),
+            biases: Param::new(biases),
+            inner,
+        }))
+    } else {
+        let weight = get_weight(weights, &format!("{}.weight", prefix))?;
+        let bias = weights.get(&format!("{}.bias", prefix)).cloned();
+        Ok(make_linear(weight, bias))
+    }
+}
+
 fn load_all_weights(model_dir: &Path) -> Result<HashMap<String, Array>> {
     // Try sharded safetensors
     let index_path = model_dir.join("model.safetensors.index.json");
@@ -618,6 +650,20 @@ pub fn load_model(model_dir: impl AsRef<Path>) -> Result<MoxinVLM> {
         MistralConfig::default()
     };
 
+    // Read quantization config if present (for pre-quantized models)
+    let (q_group_size, q_bits) = {
+        let qcfg_path = model_dir.join("quantize_config.json");
+        if qcfg_path.exists() {
+            if let Ok(s) = std::fs::read_to_string(&qcfg_path) {
+                if let Ok(v) = serde_json::from_str::<serde_json::Value>(&s) {
+                    let gs = v["quantization"]["group_size"].as_i64().unwrap_or(64) as i32;
+                    let b = v["quantization"]["bits"].as_i64().unwrap_or(8) as i32;
+                    (gs, b)
+                } else { (64, 8) }
+            } else { (64, 8) }
+        } else { (64, 8) }
+    };
+
     eprintln!("Loading Moxin-7B VLM...");
     let weights = load_all_weights(model_dir)?;
 
@@ -653,9 +699,9 @@ pub fn load_model(model_dir: impl AsRef<Path>) -> Result<MoxinVLM> {
     eprintln!("  Loading projector...");
     let projector = projector::load_projector(&weights, "projector")?;
 
-    // Load LLM decoder
+    // Load LLM decoder (Moxin-7B LLM, Mistral architecture)
     eprintln!(
-        "  Loading Mistral-7B decoder ({} layers)...",
+        "  Loading Moxin-7B LLM decoder ({} layers)...",
         llm_config.num_hidden_layers
     );
 
@@ -679,22 +725,10 @@ pub fn load_model(model_dir: impl AsRef<Path>) -> Result<MoxinVLM> {
             n_kv_heads,
             head_dim,
             scale: (head_dim as f32).powf(-0.5),
-            q_proj: make_linear(
-                get_weight(&weights, &format!("{}.self_attn.q_proj.weight", lp))?,
-                None,
-            ),
-            k_proj: make_linear(
-                get_weight(&weights, &format!("{}.self_attn.k_proj.weight", lp))?,
-                None,
-            ),
-            v_proj: make_linear(
-                get_weight(&weights, &format!("{}.self_attn.v_proj.weight", lp))?,
-                None,
-            ),
-            o_proj: make_linear(
-                get_weight(&weights, &format!("{}.self_attn.o_proj.weight", lp))?,
-                None,
-            ),
+            q_proj: get_maybe_quantized_linear(&weights, &format!("{}.self_attn.q_proj", lp), q_group_size, q_bits)?,
+            k_proj: get_maybe_quantized_linear(&weights, &format!("{}.self_attn.k_proj", lp), q_group_size, q_bits)?,
+            v_proj: get_maybe_quantized_linear(&weights, &format!("{}.self_attn.v_proj", lp), q_group_size, q_bits)?,
+            o_proj: get_maybe_quantized_linear(&weights, &format!("{}.self_attn.o_proj", lp), q_group_size, q_bits)?,
             rope: nn::RopeBuilder::new(head_dim)
                 .traditional(false)
                 .base(llm_config.rope_theta)
@@ -703,18 +737,9 @@ pub fn load_model(model_dir: impl AsRef<Path>) -> Result<MoxinVLM> {
         };
 
         let mlp = LLMFeedForward {
-            gate_proj: make_linear(
-                get_weight(&weights, &format!("{}.mlp.gate_proj.weight", lp))?,
-                None,
-            ),
-            up_proj: make_linear(
-                get_weight(&weights, &format!("{}.mlp.up_proj.weight", lp))?,
-                None,
-            ),
-            down_proj: make_linear(
-                get_weight(&weights, &format!("{}.mlp.down_proj.weight", lp))?,
-                None,
-            ),
+            gate_proj: get_maybe_quantized_linear(&weights, &format!("{}.mlp.gate_proj", lp), q_group_size, q_bits)?,
+            up_proj: get_maybe_quantized_linear(&weights, &format!("{}.mlp.up_proj", lp), q_group_size, q_bits)?,
+            down_proj: get_maybe_quantized_linear(&weights, &format!("{}.mlp.down_proj", lp), q_group_size, q_bits)?,
         };
 
         layers.push(LLMBlock {
@@ -751,10 +776,7 @@ pub fn load_model(model_dir: impl AsRef<Path>) -> Result<MoxinVLM> {
             None,
         )
     } else {
-        make_linear(
-            get_weight(&weights, &format!("{}.lm_head.weight", llm_prefix))?,
-            None,
-        )
+        get_maybe_quantized_linear(&weights, &format!("{}.lm_head", llm_prefix), q_group_size, q_bits)?
     };
 
     eprintln!("Model loaded successfully.");
