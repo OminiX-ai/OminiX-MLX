@@ -194,6 +194,86 @@ impl Synthesizer {
         })
     }
 
+    /// Swap the talker (and voice-cloning encoders) to a different model variant,
+    /// keeping the shared decoder, tokenizer, and sample rate.
+    ///
+    /// This is much faster than a full `load()` because the speech tokenizer
+    /// decoder (~651 MB) and BPE tokenizer are reused. Only the talker weights
+    /// (~2.2-2.3 GB) plus optional speaker/speech encoders are reloaded.
+    pub fn swap_talker(&mut self, model_dir: impl AsRef<Path>) -> Result<()> {
+        let model_dir = model_dir.as_ref();
+
+        info!("Swapping talker from model dir: {}", model_dir.display());
+
+        // Load new configs
+        let tts_config = Qwen3TtsConfig::load(model_dir)?;
+        let gen_config = GenerationConfig::load(model_dir)?;
+        let quant = tts_config.quant_config().cloned();
+
+        // Load new talker first, then swap — if loading fails we keep the old one.
+        if let Some(ref q) = quant {
+            info!("Loading talker model ({}-bit)...", q.bits);
+        } else {
+            info!("Loading talker model (float)...");
+        }
+        let new_talker = talker::load_talker(
+            model_dir,
+            &tts_config.talker_config,
+            quant.as_ref(),
+            tts_config.tts_pad_token_id,
+        )?;
+
+        // Success — drop old talker + encoders and install new one
+        self.speaker_encoder = None;
+        self.speech_encoder = None;
+        self.talker = new_talker;
+
+        // Load voice-cloning encoders if Base model
+        let model_type = tts_config.model_type();
+        if model_type == config::ModelType::Base {
+            info!("Loading speaker encoder (ECAPA-TDNN)...");
+            let weights = talker::load_all_weights(model_dir)?;
+
+            if speaker_encoder::has_speaker_encoder_weights(&weights) {
+                let enc_dim = tts_config
+                    .speaker_encoder_config
+                    .as_ref()
+                    .map(|c| c.enc_dim)
+                    .unwrap_or(tts_config.talker_config.hidden_size);
+                let se_config = speaker_encoder::SpeakerEncoderConfig::from_enc_dim(enc_dim);
+                match speaker_encoder::load_speaker_encoder(&weights, &se_config) {
+                    Ok(enc) => {
+                        info!("Speaker encoder loaded (enc_dim={})", enc_dim);
+                        self.speaker_encoder = Some(enc);
+                    }
+                    Err(e) => tracing::warn!("Failed to load speaker encoder: {}", e),
+                }
+            }
+
+            // Load speech encoder (Mimi) for ICL voice cloning
+            let st_model_path = model_dir.join("speech_tokenizer").join("model.safetensors");
+            if st_model_path.exists() {
+                info!("Loading speech encoder (Mimi) for ICL voice cloning...");
+                let st_weights = mlx_rs::Array::load_safetensors(&st_model_path)?;
+                if speech_encoder::has_encoder_weights(&st_weights) {
+                    match speech_encoder::load_speech_encoder(&st_weights) {
+                        Ok(enc) => {
+                            info!("Speech encoder (Mimi) loaded");
+                            self.speech_encoder = Some(enc);
+                        }
+                        Err(e) => tracing::warn!("Failed to load speech encoder: {}", e),
+                    }
+                }
+            }
+        }
+
+        self.tts_config = tts_config;
+        self.gen_config = gen_config;
+
+        info!("Talker swapped successfully (type: {})", model_type);
+        Ok(())
+    }
+
     /// Detected model type (Base, CustomVoice, VoiceDesign).
     pub fn model_type(&self) -> config::ModelType {
         self.tts_config.model_type()
