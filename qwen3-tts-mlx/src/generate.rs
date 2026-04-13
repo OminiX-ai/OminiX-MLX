@@ -15,12 +15,18 @@
 use std::time::Instant;
 
 use mlx_rs::{module::Module, ops::indexing::IndexOp, transforms::eval, Array};
-use tracing::info;
+use tracing::{info, warn};
 
 use crate::config::{GenerationConfig, Qwen3TtsConfig, TalkerConfig};
 use crate::error::Result;
 use crate::sampling::{build_eos_suppression_mask, build_eos_unit_mask, build_suppression_mask, compute_eos_steering_bias, sample_logits_with_mask, RepetitionPenaltyMask, SamplingKey};
 use crate::talker::Talker;
+
+// ── Repetition loop detection constants ─────────────────────────────────────
+/// Window size (in codec frames) for repetition detection. ~2s at 12Hz.
+const REPEAT_WINDOW: usize = 24;
+/// If this many frames in the window share the same token0, it's a loop.
+const REPEAT_THRESHOLD: usize = 20;
 
 /// Average ratio of generated codec frames to text tokens.
 /// Empirically determined from Chinese text: ~4.0 frames per text token.
@@ -157,6 +163,10 @@ fn run_generation_loop(
 
     let mut all_codes: Vec<[u32; 16]> = Vec::new();
 
+    // Repetition loop detection: if the same token0 repeats too many times
+    // in a window, the model is stuck — break early and return what we have.
+    let mut recent_tokens: Vec<u32> = Vec::new();
+
     for step in 0..params.max_new_tokens {
         let base_mask = if step < min_new_tokens {
             &combined_mask
@@ -202,6 +212,27 @@ fn run_generation_loop(
         }
 
         penalty_mask.record_token(token0)?;
+
+        // Repetition loop detection
+        recent_tokens.push(token0);
+        if recent_tokens.len() > REPEAT_WINDOW {
+            recent_tokens.remove(0);
+        }
+        if recent_tokens.len() == REPEAT_WINDOW && step >= params.trailing_len {
+            // Count most frequent token in the window
+            let mut counts = std::collections::HashMap::new();
+            for &t in &recent_tokens {
+                *counts.entry(t).or_insert(0usize) += 1;
+            }
+            let max_count = counts.values().copied().max().unwrap_or(0);
+            if max_count >= REPEAT_THRESHOLD {
+                warn!(
+                    "Repetition loop detected at step {} (token {} repeated {}/{} times), stopping early",
+                    step, recent_tokens.last().unwrap_or(&0), max_count, REPEAT_WINDOW
+                );
+                break;
+            }
+        }
 
         // Generate codebooks 1-15 via code predictor
         let hidden_slice = hidden.index((.., -1.., ..));
@@ -358,13 +389,9 @@ pub fn generate(
     let gen_start = Instant::now();
     let vocab_size = tts_config.talker_config.vocab_size as usize;
     let speed = gen_config.speed_factor;
-    let eos_steering = if (speed - 1.0).abs() > 0.01 {
-        let t = (trailing_len as f32 * AVG_FRAMES_PER_TEXT_TOKEN / speed) as usize;
-        info!("EOS steering: target_frames={}, speed={:.2}x, trailing_len={}", t, speed, trailing_len);
-        Some((t, speed))
-    } else {
-        None
-    };
+    let target_frames = (trailing_len as f32 * AVG_FRAMES_PER_TEXT_TOKEN / speed) as usize;
+    info!("EOS steering: target_frames={}, speed={:.2}x, trailing_len={}", target_frames, speed, trailing_len);
+    let eos_steering = Some((target_frames, speed));
 
     let params = GenerationLoopParams {
         trailing_len,
@@ -458,6 +485,9 @@ pub fn generate_voice_design(
     // Generation loop (delegates to shared loop)
     let gen_start = Instant::now();
     let vocab_size = tts_config.talker_config.vocab_size as usize;
+    let speed = gen_config.speed_factor;
+    let target_frames = (trailing_len as f32 * AVG_FRAMES_PER_TEXT_TOKEN / speed) as usize;
+    let eos_steering = Some((target_frames, speed));
 
     let params = GenerationLoopParams {
         trailing_len,
@@ -468,7 +498,7 @@ pub fn generate_voice_design(
         top_p: gen_config.top_p,
         repetition_penalty: gen_config.repetition_penalty,
         max_new_tokens: gen_config.max_new_tokens as usize,
-        eos_steering: None,
+        eos_steering,
     };
 
     let all_codes = run_generation_loop(
@@ -535,12 +565,8 @@ pub fn generate_voice_clone_instruct(
     let gen_start = Instant::now();
     let vocab_size = tts_config.talker_config.vocab_size as usize;
     let speed = gen_config.speed_factor;
-    let eos_steering = if (speed - 1.0).abs() > 0.01 {
-        let t = (trailing_len as f32 * AVG_FRAMES_PER_TEXT_TOKEN / speed) as usize;
-        Some((t, speed))
-    } else {
-        None
-    };
+    let target_frames = (trailing_len as f32 * AVG_FRAMES_PER_TEXT_TOKEN / speed) as usize;
+    let eos_steering = Some((target_frames, speed));
 
     let params = GenerationLoopParams {
         trailing_len, eos_token, pad_id,
@@ -627,13 +653,9 @@ pub fn generate_voice_clone(
     let gen_start = Instant::now();
     let vocab_size = tts_config.talker_config.vocab_size as usize;
     let speed = gen_config.speed_factor;
-    let eos_steering = if (speed - 1.0).abs() > 0.01 {
-        let t = (trailing_len as f32 * AVG_FRAMES_PER_TEXT_TOKEN / speed) as usize;
-        info!("EOS steering: target_frames={}, speed={:.2}x, trailing_len={}", t, speed, trailing_len);
-        Some((t, speed))
-    } else {
-        None
-    };
+    let target_frames = (trailing_len as f32 * AVG_FRAMES_PER_TEXT_TOKEN / speed) as usize;
+    info!("EOS steering: target_frames={}, speed={:.2}x, trailing_len={}", target_frames, speed, trailing_len);
+    let eos_steering = Some((target_frames, speed));
 
     let params = GenerationLoopParams {
         trailing_len,
@@ -756,6 +778,9 @@ pub fn generate_voice_clone_icl(
     // Phase 3: Autoregressive generation (delegates to shared loop)
     let gen_start = Instant::now();
     let vocab_size = tts_config.talker_config.vocab_size as usize;
+    let speed = gen_config.speed_factor;
+    let target_frames = (trailing_len as f32 * AVG_FRAMES_PER_TEXT_TOKEN / speed) as usize;
+    let eos_steering = Some((target_frames, speed));
 
     let params = GenerationLoopParams {
         trailing_len,
@@ -766,7 +791,7 @@ pub fn generate_voice_clone_icl(
         top_p: gen_config.top_p,
         repetition_penalty,
         max_new_tokens,
-        eos_steering: None,
+        eos_steering,
     };
 
     let all_codes = run_generation_loop(
@@ -805,6 +830,12 @@ pub struct GenerationState {
     rng_key: Option<SamplingKey>,
     gen_config: GenerationConfig,
     finished: bool,
+    /// Recent token0 values for repetition loop detection
+    recent_tokens: Vec<u32>,
+    /// EOS steering: (target_frames, speed_factor)
+    eos_steering: (usize, f32),
+    /// Unit mask for EOS logit steering
+    eos_unit_mask: Array,
 }
 
 impl GenerationState {
@@ -878,6 +909,11 @@ impl GenerationState {
         let combined_mask = suppress_mask.add(&eos_suppress_mask)?;
         let penalty_mask = RepetitionPenaltyMask::new(vocab_size, gen_config.repetition_penalty)?;
 
+        // EOS steering (always enabled — anti-loop at speed=1.0, full control otherwise)
+        let speed = gen_config.speed_factor;
+        let target_frames = (trailing_len as f32 * AVG_FRAMES_PER_TEXT_TOKEN / speed) as usize;
+        let eos_unit_mask = build_eos_unit_mask(vocab_size, eos_token);
+
         Ok(Self {
             logits,
             hidden,
@@ -895,6 +931,9 @@ impl GenerationState {
             rng_key,
             gen_config: gen_config.clone(),
             finished: false,
+            recent_tokens: Vec::new(),
+            eos_steering: (target_frames, speed),
+            eos_unit_mask,
         })
     }
 
@@ -916,10 +955,26 @@ impl GenerationState {
                 break;
             }
 
-            let mask = if self.step < self.min_new_tokens {
+            let base_mask = if self.step < self.min_new_tokens {
                 &self.combined_mask
             } else {
                 &self.suppress_mask
+            };
+
+            // Apply EOS steering bias
+            let steered;
+            let mask: &Array = if self.step >= self.min_new_tokens {
+                let (target, speed) = self.eos_steering;
+                let bias = compute_eos_steering_bias(self.step, target, speed);
+                if bias.abs() > 0.01 {
+                    let bias_arr = self.eos_unit_mask.multiply(mlx_rs::array!(bias))?;
+                    steered = base_mask.add(&bias_arr)?;
+                    &steered
+                } else {
+                    base_mask
+                }
+            } else {
+                base_mask
             };
 
             let token0 = sample_logits_with_mask(
@@ -941,6 +996,27 @@ impl GenerationState {
             }
 
             self.penalty_mask.record_token(token0)?;
+
+            // Repetition loop detection (same logic as run_generation_loop)
+            self.recent_tokens.push(token0);
+            if self.recent_tokens.len() > REPEAT_WINDOW {
+                self.recent_tokens.remove(0);
+            }
+            if self.recent_tokens.len() == REPEAT_WINDOW && self.step >= self.trailing_len {
+                let mut counts = std::collections::HashMap::new();
+                for &t in &self.recent_tokens {
+                    *counts.entry(t).or_insert(0usize) += 1;
+                }
+                let max_count = counts.values().copied().max().unwrap_or(0);
+                if max_count >= REPEAT_THRESHOLD {
+                    warn!(
+                        "Repetition loop detected at step {} (token repeated {}/{} times), stopping early",
+                        self.step, max_count, REPEAT_WINDOW
+                    );
+                    self.finished = true;
+                    break;
+                }
+            }
 
             // Code predictor: codebooks 1-15
             let hidden_slice = self.hidden.index((.., -1.., ..));

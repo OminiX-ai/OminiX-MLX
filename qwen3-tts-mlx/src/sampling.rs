@@ -36,43 +36,68 @@ pub fn build_eos_unit_mask(vocab_size: usize, eos_token: u32) -> Array {
 
 /// Compute EOS logit steering bias for a given generation step.
 ///
-/// Based on the "Segment-Aware Conditioning" approach (arxiv 2601.03170):
-/// - Before 60% of target: suppress EOS (negative bias)
-/// - 60%-100% of target: linear ramp from suppression to neutral
-/// - 100%-140% of target: linear ramp from neutral to encouragement
-/// - After 140% of target: strong EOS encouragement
+/// Two modes based on speed_factor:
+///
+/// **Speed control mode** (speed != 1.0):
+///   Based on "Segment-Aware Conditioning" (arxiv 2601.03170):
+///   - Before 60% of target: suppress EOS (negative bias)
+///   - 60%-100% of target: linear ramp from suppression to neutral
+///   - 100%-140% of target: linear ramp from neutral to encouragement
+///   - After 140% of target: strong EOS encouragement
+///
+/// **Anti-loop mode** (speed == 1.0):
+///   No early suppression — let the model decide naturally.
+///   After the expected frame count, gently encourage EOS to prevent
+///   generation loops from quantized models overshooting past text.
+///   - Before target: no bias (0.0)
+///   - 100%-150% of target: gentle linear ramp (0 → 15)
+///   - After 150% of target: strong encouragement (40)
 ///
 /// Returns a bias value to multiply with the EOS unit mask.
 pub fn compute_eos_steering_bias(step: usize, target_frames: usize, speed_factor: f32) -> f32 {
-    if (speed_factor - 1.0).abs() < 0.01 || target_frames == 0 {
+    if target_frames == 0 {
         return 0.0;
     }
 
     let t = step as f32;
     let target = target_frames as f32;
 
-    // The model's EOS logit is typically very negative (-20 to -40) during
-    // active speech, so we need strong biases to have any effect.
-    let suppress_strength = -30.0; // suppress EOS before target
-    let encourage_strength = 40.0; // encourage EOS after target
+    if (speed_factor - 1.0).abs() < 0.01 {
+        // Anti-loop mode: no suppression, gentle encouragement after target
+        let soft_end = 1.3 * target;
+        let hard_end = 1.6 * target;
+        let soft_strength = 25.0;
+        let hard_strength = 40.0;
 
-    let phase_start = 0.6 * target; // start ramping from suppression
-    let phase_end = 1.4 * target; // max encouragement
-
-    if t < phase_start {
-        // Strong EOS suppression — don't stop early
-        suppress_strength
-    } else if t < target {
-        // Linear ramp: suppress → neutral
-        let progress = (t - phase_start) / (target - phase_start);
-        suppress_strength * (1.0 - progress)
-    } else if t < phase_end {
-        // Linear ramp: neutral → encourage
-        let progress = (t - target) / (phase_end - target);
-        encourage_strength * progress
+        if t < target {
+            0.0
+        } else if t < soft_end {
+            let progress = (t - target) / (soft_end - target);
+            soft_strength * progress
+        } else if t < hard_end {
+            let progress = (t - soft_end) / (hard_end - soft_end);
+            soft_strength + (hard_strength - soft_strength) * progress
+        } else {
+            hard_strength
+        }
     } else {
-        // Strong EOS encouragement — time to stop
-        encourage_strength
+        // Speed control mode: full suppress/encourage curve
+        let suppress_strength = -30.0;
+        let encourage_strength = 40.0;
+        let phase_start = 0.6 * target;
+        let phase_end = 1.4 * target;
+
+        if t < phase_start {
+            suppress_strength
+        } else if t < target {
+            let progress = (t - phase_start) / (target - phase_start);
+            suppress_strength * (1.0 - progress)
+        } else if t < phase_end {
+            let progress = (t - target) / (phase_end - target);
+            encourage_strength * progress
+        } else {
+            encourage_strength
+        }
     }
 }
 
