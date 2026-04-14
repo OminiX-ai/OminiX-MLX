@@ -307,6 +307,8 @@ pub struct CodePredictor {
     pub lm_heads: Vec<MaybeQuantized<nn::Linear>>, // 15 heads
     pub small_to_mtp_projection: MaybeQuantized<nn::Linear>,
     pub mtp_proj_bias: Option<Array>,
+    /// Persistent KV caches — reset per time step, not re-allocated.
+    caches: Vec<KVCache>,
 }
 
 impl CodePredictor {
@@ -333,33 +335,32 @@ impl CodePredictor {
         // Concatenate to form 2-token prefill: [past_hidden, code0_embed]
         let prefill_input =
             mlx_rs::ops::concatenate_axis(&[&proj_hidden, &proj_code0], 1)?;
-        eval(std::iter::once(&prefill_input))?;
 
-        // Initialize KV caches for code predictor (fresh per time step)
-        let mut caches: Vec<KVCache> = (0..self.layers.len())
-            .map(|_| KVCache::new())
-            .collect();
+        // Reset persistent KV caches (avoids re-allocation each step)
+        if self.caches.is_empty() {
+            self.caches = (0..self.layers.len()).map(|_| KVCache::new()).collect();
+        } else {
+            for cache in &mut self.caches {
+                cache.reset();
+            }
+        }
 
-        // Prefill with 2 tokens
+        // Prefill with 2 tokens — build full lazy graph through layers + norm + head
         let mut current_output = prefill_input;
-        for (layer, cache) in self.layers.iter_mut().zip(caches.iter_mut()) {
+        for (layer, cache) in self.layers.iter_mut().zip(self.caches.iter_mut()) {
             current_output = layer.forward(&current_output, None, cache)?;
         }
-        eval(std::iter::once(&current_output))?;
-
-        // Sample codebook 1 from last position (code0 position) logits
         let normed = self.norm.forward(&current_output)?;
         use mlx_rs::ops::indexing::IndexOp;
-        let last_normed = normed.index((.., -1.., ..)); // [B, 1, 1024]
+        let last_normed = normed.index((.., -1.., ..));
         let logits = self.lm_heads[0].forward(&last_normed)?;
-        eval([&logits])?;
-        // Greedy decoding (argmax)
-        let token = sample_logits(&logits, 0.0, 0, 1.0, 1.0, &[], None)?;
-        codes.push(token);
+        // Single eval: triggers prefill + norm + logits + argmax in one GPU dispatch
+        let token = mlx_rs::ops::indexing::argmax_axis(&logits.squeeze()?, -1, None)?;
+        eval(std::iter::once(&token))?;
+        codes.push(token.item::<u32>());
 
-        // Autoregressive for codebooks 2-15
+        // Autoregressive for codebooks 2-15: one eval per group (down from 3)
         for g in 1..15 {
-            // Embed previous token through codec_embeddings[g-1] → project to 1024
             let token_arr = Array::from_slice(&[codes[g - 1] as i32], &[1, 1]);
             let embed = self.codec_embeddings[g - 1].forward(&token_arr)?;
             let mut current_input = self.small_to_mtp_projection.forward(&embed)?;
@@ -367,17 +368,15 @@ impl CodePredictor {
                 current_input = current_input.add(bias)?;
             }
 
-            for (layer, cache) in self.layers.iter_mut().zip(caches.iter_mut()) {
+            for (layer, cache) in self.layers.iter_mut().zip(self.caches.iter_mut()) {
                 current_input = layer.forward(&current_input, None, cache)?;
             }
-            eval(std::iter::once(&current_input))?;
-
+            // Build full lazy graph: layers + norm + head + argmax → single eval
             let normed = self.norm.forward(&current_input)?;
             let logits = self.lm_heads[g].forward(&normed)?;
-            eval([&logits])?;
-            // Greedy decoding (argmax)
-            let token = sample_logits(&logits, 0.0, 0, 1.0, 1.0, &[], None)?;
-            codes.push(token);
+            let token = mlx_rs::ops::indexing::argmax_axis(&logits.squeeze()?, -1, None)?;
+            eval(std::iter::once(&token))?;
+            codes.push(token.item::<u32>());
         }
 
         Ok(codes)
@@ -1315,6 +1314,7 @@ pub fn load_talker(model_dir: &Path, config: &TalkerConfig, quant: Option<&Quant
         lm_heads,
         small_to_mtp_projection: mtp_proj,
         mtp_proj_bias,
+        caches: Vec::new(), // lazily initialized on first use
     };
 
     let num_layers = layers.len();

@@ -263,7 +263,8 @@ fn run_generation_loop(
         let result = talker.forward_step(input_embed)?;
         logits = result.0;
         hidden = result.1;
-        eval([&logits])?;
+        // No eval here — let the lazy graph build up.
+        // Next iteration's sample_logits_with_mask will eval when it needs the token value.
 
         if step > 0 && step % 256 == 0 {
             unsafe { mlx_sys::mlx_clear_cache() };
@@ -1047,7 +1048,7 @@ impl GenerationState {
             let result = talker.forward_step(input_embed)?;
             self.logits = result.0;
             self.hidden = result.1;
-            eval([&self.logits])?;
+            // No eval — let lazy graph build up for next iteration's sampling.
 
             self.step += 1;
 
