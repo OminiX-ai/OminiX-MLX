@@ -722,15 +722,11 @@ impl Qwen3ASR {
         input_ids: &Array,
         audio_features: &Array,
     ) -> Result<Array> {
-        // Get text embeddings for all tokens
-        let embeddings = self.model.get_token_embeddings(input_ids)?;
-        eval([&embeddings])?;
-
-        // Find audio_pad token positions
+        // Find audio_pad token positions first (input_ids is already concrete from from_slice)
         let audio_token_id = self.config.audio_token_id;
 
         let ids_flat = input_ids.reshape(&[-1])?;
-        eval([&ids_flat])?;
+        // input_ids was built from Array::from_slice — already materialized, no eval needed
         let ids_data: &[i32] = ids_flat.try_as_slice::<i32>()
             .map_err(|e| Error::Inference(format!("Failed to read input_ids: {}", e)))?;
 
@@ -744,6 +740,9 @@ impl Qwen3ASR {
                 last_audio = Some(i);
             }
         }
+
+        // Get text embeddings (lazy — eval deferred to concatenation)
+        let embeddings = self.model.get_token_embeddings(input_ids)?;
 
         if let (Some(first), Some(last)) = (first_audio, last_audio) {
             let audio_start = first as i32;

@@ -219,7 +219,6 @@ fn run_generation_loop(
             recent_tokens.remove(0);
         }
         if recent_tokens.len() == REPEAT_WINDOW && step >= params.trailing_len {
-            // Count most frequent token in the window
             let mut counts = std::collections::HashMap::new();
             for &t in &recent_tokens {
                 *counts.entry(t).or_insert(0usize) += 1;
@@ -263,8 +262,6 @@ fn run_generation_loop(
         let result = talker.forward_step(input_embed)?;
         logits = result.0;
         hidden = result.1;
-        // No eval here — let the lazy graph build up.
-        // Next iteration's sample_logits_with_mask will eval when it needs the token value.
 
         if step > 0 && step % 256 == 0 {
             unsafe { mlx_sys::mlx_clear_cache() };
