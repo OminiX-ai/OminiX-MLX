@@ -311,12 +311,8 @@ impl VisionAttention {
             .reshape(&[1, n, self.num_heads, self.head_dim])?
             .transpose_axes(&[0, 2, 1, 3])?;
 
-        // Scaled dot-product attention (full, no mask)
-        let scale = array!(self.scale);
-        let scores = q.matmul(&k.transpose_axes(&[0, 1, 3, 2])?)?.multiply(&scale)?;
-        let attn = mlx_rs::ops::softmax_axis(&scores, -1, None)?;
-        let out = attn
-            .matmul(&v)?
+        // Use MLX SDPA — avoids materializing full attention matrix
+        let out = mlx_rs::fast::scaled_dot_product_attention(q, k, v, self.scale, None)?
             .transpose_axes(&[0, 2, 1, 3])?
             .reshape(&[n, hidden])?;
 

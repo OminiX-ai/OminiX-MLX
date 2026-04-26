@@ -98,11 +98,9 @@ impl Qwen2Attention {
             v
         };
 
-        // Attention with custom mask
-        let attn = q.matmul(&k.transpose_axes(&[0, 1, 3, 2])?)?.multiply(mlx_rs::array!(self.scale))?;
-        let attn = attn.add(mask)?;
-        let attn = ops::softmax_axis(&attn, -1, true)?;
-        let out = attn.matmul(&v)?;
+        // Use MLX SDPA with additive mask — avoids materializing full attention matrix
+        let mask_ref = mlx_rs::fast::ScaledDotProductAttentionMask::Array(mask);
+        let out = mlx_rs::fast::scaled_dot_product_attention(q, k, v, self.scale, Some(mask_ref))?;
 
         let out = out
             .transpose_axes(&[0, 2, 1, 3])?
