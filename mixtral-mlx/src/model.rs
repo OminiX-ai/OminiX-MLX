@@ -24,6 +24,7 @@ use mlx_rs_core::{
     cache::KeyValueCache,
     error::Error,
     fused_swiglu,
+    memory::MemoryGuard,
     utils::{create_attention_mask, scaled_dot_product_attention, AttentionMask, SdpaMask},
 };
 
@@ -632,6 +633,7 @@ pub struct Generate<'a, C> {
     state: GenerateState<'a>,
     prefetched: Option<Array>,
     token_count: usize,
+    mem_guard: MemoryGuard,
 }
 
 pub enum GenerateState<'a> {
@@ -641,7 +643,7 @@ pub enum GenerateState<'a> {
 
 impl<'a, C: KeyValueCache + Default> Generate<'a, C> {
     pub fn new(model: &'a mut Model, cache: &'a mut Vec<Option<C>>, temp: f32, prompt_token: &'a Array) -> Self {
-        Self { model, cache, temp, state: GenerateState::Prefill { prompt_token }, prefetched: None, token_count: 0 }
+        Self { model, cache, temp, state: GenerateState::Prefill { prompt_token }, prefetched: None, token_count: 0, mem_guard: MemoryGuard::default_guard() }
     }
 
     fn compute_next(&mut self, y: &Array) -> std::result::Result<Array, Exception> {
@@ -683,9 +685,7 @@ impl<'a, C: KeyValueCache + Default> Iterator for Generate<'a, C> {
                 self.prefetched = Some(next_y);
 
                 self.token_count += 1;
-                if self.token_count % 256 == 0 {
-                    unsafe { mlx_sys::mlx_clear_cache(); }
-                }
+                self.mem_guard.step();
                 Some(Ok(current))
             }
         }

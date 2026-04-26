@@ -162,6 +162,7 @@ fn run_generation_loop(
     };
 
     let mut all_codes: Vec<[u32; 16]> = Vec::new();
+    let mut mem_guard = mlx_rs_core::memory::MemoryGuard::default_guard();
 
     // Repetition loop detection: if the same token0 repeats too many times
     // in a window, the model is stuck — break early and return what we have.
@@ -263,9 +264,7 @@ fn run_generation_loop(
         logits = result.0;
         hidden = result.1;
 
-        if step > 0 && step % 256 == 0 {
-            unsafe { mlx_sys::mlx_clear_cache() };
-        }
+        mem_guard.step();
     }
 
     Ok(all_codes)
@@ -834,6 +833,8 @@ pub struct GenerationState {
     eos_steering: (usize, f32),
     /// Unit mask for EOS logit steering
     eos_unit_mask: Array,
+    /// GPU memory guard — adaptive cache clearing
+    mem_guard: mlx_rs_core::memory::MemoryGuard,
 }
 
 impl GenerationState {
@@ -932,6 +933,7 @@ impl GenerationState {
             recent_tokens: Vec::new(),
             eos_steering: (target_frames, speed),
             eos_unit_mask,
+            mem_guard: mlx_rs_core::memory::MemoryGuard::default_guard(),
         })
     }
 
@@ -1049,9 +1051,7 @@ impl GenerationState {
 
             self.step += 1;
 
-            if self.step > 0 && self.step % 256 == 0 {
-                unsafe { mlx_sys::mlx_clear_cache() };
-            }
+            self.mem_guard.step();
         }
 
         if frames.is_empty() {

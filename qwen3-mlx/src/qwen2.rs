@@ -31,6 +31,7 @@ use mlx_rs_core::{
     Error,
     create_attention_mask,
     initialize_rope,
+    memory::MemoryGuard,
     FloatOrString,
     AttentionMask,
     SdpaMask,
@@ -758,6 +759,7 @@ pub struct Generate<'a, C> {
     state: GenerateState<'a>,
     prefetched: Option<Array>,
     token_count: usize,
+    mem_guard: MemoryGuard,
 }
 
 impl<'a, C> Generate<'a, C>
@@ -777,6 +779,7 @@ where
             state: GenerateState::Prefill { prompt_token },
             prefetched: None,
             token_count: 0,
+            mem_guard: MemoryGuard::default_guard(),
         }
     }
 
@@ -846,9 +849,7 @@ where
                 self.prefetched = Some(next_y);
 
                 self.token_count += 1;
-                if self.token_count % 256 == 0 {
-                    unsafe { mlx_sys::mlx_clear_cache(); }
-                }
+                self.mem_guard.step();
 
                 Some(Ok(current))
             }

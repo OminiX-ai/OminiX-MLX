@@ -21,6 +21,7 @@ pub mod convert;
 pub mod cache;
 pub mod error;
 pub mod generate;
+pub mod memory;
 pub mod metal_kernels;
 pub mod sampler;
 pub mod speculative;
@@ -28,7 +29,7 @@ pub mod utils;
 
 pub use cache::{ConcatKeyValueCache, KVCache, KeyValueCache};
 pub use error::{Error, Result};
-pub use metal_kernels::{fused_swiglu, fused_modulate};
+pub use metal_kernels::{flash_attention, fused_modulate, fused_swiglu};
 pub use sampler::{DefaultSampler, Sampler};
 pub use utils::{
     create_attention_mask, initialize_rope, scaled_dot_product_attention,

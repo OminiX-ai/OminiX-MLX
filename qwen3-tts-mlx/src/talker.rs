@@ -34,9 +34,11 @@ pub struct TalkerAttention {
     /// KV cache indexing is unaffected — only the RoPE rotation angles change.
     pub rope_speed_factor: f32,
 
-    pub q_proj: MaybeQuantized<nn::Linear>,
-    pub k_proj: MaybeQuantized<nn::Linear>,
-    pub v_proj: MaybeQuantized<nn::Linear>,
+    /// Merged QKV projection: one quantized_matmul instead of three.
+    /// Output dim = n_heads*head_dim + 2*n_kv_heads*head_dim.
+    pub qkv_proj: MaybeQuantized<nn::Linear>,
+    pub q_dim: i32,  // n_heads * head_dim
+    pub kv_dim: i32, // n_kv_heads * head_dim
     pub o_proj: MaybeQuantized<nn::Linear>,
     pub q_norm: nn::RmsNorm,
     pub k_norm: nn::RmsNorm,
@@ -53,9 +55,13 @@ impl TalkerAttention {
         let b = shape[0];
         let l = shape[1];
 
-        let queries = self.q_proj.forward(x)?;
-        let keys = self.k_proj.forward(x)?;
-        let values = self.v_proj.forward(x)?;
+        // Batched QKV projection: one matmul instead of three
+        let qkv = self.qkv_proj.forward(x)?;
+        let qd = self.q_dim;
+        let kvd = self.kv_dim;
+        let queries = qkv.index((.., .., ..qd));
+        let keys = qkv.index((.., .., qd..(qd + kvd)));
+        let values = qkv.index((.., .., (qd + kvd)..));
 
         // Reshape to [B, L, heads, head_dim] then transpose to [B, heads, L, head_dim]
         let mut queries = self
@@ -198,9 +204,9 @@ pub struct CodePredictorAttention {
     pub head_dim: i32,
     pub scale: f32,
 
-    pub q_proj: MaybeQuantized<nn::Linear>,
-    pub k_proj: MaybeQuantized<nn::Linear>,
-    pub v_proj: MaybeQuantized<nn::Linear>,
+    pub qkv_proj: MaybeQuantized<nn::Linear>,
+    pub q_dim: i32,
+    pub kv_dim: i32,
     pub o_proj: MaybeQuantized<nn::Linear>,
     pub q_norm: nn::RmsNorm,
     pub k_norm: nn::RmsNorm,
@@ -218,9 +224,12 @@ impl CodePredictorAttention {
         let b = shape[0];
         let l = shape[1];
 
-        let queries = self.q_proj.forward(x)?;
-        let keys = self.k_proj.forward(x)?;
-        let values = self.v_proj.forward(x)?;
+        let qkv = self.qkv_proj.forward(x)?;
+        let qd = self.q_dim;
+        let kvd = self.kv_dim;
+        let queries = qkv.index((.., .., ..qd));
+        let keys = qkv.index((.., .., qd..(qd + kvd)));
+        let values = qkv.index((.., .., (qd + kvd)..));
 
         let mut queries = self
             .q_norm
@@ -1067,6 +1076,57 @@ fn make_linear_with_bias(
     Ok((linear, bias))
 }
 
+/// Merge Q/K/V projections into a single batched linear layer.
+/// Concatenates weight/scales/biases along output dim (axis 0).
+fn merge_qkv_projections(
+    weights: &HashMap<String, Array>,
+    prefix: &str,
+    quant: Option<&QuantizationConfig>,
+    _q_dim: i32,
+    _kv_dim: i32,
+) -> Result<MaybeQuantized<nn::Linear>> {
+    use mlx_rs::ops::concatenate_axis;
+
+    if let Some(q) = quant {
+        let q_w = get_weight(weights, &format!("{prefix}.q_proj.weight"))?;
+        let k_w = get_weight(weights, &format!("{prefix}.k_proj.weight"))?;
+        let v_w = get_weight(weights, &format!("{prefix}.v_proj.weight"))?;
+        let q_s = get_weight(weights, &format!("{prefix}.q_proj.scales"))?;
+        let k_s = get_weight(weights, &format!("{prefix}.k_proj.scales"))?;
+        let v_s = get_weight(weights, &format!("{prefix}.v_proj.scales"))?;
+        let q_b = get_weight(weights, &format!("{prefix}.q_proj.biases"))?;
+        let k_b = get_weight(weights, &format!("{prefix}.k_proj.biases"))?;
+        let v_b = get_weight(weights, &format!("{prefix}.v_proj.biases"))?;
+
+        let merged_w = concatenate_axis(&[&q_w, &k_w, &v_w], 0)?;
+        let merged_s = concatenate_axis(&[&q_s, &k_s, &v_s], 0)?;
+        let merged_b = concatenate_axis(&[&q_b, &k_b, &v_b], 0)?;
+
+        let inner = nn::Linear {
+            weight: Param::new(merged_w),
+            bias: Param::new(None),
+        };
+        let mut ql = nn::QuantizedLinear {
+            group_size: q.group_size,
+            bits: q.bits,
+            scales: Param::new(merged_s),
+            biases: Param::new(merged_b),
+            inner,
+        };
+        ql.freeze_parameters(true);
+        Ok(MaybeQuantized::Quantized(ql))
+    } else {
+        let q_w = get_weight(weights, &format!("{prefix}.q_proj.weight"))?;
+        let k_w = get_weight(weights, &format!("{prefix}.k_proj.weight"))?;
+        let v_w = get_weight(weights, &format!("{prefix}.v_proj.weight"))?;
+        let merged_w = concatenate_axis(&[&q_w, &k_w, &v_w], 0)?;
+        Ok(MaybeQuantized::Original(nn::Linear {
+            weight: Param::new(merged_w),
+            bias: Param::new(None),
+        }))
+    }
+}
+
 /// Load a linear layer as MaybeQuantized, auto-detecting from quant config.
 fn load_maybe_quantized(
     weights: &HashMap<String, Array>,
@@ -1115,6 +1175,14 @@ fn load_talker_attention(
         .build()
         .map_err(|e| Error::Model(format!("RoPE build error: {e}")))?;
 
+    let q_dim = config.num_attention_heads * config.head_dim;
+    let kv_dim = config.num_key_value_heads * config.head_dim;
+
+    // Merge Q/K/V projections into a single batched matmul
+    let qkv_proj = merge_qkv_projections(
+        weights, prefix, quant, q_dim, kv_dim,
+    )?;
+
     Ok(TalkerAttention {
         n_heads: config.num_attention_heads,
         n_kv_heads: config.num_key_value_heads,
@@ -1122,9 +1190,9 @@ fn load_talker_attention(
         scale: (config.head_dim as f32).sqrt().recip(),
         rope,
         rope_speed_factor: 1.0,
-        q_proj: load_maybe_quantized(weights, &format!("{prefix}.q_proj"), quant)?,
-        k_proj: load_maybe_quantized(weights, &format!("{prefix}.k_proj"), quant)?,
-        v_proj: load_maybe_quantized(weights, &format!("{prefix}.v_proj"), quant)?,
+        qkv_proj,
+        q_dim,
+        kv_dim,
         o_proj: load_maybe_quantized(weights, &format!("{prefix}.o_proj"), quant)?,
         q_norm: load_rms_norm(weights, &format!("{prefix}.q_norm"), config.rms_norm_eps)?,
         k_norm: load_rms_norm(weights, &format!("{prefix}.k_norm"), config.rms_norm_eps)?,
@@ -1155,14 +1223,18 @@ fn load_code_predictor_attention(
         .build()
         .map_err(|e| Error::Model(format!("RoPE build error: {e}")))?;
 
+    let q_dim = config.num_attention_heads * head_dim;
+    let kv_dim = config.num_key_value_heads * head_dim;
+    let qkv_proj = merge_qkv_projections(weights, prefix, quant, q_dim, kv_dim)?;
+
     Ok(CodePredictorAttention {
         n_heads: config.num_attention_heads,
         n_kv_heads: config.num_key_value_heads,
         head_dim,
         scale: (head_dim as f32).sqrt().recip(),
-        q_proj: load_maybe_quantized(weights, &format!("{prefix}.q_proj"), quant)?,
-        k_proj: load_maybe_quantized(weights, &format!("{prefix}.k_proj"), quant)?,
-        v_proj: load_maybe_quantized(weights, &format!("{prefix}.v_proj"), quant)?,
+        qkv_proj,
+        q_dim,
+        kv_dim,
         o_proj: load_maybe_quantized(weights, &format!("{prefix}.o_proj"), quant)?,
         q_norm: load_rms_norm(weights, &format!("{prefix}.q_norm"), config.rms_norm_eps())?,
         k_norm: load_rms_norm(weights, &format!("{prefix}.k_norm"), config.rms_norm_eps())?,
