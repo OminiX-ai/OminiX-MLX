@@ -1029,6 +1029,7 @@ pub struct T2SGenerate<'a, C> {
     max_tokens: usize,
     generated: usize,
     finished: bool,
+    mem_guard: mlx_rs_core::memory::MemoryGuard,
 }
 
 impl<'a, C> T2SGenerate<'a, C>
@@ -1059,6 +1060,7 @@ where
             max_tokens,
             generated: 0,
             finished: false,
+            mem_guard: mlx_rs_core::memory::MemoryGuard::default_guard(),
         })
     }
 }
@@ -1113,17 +1115,7 @@ where
         self.current_token = next_token.index((.., NewAxis));
         self.generated += 1;
 
-        // Periodic cache clearing to prevent memory accumulation during long sequences
-        if self.generated % 256 == 0 {
-            // SAFETY: mlx_clear_cache() is safe to call at any point. It clears the MLX
-            // computation graph cache, releasing memory from completed operations.
-            // This is called during single-threaded inference with no concurrent MLX
-            // operations, so there's no race condition risk. The function is idempotent
-            // and documented as safe to call from the MLX C API.
-            unsafe {
-                mlx_sys::mlx_clear_cache();
-            }
-        }
+        self.mem_guard.step();
 
         Some(Ok(next_token))
     }

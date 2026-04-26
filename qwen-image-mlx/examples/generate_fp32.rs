@@ -28,7 +28,7 @@ use safetensors::SafeTensors;
 use tokenizers::Tokenizer;
 
 // For cache clearing
-extern crate mlx_sys;
+extern crate mlx_rs_core;
 
 use qwen_image_mlx::qwen_full_precision::{QwenFullConfig, QwenFullTransformer, load_full_precision_weights};
 
@@ -299,7 +299,7 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
 
     // Free text encoder to save ~2-3GB RAM (from flux2.c pattern)
     drop(text_encoder);
-    unsafe { mlx_sys::mlx_clear_cache(); }
+    mlx_rs_core::memory::clear_cache();
     println!("  Text encoder released to free memory");
 
     // Image parameters

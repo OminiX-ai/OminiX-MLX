@@ -17,6 +17,7 @@ pub use cache::HybridCache;
 pub use config::ModelArgs;
 pub use model::{load_model, Model};
 pub use mlx_rs_core::{error::Error, load_tokenizer};
+use mlx_rs_core::memory::MemoryGuard;
 
 use mlx_rs::{
     argmax_axis, array, categorical,
@@ -50,6 +51,7 @@ pub struct Generate<'a> {
     state: GenerateState<'a>,
     prefetched: Option<Array>,
     token_count: usize,
+    mem_guard: MemoryGuard,
 }
 
 enum GenerateState<'a> {
@@ -66,6 +68,7 @@ impl<'a> Generate<'a> {
             state: GenerateState::Prefill { prompt },
             prefetched: None,
             token_count: 0,
+            mem_guard: MemoryGuard::default_guard(),
         }
     }
 
@@ -115,14 +118,7 @@ impl Iterator for Generate<'_> {
 
                 self.prefetched = Some(next_y);
                 self.token_count += 1;
-
-                if self.token_count % 256 == 0 {
-                    // SAFETY: mlx_clear_cache releases GPU memory for completed graphs.
-                    // Safe to call between generation steps when no evaluation is in progress.
-                    unsafe {
-                        mlx_sys::mlx_clear_cache();
-                    }
-                }
+                self.mem_guard.step();
 
                 Some(Ok(current))
             }

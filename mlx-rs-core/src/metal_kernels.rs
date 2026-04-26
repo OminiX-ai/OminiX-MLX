@@ -93,8 +93,88 @@ const MODULATE_KERNEL_SOURCE: &str = r#"
     }
 "#;
 
+// Flash attention kernel using online softmax (no attention matrix materialization).
+// Handles both decode (Q=1) and prefill (Q>1) with causal masking and GQA.
+//
+// Inputs: q [num_q_heads, seq_q, head_dim], k [num_kv_heads, seq_kv, head_dim],
+//         v [num_kv_heads, seq_kv, head_dim]
+// Output: out [num_q_heads, seq_q, head_dim]
+//
+// Grid: (num_q_heads * seq_q) threadgroups, head_dim threads each.
+// Each threadgroup computes one output vector using cooperative dot product
+// reduction and per-thread online softmax accumulation.
+const FLASH_ATTENTION_KERNEL_SOURCE: &str = r#"
+    // Decode scale from bit-cast integer template arg
+    int _sb = scale_bits;
+    float scale = as_type<float>(_sb);
+
+    uint tg_idx = threadgroup_position_in_grid.x;
+    uint head_q = tg_idx / seq_q;
+    uint q_pos = tg_idx % seq_q;
+    uint d = thread_position_in_threadgroup.x;
+
+    // GQA: map query head to corresponding KV head
+    uint head_kv = head_q / gqa_factor;
+
+    // Load Q[head_q, q_pos, :] into shared memory (all threads cooperate)
+    threadgroup float shared_q[head_dim];
+    shared_q[d] = float(q[head_q * seq_q * head_dim + q_pos * head_dim + d]);
+    threadgroup_barrier(mem_flags::mem_threadgroup);
+
+    // Shared memory for dot product reduction
+    threadgroup float shared_dot[head_dim];
+
+    // Determine max KV position for causal masking
+    uint max_kv_pos = seq_kv;
+    if (causal) {
+        uint absolute_q_pos = q_pos + kv_offset;
+        max_kv_pos = min(absolute_q_pos + 1, (uint)seq_kv);
+    }
+
+    // Online softmax accumulators (per thread, for output dimension d)
+    float m = -1e38;
+    float l = 0.0;
+    float acc = 0.0;
+
+    uint kv_base = head_kv * seq_kv * head_dim;
+
+    for (uint kv = 0; kv < max_kv_pos; kv++) {
+        uint kv_off = kv_base + kv * head_dim;
+
+        // Cooperative dot product: Q[q_pos] . K[kv]
+        shared_dot[d] = shared_q[d] * float(k[kv_off + d]);
+        threadgroup_barrier(mem_flags::mem_threadgroup);
+
+        // Tree reduction for dot product (power-of-2 head_dim)
+        for (uint stride = head_dim / 2; stride > 0; stride >>= 1) {
+            if (d < stride) {
+                shared_dot[d] += shared_dot[d + stride];
+            }
+            threadgroup_barrier(mem_flags::mem_threadgroup);
+        }
+
+        float score = shared_dot[0] * scale;
+
+        // Online softmax update
+        float new_m = max(m, score);
+        float correction = exp(m - new_m);
+        float weight = exp(score - new_m);
+        l = l * correction + weight;
+        acc = acc * correction + weight * float(v[kv_off + d]);
+        m = new_m;
+    }
+
+    // Write normalized output
+    if (l > 0.0) {
+        out[head_q * seq_q * head_dim + q_pos * head_dim + d] = T(acc / l);
+    } else {
+        out[head_q * seq_q * head_dim + q_pos * head_dim + d] = T(0);
+    }
+"#;
+
 static SWIGLU_KERNEL: OnceLock<MetalKernel> = OnceLock::new();
 static MODULATE_KERNEL: OnceLock<MetalKernel> = OnceLock::new();
+static FLASH_ATTN_KERNEL: OnceLock<MetalKernel> = OnceLock::new();
 
 struct MetalKernel {
     kernel: mlx_sys::mlx_fast_metal_kernel,
@@ -335,5 +415,205 @@ pub fn fused_modulate(x: &Array, shift: &Array, scale: &Array) -> Result<Array, 
         mlx_sys::mlx_stream_free(stream);
 
         Ok(Array::from_ptr(result))
+    }
+}
+
+fn create_flash_attn_kernel() -> MetalKernel {
+    unsafe {
+        let q_name = CString::new("q").unwrap();
+        let k_name = CString::new("k").unwrap();
+        let v_name = CString::new("v").unwrap();
+        let out_name = CString::new("out").unwrap();
+
+        let input_names = mlx_sys::mlx_vector_string_new();
+        mlx_sys::mlx_vector_string_append_value(input_names, q_name.as_ptr());
+        mlx_sys::mlx_vector_string_append_value(input_names, k_name.as_ptr());
+        mlx_sys::mlx_vector_string_append_value(input_names, v_name.as_ptr());
+
+        let output_names = mlx_sys::mlx_vector_string_new();
+        mlx_sys::mlx_vector_string_append_value(output_names, out_name.as_ptr());
+
+        let source = CString::new(FLASH_ATTENTION_KERNEL_SOURCE).unwrap();
+        let header = CString::new("").unwrap();
+        let name = CString::new("flash_attention").unwrap();
+
+        let kernel = mlx_sys::mlx_fast_metal_kernel_new(
+            name.as_ptr(),
+            input_names,
+            output_names,
+            source.as_ptr(),
+            header.as_ptr(),
+            true,  // ensure_row_contiguous
+            false, // atomic_outputs
+        );
+
+        MetalKernel { kernel, input_names, output_names }
+    }
+}
+
+/// Flash attention using a custom Metal kernel with online softmax.
+///
+/// Computes scaled dot-product attention without materializing the full
+/// attention matrix. Supports GQA (grouped query attention) and causal masking.
+///
+/// Inputs must be 3D with batch*heads merged into the first dimension:
+/// * `queries` - `[num_q_heads, seq_q, head_dim]`
+/// * `keys` - `[num_kv_heads, seq_kv, head_dim]`
+/// * `values` - `[num_kv_heads, seq_kv, head_dim]`
+///
+/// `head_dim` must be a power of 2 (e.g., 64, 128).
+pub fn flash_attention(
+    queries: &Array,
+    keys: &Array,
+    values: &Array,
+    scale: f32,
+    causal: bool,
+    kv_offset: i32,
+) -> Result<Array, Exception> {
+    let kernel = FLASH_ATTN_KERNEL.get_or_init(create_flash_attn_kernel);
+
+    let q_shape = queries.shape();
+    let k_shape = keys.shape();
+
+    if q_shape.len() != 3 || k_shape.len() != 3 {
+        return Err(Exception::custom(
+            "flash_attention: expected 3D inputs [heads, seq, head_dim]",
+        ));
+    }
+
+    let num_q_heads = q_shape[0] as i32;
+    let seq_q = q_shape[1] as i32;
+    let head_dim = q_shape[2] as i32;
+    let num_kv_heads = k_shape[0] as i32;
+    let seq_kv = k_shape[1] as i32;
+
+    if num_q_heads % num_kv_heads != 0 {
+        return Err(Exception::custom(
+            "flash_attention: num_q_heads must be divisible by num_kv_heads",
+        ));
+    }
+    let gqa_factor = num_q_heads / num_kv_heads;
+
+    if head_dim & (head_dim - 1) != 0 {
+        return Err(Exception::custom(
+            "flash_attention: head_dim must be a power of 2",
+        ));
+    }
+
+    let dtype: u32 = queries.dtype().into();
+    let out_shape = [num_q_heads, seq_q, head_dim];
+
+    unsafe {
+        let stream = mlx_sys::mlx_default_gpu_stream_new();
+        let config = mlx_sys::mlx_fast_metal_kernel_config_new();
+
+        let type_name = CString::new("T").unwrap();
+        mlx_sys::mlx_fast_metal_kernel_config_add_template_arg_dtype(
+            config, type_name.as_ptr(), dtype);
+
+        let hd_name = CString::new("head_dim").unwrap();
+        mlx_sys::mlx_fast_metal_kernel_config_add_template_arg_int(
+            config, hd_name.as_ptr(), head_dim);
+
+        let sq_name = CString::new("seq_q").unwrap();
+        mlx_sys::mlx_fast_metal_kernel_config_add_template_arg_int(
+            config, sq_name.as_ptr(), seq_q);
+
+        let skv_name = CString::new("seq_kv").unwrap();
+        mlx_sys::mlx_fast_metal_kernel_config_add_template_arg_int(
+            config, skv_name.as_ptr(), seq_kv);
+
+        let gqa_name = CString::new("gqa_factor").unwrap();
+        mlx_sys::mlx_fast_metal_kernel_config_add_template_arg_int(
+            config, gqa_name.as_ptr(), gqa_factor);
+
+        // Encode float scale as int bits (no float template args in MLX custom kernels)
+        let scale_bits: i32 = f32::to_bits(scale) as i32;
+        let scale_name = CString::new("scale_bits").unwrap();
+        mlx_sys::mlx_fast_metal_kernel_config_add_template_arg_int(
+            config, scale_name.as_ptr(), scale_bits);
+
+        let causal_name = CString::new("causal").unwrap();
+        mlx_sys::mlx_fast_metal_kernel_config_add_template_arg_bool(
+            config, causal_name.as_ptr(), causal);
+
+        let offset_name = CString::new("kv_offset").unwrap();
+        mlx_sys::mlx_fast_metal_kernel_config_add_template_arg_int(
+            config, offset_name.as_ptr(), kv_offset);
+
+        // Grid: one threadgroup per (head, query_pos). head_dim threads per group.
+        let num_threadgroups = num_q_heads * seq_q;
+        let total_threads = num_threadgroups * head_dim;
+        mlx_sys::mlx_fast_metal_kernel_config_set_grid(config, total_threads, 1, 1);
+        mlx_sys::mlx_fast_metal_kernel_config_set_thread_group(config, head_dim, 1, 1);
+
+        mlx_sys::mlx_fast_metal_kernel_config_add_output_arg(
+            config, out_shape.as_ptr(), out_shape.len(), dtype);
+
+        let inputs = mlx_sys::mlx_vector_array_new();
+        mlx_sys::mlx_vector_array_append_value(inputs, queries.as_ptr());
+        mlx_sys::mlx_vector_array_append_value(inputs, keys.as_ptr());
+        mlx_sys::mlx_vector_array_append_value(inputs, values.as_ptr());
+
+        let mut outputs = mlx_sys::mlx_vector_array_new();
+        let ret = mlx_sys::mlx_fast_metal_kernel_apply(
+            &mut outputs, kernel.kernel, inputs, config, stream);
+
+        if ret != 0 {
+            mlx_sys::mlx_fast_metal_kernel_config_free(config);
+            mlx_sys::mlx_vector_array_free(inputs);
+            mlx_sys::mlx_vector_array_free(outputs);
+            mlx_sys::mlx_stream_free(stream);
+            return Err(Exception::custom("flash_attention Metal kernel failed"));
+        }
+
+        let mut result = mlx_sys::mlx_array_new();
+        mlx_sys::mlx_vector_array_get(&mut result, outputs, 0);
+
+        mlx_sys::mlx_fast_metal_kernel_config_free(config);
+        mlx_sys::mlx_vector_array_free(inputs);
+        mlx_sys::mlx_vector_array_free(outputs);
+        mlx_sys::mlx_stream_free(stream);
+
+        Ok(Array::from_ptr(result))
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn test_flash_attention_decode() {
+        // Simulates Qwen3-TTS decode: 16 Q heads, 8 KV heads, Q=1, KV=4, head_dim=64
+        let q = Array::ones::<f32>(&[16, 1, 64]).unwrap();
+        let k = Array::ones::<f32>(&[8, 4, 64]).unwrap();
+        let v_data: Vec<f32> = (0..2048).map(|i| (i % 64) as f32 / 64.0).collect();
+        let v = Array::from_slice(&v_data, &[8, 4, 64]);
+
+        let scale = 1.0 / (64.0f32).sqrt();
+        let result = flash_attention(&q, &k, &v, scale, false, 0).unwrap();
+        result.eval().unwrap();
+
+        assert_eq!(result.shape(), &[16, 1, 64]);
+        let out = result.as_slice::<f32>();
+        assert!(!out.iter().any(|x| x.is_nan()), "output contains NaN");
+        assert!(out.iter().any(|x| *x != 0.0), "output is all zeros");
+    }
+
+    #[test]
+    fn test_flash_attention_causal_prefill() {
+        // Prefill: 4 Q heads, 2 KV heads, seq_q=3, seq_kv=3, head_dim=64
+        let q = Array::ones::<f32>(&[4, 3, 64]).unwrap();
+        let k = Array::ones::<f32>(&[2, 3, 64]).unwrap();
+        let v = Array::ones::<f32>(&[2, 3, 64]).unwrap();
+
+        let scale = 1.0 / (64.0f32).sqrt();
+        let result = flash_attention(&q, &k, &v, scale, true, 0).unwrap();
+        result.eval().unwrap();
+
+        assert_eq!(result.shape(), &[4, 3, 64]);
+        let out = result.as_slice::<f32>();
+        assert!(!out.iter().any(|x| x.is_nan()), "causal output has NaN");
     }
 }
