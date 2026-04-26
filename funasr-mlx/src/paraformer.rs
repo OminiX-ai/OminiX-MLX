@@ -41,7 +41,7 @@ use mlx_rs::{
     macros::ModuleParameters,
     module::{Module, Param},
     nn,
-    ops::{self, indexing::IndexOp, softmax_axis},
+    ops::{self, indexing::IndexOp},
     Array,
 };
 
@@ -514,10 +514,8 @@ impl Module<&Array> for SanmAttention {
             .reshape(&[batch, seq_len, self.num_heads, self.head_dim])?
             .transpose_axes(&[0, 2, 1, 3])?;
 
-        let k_t = k.transpose_axes(&[0, 1, 3, 2])?;
-        let scores = q.matmul(&k_t)?.multiply(array!(self.scale))?;
-        let attn_weights = softmax_axis(&scores, -1, None)?;
-        let attn_out = attn_weights.matmul(&v)?;
+        // Use MLX SDPA — avoids materializing full attention matrix for long sequences
+        let attn_out = mlx_rs::fast::scaled_dot_product_attention(q, k, v, self.scale, None)?;
 
         let attn_out = attn_out
             .transpose_axes(&[0, 2, 1, 3])?
@@ -1004,10 +1002,8 @@ impl ParaformerDecoderLayer {
             .reshape(&[batch, src_len, self.num_heads, self.head_dim])?
             .transpose_axes(&[0, 2, 1, 3])?;
 
-        let k_t = k.transpose_axes(&[0, 1, 3, 2])?;
-        let scores = q.matmul(&k_t)?.multiply(array!(self.scale))?;
-        let attn_weights = softmax_axis(&scores, -1, None)?;
-        let attn_out = attn_weights.matmul(&v)?;
+        // Use MLX SDPA — avoids materializing full attention matrix
+        let attn_out = mlx_rs::fast::scaled_dot_product_attention(q, k, v, self.scale, None)?;
 
         let attn_out = attn_out
             .transpose_axes(&[0, 2, 1, 3])?

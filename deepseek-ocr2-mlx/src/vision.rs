@@ -112,17 +112,11 @@ impl SamAttention {
         // Attention: use SDPA (no mask for bidirectional)
         // q, k, v: [B, nH, H*W, hd]
         let attn = if self.use_rel_pos && (*self.rel_pos_h).shape()[0] > 0 {
-            // Compute attention with relative position bias
-            let scores = q.matmul(&k.transpose_axes(&[0, 1, 3, 2])?)?.multiply(array!(self.scale))?;
-
-            // Add decomposed relative position bias
+            // SDPA with relative position bias as additive mask
             let bias = self.compute_rel_pos_bias(&q, h, w)?;
-            let scores = scores.add(&bias)?;
-
-            let attn_weights = ops::softmax_axis(&scores, -1, true)?;
-            attn_weights.matmul(&v)?
+            let mask = mlx_rs::fast::ScaledDotProductAttentionMask::Array(&bias);
+            mlx_rs::fast::scaled_dot_product_attention(&q, &k, &v, self.scale, Some(mask))?
         } else {
-            // Simple SDPA without bias
             mlx_rs::fast::scaled_dot_product_attention(&q, &k, &v, self.scale, None)?
         };
 
