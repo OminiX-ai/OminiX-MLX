@@ -286,9 +286,14 @@ fn build_from_source() {
 
     cmake_args.push("-DCMAKE_METAL_COMPILER=/Applications/Xcode.app/Contents/Developer/Toolchains/XcodeDefault.xctoolchain/usr/bin/metal".to_string());
 
-    cmake_args.push("-DCMAKE_OSX_DEPLOYMENT_TARGET=15.0".to_string());
+    // Honor MLX_MACOSX_DEPLOYMENT_TARGET if set (e.g. "14.0" for macOS 14
+    // targets like the mini4 host), otherwise default to 15.0 for parity
+    // with the upstream prebuilt artifacts. MLX upstream supports >= 14.0.
+    let deployment_target =
+        std::env::var("MLX_MACOSX_DEPLOYMENT_TARGET").unwrap_or_else(|_| "15.0".to_string());
+    cmake_args.push(format!("-DCMAKE_OSX_DEPLOYMENT_TARGET={deployment_target}"));
 
-    std::env::set_var("MACOSX_DEPLOYMENT_TARGET", "15.0");
+    std::env::set_var("MACOSX_DEPLOYMENT_TARGET", &deployment_target);
 
     let status = Command::new("cmake")
         .args(&cmake_args)
@@ -361,9 +366,15 @@ fn link_system_frameworks() {
 
 fn main() {
     println!("cargo:rerun-if-env-changed=MLX_PREBUILT_PATH");
+    println!("cargo:rerun-if-env-changed=MLX_MACOSX_DEPLOYMENT_TARGET");
 
-    std::env::set_var("MACOSX_DEPLOYMENT_TARGET", "15.0");
-    println!("cargo:rustc-link-arg=-mmacosx-version-min=15.0");
+    // Honor MLX_MACOSX_DEPLOYMENT_TARGET if set (e.g. "14.0" for macOS 14
+    // targets like the mini4 host), otherwise default to 15.0 for parity
+    // with the upstream prebuilt artifacts.
+    let deployment_target =
+        std::env::var("MLX_MACOSX_DEPLOYMENT_TARGET").unwrap_or_else(|_| "15.0".to_string());
+    std::env::set_var("MACOSX_DEPLOYMENT_TARGET", &deployment_target);
+    println!("cargo:rustc-link-arg=-mmacosx-version-min={deployment_target}");
 
     // Three-mode detection:
     // 1. Explicit MLX_PREBUILT_PATH env var
