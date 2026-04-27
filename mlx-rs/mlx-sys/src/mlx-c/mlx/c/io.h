@@ -42,6 +42,10 @@ int mlx_load_safetensors(
     mlx_map_string_to_string* res_1,
     const char* file,
     const mlx_stream s);
+int mlx_load_gguf(
+    mlx_map_string_to_array* res,
+    const char* file,
+    const mlx_stream s);
 int mlx_save_writer(mlx_io_writer out_stream, const mlx_array a);
 int mlx_save(const char* file, const mlx_array a);
 int mlx_save_safetensors_writer(

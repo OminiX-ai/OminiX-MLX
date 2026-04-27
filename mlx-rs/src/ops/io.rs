@@ -1,6 +1,6 @@
 use crate::error::IoError;
 use crate::utils::guard::Guarded;
-use crate::utils::io::SafeTensors;
+use crate::utils::io::{SafeTensors, GgufWeights};
 use crate::utils::SUCCESS;
 use crate::{Array, Stream};
 use mlx_internal_macros::default_device;
@@ -74,6 +74,22 @@ impl Array {
         let metadata = safetensors.metadata()?;
 
         Ok((data, metadata))
+    }
+
+    /// Load dictionary of ``MLXArray`` from a `.gguf` file.
+    ///
+    /// # Params
+    ///
+    /// - path: path of file to load
+    /// - stream: stream or device to evaluate on
+    #[default_device(device = "cpu")]
+    pub fn load_gguf_device(
+        path: impl AsRef<Path>,
+        stream: impl AsRef<Stream>,
+    ) -> Result<HashMap<String, Array>, IoError> {
+        let gguf = GgufWeights::load_device(path.as_ref(), stream)?;
+        let data = gguf.data()?;
+        Ok(data)
     }
 
     /// Save array to a binary file in `.npy`format.

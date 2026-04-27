@@ -495,39 +495,60 @@ pub fn load_text_encoder_weights(
 }
 
 /// Load text encoder from model directory
+/// Load text encoder from model directory.
+/// Supports two layouts:
+/// - Sharded safetensors: `text_encoder/model.safetensors.index.json`
+/// - GGUF: `Qwen2.5-VL-*.gguf` or `*llm*.gguf` in root dir
 pub fn load_text_encoder(model_dir: impl AsRef<Path>) -> Result<QwenTextEncoder, Box<dyn std::error::Error>> {
     let model_dir = model_dir.as_ref();
-    let text_encoder_dir = model_dir.join("text_encoder");
 
-    // Load index
-    let index_path = text_encoder_dir.join("model.safetensors.index.json");
-    let index_content = std::fs::read_to_string(&index_path)?;
-    let index: serde_json::Value = serde_json::from_str(&index_content)?;
+    // Try GGUF first (edit model uses single LLM GGUF in root dir)
+    let gguf_candidate = std::fs::read_dir(model_dir)
+        .into_iter()
+        .flatten()
+        .filter_map(|e| e.ok())
+        .find(|e| {
+            let name = e.file_name().to_string_lossy().to_lowercase();
+            name.ends_with(".gguf") && (name.contains("qwen2") || name.contains("instruct") || name.contains("llm"))
+                && !name.contains("edit") && !name.contains("diffusion")
+        });
 
-    // Get all weight files
-    let weight_map = index["weight_map"].as_object()
-        .ok_or("Invalid index format")?;
+    let all_weights = if let Some(gguf_entry) = gguf_candidate {
+        let gguf_path = gguf_entry.path();
+        println!("  Loading text encoder from GGUF: {}", gguf_path.display());
+        Array::load_gguf(&gguf_path)
+            .map_err(|e| -> Box<dyn std::error::Error> { format!("GGUF load failed: {e}").into() })?
+    } else {
+        // Fall back to sharded safetensors
+        let text_encoder_dir = model_dir.join("text_encoder");
+        let index_path = text_encoder_dir.join("model.safetensors.index.json");
+        let index_content = std::fs::read_to_string(&index_path)?;
+        let index: serde_json::Value = serde_json::from_str(&index_content)?;
 
-    let mut files: std::collections::HashSet<String> = std::collections::HashSet::new();
-    for file in weight_map.values() {
-        if let Some(f) = file.as_str() {
-            files.insert(f.to_string());
+        let weight_map = index["weight_map"].as_object()
+            .ok_or("Invalid index format")?;
+
+        let mut files: std::collections::HashSet<String> = std::collections::HashSet::new();
+        for file in weight_map.values() {
+            if let Some(f) = file.as_str() {
+                files.insert(f.to_string());
+            }
         }
-    }
 
-    // Load all weights
-    let mut all_weights = HashMap::new();
-    for file in files {
-        let path = text_encoder_dir.join(&file);
-        println!("  Loading text encoder: {} ...", file);
-        let data = std::fs::read(&path)?;
-        let tensors = safetensors::SafeTensors::deserialize(&data)?;
+        let mut weights = HashMap::new();
+        for file in files {
+            let path = text_encoder_dir.join(&file);
+            println!("  Loading text encoder: {} ...", file);
+            let data = std::fs::read(&path)?;
+            let tensors = safetensors::SafeTensors::deserialize(&data)?;
 
-        for (name, tensor) in tensors.tensors() {
-            let array = Array::try_from(tensor)?;
-            all_weights.insert(name.to_string(), array);
+            for (name, tensor) in tensors.tensors() {
+                let array = Array::try_from(tensor)?;
+                weights.insert(name.to_string(), array);
+            }
         }
-    }
+        weights
+    };
 
     println!("  Loaded {} text encoder tensors", all_weights.len());
 

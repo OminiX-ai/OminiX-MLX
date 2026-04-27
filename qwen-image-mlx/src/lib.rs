@@ -20,6 +20,6 @@ pub mod text_encoder;
 pub use error::QwenImageError;
 pub use vae::{QwenVAE, load_vae_from_dir};
 pub use transformer::{QwenTransformer, QwenTransformerConfig};
-pub use pipeline::{QwenImagePipeline, FlowMatchEulerScheduler};
-pub use qwen_quantized::{QwenQuantizedTransformer, QwenConfig, load_transformer_weights};
+pub use pipeline::{QwenImagePipeline, FlowMatchEulerScheduler, pack_latents, unpack_latents, encode_reference_latent, ref_shape_from_latent};
+pub use qwen_quantized::{QwenQuantizedTransformer, QwenConfig, load_transformer_weights, build_edit_rope};
 pub use text_encoder::{QwenTextEncoder, TextEncoderConfig, load_text_encoder};

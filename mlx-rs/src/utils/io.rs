@@ -13,12 +13,106 @@ pub(crate) struct SafeTensors {
     pub(crate) c_metadata: mlx_sys::mlx_map_string_to_string,
 }
 
+/// Wrapper for GGUF loaded weights (no metadata — just the array map).
+pub(crate) struct GgufWeights {
+    pub(crate) c_data: mlx_sys::mlx_map_string_to_array,
+}
+
 impl Drop for SafeTensors {
     fn drop(&mut self) {
         unsafe {
             mlx_sys::mlx_map_string_to_string_free(self.c_metadata);
             mlx_sys::mlx_map_string_to_array_free(self.c_data);
         }
+    }
+}
+
+impl Drop for GgufWeights {
+    fn drop(&mut self) {
+        unsafe {
+            mlx_sys::mlx_map_string_to_array_free(self.c_data);
+        }
+    }
+}
+
+impl GgufWeights {
+    pub(crate) fn load_device(path: &Path, stream: impl AsRef<Stream>) -> Result<Self, IoError> {
+        if !path.is_file() {
+            return Err(IoError::NotFile);
+        }
+
+        let extension = path
+            .extension()
+            .and_then(|ext| ext.to_str())
+            .ok_or(IoError::UnsupportedFormat)?;
+
+        if extension != "gguf" {
+            return Err(IoError::UnsupportedFormat);
+        }
+
+        let path_str = path.to_str().ok_or(IoError::InvalidUtf8)?;
+        let filepath = CString::new(path_str)?;
+
+        crate::error::INIT_ERR_HANDLER
+            .with(|init| init.call_once(crate::error::setup_mlx_error_handler));
+
+        unsafe {
+            let c_data = mlx_sys::mlx_map_string_to_array_new();
+            let status = mlx_sys::mlx_load_gguf(
+                &c_data as *const _ as *mut _,
+                filepath.as_ptr(),
+                stream.as_ref().as_ptr(),
+            );
+            if status != SUCCESS {
+                mlx_sys::mlx_map_string_to_array_free(c_data);
+                return Err(crate::error::get_and_clear_last_mlx_error()
+                    .expect("A non-success status was returned, but no error was set.")
+                    .into());
+            }
+            Ok(Self { c_data })
+        }
+    }
+
+    pub(crate) fn data(&self) -> Result<HashMap<String, Array>, Exception> {
+        crate::error::INIT_ERR_HANDLER
+            .with(|init| init.call_once(crate::error::setup_mlx_error_handler));
+        let mut map = HashMap::new();
+        unsafe {
+            let iterator = mlx_sys::mlx_map_string_to_array_iterator_new(self.c_data);
+
+            loop {
+                let mut key_ptr: *const ::std::os::raw::c_char = null_mut();
+                let mut value = mlx_sys::mlx_array_new();
+                let status = mlx_sys::mlx_map_string_to_array_iterator_next(
+                    &mut key_ptr as *mut *const _,
+                    &mut value,
+                    iterator,
+                );
+
+                match status {
+                    SUCCESS => {
+                        let key = CStr::from_ptr(key_ptr).to_string_lossy().into_owned();
+                        let array = Array::from_ptr(value);
+                        map.insert(key, array);
+                    }
+                    1 => {
+                        mlx_sys::mlx_array_free(value);
+                        return Err(crate::error::get_and_clear_last_mlx_error()
+                            .expect("A non-success status was returned, but no error was set.")
+                            .into());
+                    }
+                    2 => {
+                        mlx_sys::mlx_array_free(value);
+                        break;
+                    }
+                    _ => unreachable!(),
+                }
+            }
+
+            mlx_sys::mlx_map_string_to_array_iterator_free(iterator);
+        }
+
+        Ok(map)
     }
 }
 

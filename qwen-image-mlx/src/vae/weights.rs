@@ -174,9 +174,16 @@ fn load_decoder_weights(
     Ok(())
 }
 
-/// Load VAE from model directory
+/// Load VAE from model directory.
+/// Checks for `qwen_image_vae.safetensors` (edit model layout)
+/// then falls back to `vae/0.safetensors` (text-to-image layout).
 pub fn load_vae_from_dir(model_dir: impl AsRef<Path>) -> Result<QwenVAE, Box<dyn std::error::Error>> {
-    let vae_path = model_dir.as_ref().join("vae/0.safetensors");
+    let dir = model_dir.as_ref();
+    let vae_path = if dir.join("qwen_image_vae.safetensors").exists() {
+        dir.join("qwen_image_vae.safetensors")
+    } else {
+        dir.join("vae/0.safetensors")
+    };
 
     println!("  Loading VAE weights from: {}", vae_path.display());
 

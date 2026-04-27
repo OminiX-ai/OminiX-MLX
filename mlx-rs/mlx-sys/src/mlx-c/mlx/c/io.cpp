@@ -66,6 +66,20 @@ extern "C" int mlx_load_safetensors(
   }
   return 0;
 }
+extern "C" int mlx_load_gguf(
+    mlx_map_string_to_array* res,
+    const char* file,
+    const mlx_stream s) {
+  try {
+    auto [arrays, metadata] =
+        mlx::core::load_gguf(std::string(file), mlx_stream_get_(s));
+    mlx_map_string_to_array_set_(*res, arrays);
+  } catch (std::exception& e) {
+    mlx_error(e.what());
+    return 1;
+  }
+  return 0;
+}
 extern "C" int mlx_save_writer(mlx_io_writer out_stream, const mlx_array a) {
   try {
     mlx::core::save(mlx_io_writer_get_(out_stream), mlx_array_get_(a));
