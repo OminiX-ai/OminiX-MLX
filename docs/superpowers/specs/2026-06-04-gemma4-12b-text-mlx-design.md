@@ -1,6 +1,6 @@
 # Gemma 4 12B (文本) MLX 接入设计
 
-- 日期: 2026-06-04(rev3,纳入两轮代码评审 + HF Gemma4 源码核实)
+- 日期: 2026-06-04(rev4,纳入三轮代码评审 + HF/vLLM 源码核实)
 - 分支: `feat/gemma4-12b`
 - 范围: **纯文本先行**(视觉/音频多模态留待后续阶段)
 - 目标 crate: 新建 `gemma4-mlx`(参照 `qwen3-mlx` 结构,但**不复用其量化加载器**,见 §6)
@@ -28,7 +28,7 @@
 | head_dim | 256(滑窗层) |
 | global_head_dim | 512(全局层) |
 | num_global_key_value_heads | 1(全局层 MQA) |
-| attention_k_eq_v | true(全局层 K=V,需 M0 定论 v_proj 是否独立存在) |
+| attention_k_eq_v | true → **全局层无 v_proj**,value 取 raw k_proj 输出过 v_norm(源码确认,M0 仅本地复核) |
 | intermediate_size | 15360 |
 | hidden_activation | gelu_pytorch_tanh(→ GeGLU) |
 | vocab_size | 262144 |
@@ -118,8 +118,13 @@ struct Attention {
 - q/k/v norm 均作用于 head_dim 维。
 
 ### 5.5 rope.rs — 双 RoPE(方案②A,本地)
-- 滑窗:`nn::Rope` dims=256 θ=10000 default。
-- 全局:`proportional` θ=1e6 partial_rotary_factor=0.25。首选用 `nn::Rope` partial-dims(dims=64)表达;**`mlx-rs-core::initialize_rope` 仅支持 default/linear,会报 unsupported,不可调用**。若 proportional 语义≠plain partial,则在 crate 内手写(R1)。
+- 滑窗层:`nn::Rope` dims=256 θ=10000 default(可直接复用)。
+- 全局层:`proportional` θ=1e6 partial_rotary_factor=0.25 —— **从第一版就本地手写,不用 `nn::Rope` partial-dims**。原因(vLLM/HF 源码核实):
+  - 频率分母用**完整 head_dim=512**,而非 rotary_dim=64:`inv_freq[i] = base^-(2i / 512)`,i=0..32(rotary_dim/2)。`nn::Rope(dims=64)` 会用 64 当分母,频率全错。
+  - 非旋转维 **identity**:`inv_freq` 在前 32 个频率后补零(`cos=1, sin=0`),后 448 维不旋转。
+  - 即:对前 64 维施加"按 512 计算频率"的旋转,其余 448 维原样透传。
+- **`mlx-rs-core::initialize_rope` 仅支持 default/linear,不可用于全局层。**
+- M0 仍逐元素对照参考确认频率与边界(R1)。
 
 ### 5.6 mlp.rs — GeGLU
 - `down(gelu_tanh(gate(x)) * up(x))`,intermediate 15360。三投影 8bit 量化。
@@ -153,12 +158,12 @@ struct Attention {
 - 集中映射:`...layers.{i}.self_attn.{q,k,[v],o}_proj`、`.q_norm/.k_norm`(`v_norm` 无权重)、`.layer_scalar`、`mlp.{gate,up,down}_proj`、各 layernorm、`embed_tokens`、`model.norm`。
 
 ## 7. 验证策略
-1. 逐层比对参考实现(RMSNorm(1+w)、embedding 缩放、双 RoPE、QK-norm、global MQA、layer_scalar、softcap),量化容差内。
+1. 逐层比对参考实现(标准 gamma RMSNorm、v_norm no-scale、embedding 缩放、双 RoPE、q/k/v-norm、scaling=1.0、global MQA、层末 layer_scalar、final softcap),量化容差内。
 2. 贪婪解码(temp=0)首 32 token 与参考一致。
-3. `examples/chat_gemma4.rs` 跑通对话,记录峰值内存、tok/s、实测可用上下文上限。
+3. `examples/chat_gemma4.rs` 跑通对话:**必须套用仓库的 chat template / `tokenizer_config`(BOS、`<start_of_turn>` 等),不能用裸 prompt**,否则即便权重正确也会输出格式错乱。记录峰值内存、tok/s、实测可用上下文上限。
 
 ## 8. 风险与未决项(M0 spike 定论)
-- R1 proportional RoPE 是否等价 nn::Rope partial-dims(§5.5)
+- R1 proportional RoPE 本地实现(分母 head_dim、前 64 维旋转、余 identity)逐元素对齐参考(§5.5)
 - R2 norm 数量/命名(四 vs 二 layernorm)——RMSNorm 公式已由源码定为标准 gamma(§5.2)
 - R3 global 层 v_proj=None 为预期行为(源码确认),**降级**为 M0 仅本地复核(§5.4)
 - R4 attention scaling 已由源码定为 1.0(§5.4);M0 仅复核
@@ -168,7 +173,7 @@ struct Attention {
 - R8 滑窗边界是 1024 还是含当前 token 的 1025,需与参考逐 token 对齐(§5.8)
 
 ## 9. 里程碑
-1. **M0 权重/配置 spike**(评审建议):解析 `config.json` + `model.safetensors.index.json`;分别实例化 layer 0(sliding)与 layer 5(full),逐键确认存在、每模块 bits/group_size 正确(MLP 8bit/其余 4bit)、global 层 v_proj 有无路径可跑;实测加载峰值内存与可用上下文。产出 R1–R7 结论。**不求完整生成**。
+1. **M0 权重/配置 spike**(评审建议):解析 `config.json` + `model.safetensors.index.json`;分别实例化 layer 0(sliding)与 layer 5(full),逐键确认存在、每模块 bits/group_size 正确(MLP 8bit/其余 4bit)、global 层 v_proj=None 路径可跑;实测加载峰值内存与可用上下文。产出 R1–R8 结论。**不求完整生成**。
 2. **M1 解码器**:48 层前向 + 按层 mask + 双 RoPE + q/k/v-norm(v 不过 RoPE)+ scaling=1.0 + 层末 layer_scalar + final softcap,逐层对齐。
 3. **M2 生成**:自有 `Generate`,端到端贪婪解码与参考一致,`chat_gemma4.rs` 跑通。
 4. **M3(可选)**:滑窗 RotatingKVCache(长上下文)、proportional RoPE 提升到 mlx-rs-core。
