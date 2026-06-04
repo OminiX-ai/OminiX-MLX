@@ -186,7 +186,12 @@ impl Attention {
         })
     }
 
-    /// Forward. `x` is `[B, L, hidden]`, `mask` a bool `[L, L]` (true=visible).
+    /// Forward. `x` is `[B, L, hidden]`. `mask` is passed straight to SDPA:
+    /// either a bool `[L, L]` (true=visible, e.g. from `mask::full_causal_mask`)
+    /// or a float additive `[L, L]` (0=keep, -inf=mask). The M0 parity example
+    /// uses the float form to match the golden dump; real inference uses bool.
+    /// TODO(M1): plumb a RoPE `offset` (from KVCache.offset()) through here and
+    /// `block::forward` for single-token decode — currently hardcoded to 0 (prefill).
     #[allow(non_snake_case)]
     pub fn forward(&mut self, x: &Array, mask: &Array) -> Result<Array> {
         let shape = x.shape();
@@ -206,7 +211,12 @@ impl Attention {
         let values = if self.use_k_eq_v {
             keys.clone()
         } else {
-            let v = self.v_proj.as_mut().expect("v_proj present for sliding").forward(x)?;
+            // Invariant: constructor builds v_proj for every non-k_eq_v layer.
+            // Return Err rather than panic to keep forward() on the Result contract.
+            let v_proj = self.v_proj.as_mut().ok_or_else(|| {
+                crate::error::Error::Model("v_proj missing on non-k_eq_v layer".into())
+            })?;
+            let v = v_proj.forward(x)?;
             v.reshape(&[B, L, self.n_kv_heads, self.head_dim])?
         };
 

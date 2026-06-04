@@ -5,6 +5,14 @@
 
 /// Returns a length `head_dim/2` inv_freq vector: the first `rotary_dim/2` entries are
 /// `theta^(-(2*i / head_dim))`, the remaining entries are 0.0 (identity / unrotated).
+///
+/// SIGN CONVENTION — read before reusing: this returns the *true* inv_freq
+/// (NEGATIVE exponent). `mlx_rs::fast::rope`'s `freqs` argument wants the
+/// POSITIVE-exponent form (`theta^(+2i/head_dim)`) because the kernel takes its
+/// reciprocal internally. `attention.rs::Rope::Proportional` therefore builds the
+/// positive form inline — do NOT feed this function's output directly to
+/// `fast::rope` (you'd double-invert). This fn documents the formula and is
+/// unit-tested; the production rotation lives in attention.rs.
 pub fn proportional_inv_freq(head_dim: i32, rotary_dim: i32, theta: f32) -> Vec<f32> {
     let half = (head_dim / 2) as usize;
     let rot_half = (rotary_dim / 2) as usize;
