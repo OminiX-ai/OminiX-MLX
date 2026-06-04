@@ -8,6 +8,8 @@ pub enum Error {
     Json(#[from] serde_json::Error),
     #[error("mlx: {0}")]
     Mlx(#[from] mlx_rs::error::Exception),
+    #[error("mlx io: {0}")]
+    MlxIo(#[from] mlx_rs::error::IoError),
     #[error("weight not found: {0}")]
     WeightNotFound(String),
     #[error("config: {0}")]
