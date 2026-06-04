@@ -8,7 +8,7 @@ pub enum LayerKind { Sliding, Global }
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum RopeType { Default, Proportional }
 
-#[derive(Debug, Clone, Copy)]
+#[derive(Debug, Clone, Copy, PartialEq)]
 pub struct RopeSpec {
     pub rope_type: RopeType,
     pub theta: f32,
@@ -50,7 +50,9 @@ struct TextConfig {
     head_dim: i32,
     global_head_dim: i32,
     num_global_key_value_heads: i32,
-    #[serde(default)] attention_k_eq_v: bool,
+    // Gemma 4 12B sets this true (global layers share K/V). Default true so an
+    // absent field doesn't silently flip global-layer behavior.
+    #[serde(default = "default_true")] attention_k_eq_v: bool,
     intermediate_size: i32,
     vocab_size: i32,
     tie_word_embeddings: bool,
@@ -72,6 +74,7 @@ struct RopeRaw {
     #[serde(default = "default_partial")] partial_rotary_factor: f32,
 }
 fn default_partial() -> f32 { 1.0 }
+fn default_true() -> bool { true }
 
 impl ModelArgs {
     pub fn from_config_str(s: &str) -> Result<Self> {
@@ -84,8 +87,16 @@ impl ModelArgs {
             other               => Err(Error::Config(format!("unknown layer_type {other}"))),
         }).collect::<Result<Vec<_>>>()?;
 
+        if layer_types.len() != t.num_hidden_layers as usize {
+            return Err(Error::Config(format!(
+                "layer_types has {} entries but num_hidden_layers is {}",
+                layer_types.len(), t.num_hidden_layers
+            )));
+        }
+
         let parse_rope = |r: &RopeRaw| -> Result<RopeSpec> {
             let rope_type = match r.rope_type.as_str() {
+                // mlx-rs-core treats "linear" as plain "default" scaling.
                 "default" | "linear" => RopeType::Default,
                 "proportional"       => RopeType::Proportional,
                 other                => return Err(Error::Config(format!("unknown rope_type {other}"))),
@@ -149,6 +160,6 @@ mod tests {
         assert_eq!(a.rope_sliding.theta, 10000.0);
         assert_eq!(a.rope_global.rope_type, RopeType::Proportional);
         assert_eq!(a.rope_global.theta, 1_000_000.0);
-        assert!((a.rope_global.partial_rotary_factor - 0.25).abs() < 1e-9);
+        assert!((a.rope_global.partial_rotary_factor - 0.25).abs() < 1e-6);
     }
 }
