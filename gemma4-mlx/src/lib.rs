@@ -1,5 +1,7 @@
 //! Gemma 4 12B (text) inference on Apple Silicon with MLX.
 //! See docs/superpowers/specs/2026-06-04-gemma4-12b-text-mlx-design.md
+pub mod attention;
+pub mod block;
 pub mod config;
 pub mod error;
 pub mod mask;
