@@ -150,7 +150,11 @@ impl QuantConfig {
 
         let mut overrides = HashMap::new();
         for (k, val) in obj {
-            // Only nested {bits, group_size} objects are per-module overrides.
+            // Heuristic: any nested object with both bits+group_size is a per-module
+            // override keyed by exact module prefix. String values like "mode":"affine"
+            // are skipped by as_object(); "mode" excluded by name as belt-and-suspenders.
+            // A future non-module {bits,group_size} object would be a harmless false
+            // positive (no one calls quant_for with its key).
             if let Some(o) = val.as_object() {
                 if let (Some(b), Some(g)) = (o.get("bits").and_then(|x| x.as_i64()),
                                              o.get("group_size").and_then(|x| x.as_i64())) {
@@ -163,7 +167,10 @@ impl QuantConfig {
         Ok(Some(QuantConfig { default_bits, default_group_size, overrides }))
     }
 
-    /// (bits, group_size). `prefix` is the module prefix without .weight/.scales/.biases.
+    /// Returns (bits, group_size) for the given module prefix (without
+    /// .weight/.scales/.biases). Lookup is **exact equality** — not a
+    /// prefix/glob match; an unknown key falls back to the defaults.
+    /// Glob/regex matching is intentionally not implemented (YAGNI).
     pub fn quant_for(&self, prefix: &str) -> (i32, i32) {
         self.overrides.get(prefix)
             .copied()
