@@ -1,0 +1,26 @@
+[package]
+name = "gemma4-mlx"
+version = "0.1.0"
+edition = "2021"
+description = "Gemma 4 12B (text) inference on Apple Silicon with MLX"
+license = "MIT OR Apache-2.0"
+
+[dependencies]
+mlx-rs = { path = "../mlx-rs", features = ["metal", "accelerate"] }
+mlx-sys = { path = "../mlx-rs/mlx-sys" }
+mlx-rs-core = { path = "../mlx-rs-core" }
+thiserror = "2"
+serde = { version = "1", features = ["derive"] }
+serde_json = "1"
+tokenizers = "0.21"
+
+[dev-dependencies]
+anyhow = "1"
+
+[[example]]
+name = "inspect_gemma4"
+path = "examples/inspect_gemma4.rs"
+
+[[example]]
+name = "layer_parity"
+path = "examples/layer_parity.rs"
