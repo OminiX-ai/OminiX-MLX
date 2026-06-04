@@ -18,7 +18,7 @@ use mlx_rs::{
     Array,
 };
 use mlx_rs_core::{
-    cache::KVCache,
+    cache::{KVCache, KeyValueCache},
     utils::{scaled_dot_product_attention, SdpaMask},
 };
 
@@ -63,7 +63,7 @@ impl Rope {
     }
 
     /// Apply RoPE to `x` of shape `[B, n_heads, L, head_dim]` at `offset`.
-    fn forward(&self, x: &Array, offset: i32) -> Result<Array> {
+    fn forward_at(&self, x: &Array, offset: i32) -> Result<Array> {
         match self {
             Rope::Standard { dims, base } => {
                 Ok(rope(x, *dims, false, Some(*base), 1.0, offset, None)?)
@@ -186,17 +186,33 @@ impl Attention {
         })
     }
 
-    /// Forward. `x` is `[B, L, hidden]`. `mask` is passed straight to SDPA:
-    /// either a bool `[L, L]` (true=visible, e.g. from `mask::full_causal_mask`)
-    /// or a float additive `[L, L]` (0=keep, -inf=mask). The M0 parity example
-    /// uses the float form to match the golden dump; real inference uses bool.
-    /// TODO(M1): plumb a RoPE `offset` (from KVCache.offset()) through here and
-    /// `block::forward` for single-token decode — currently hardcoded to 0 (prefill).
-    #[allow(non_snake_case)]
+    /// Forward (prefill). `x` is `[B, L, hidden]`. `mask` is passed straight to
+    /// SDPA: either a bool `[L, L]` (true=visible, e.g. from
+    /// `mask::full_causal_mask`) or a float additive `[L, L]` (0=keep, -inf=mask).
+    /// The M0 parity example uses the float form to match the golden dump; real
+    /// inference uses bool. Thin wrapper over [`Attention::attend`] with offset 0
+    /// and no cache — bit-identical to the M1 prefill path.
     pub fn forward(&mut self, x: &Array, mask: &Array) -> Result<Array> {
+        self.attend(x, Some(mask), None)
+    }
+
+    /// Cache-aware attention core. When `cache` is `None`, behaves exactly like
+    /// the M1 prefill path (RoPE at offset 0, no cache). When `cache` is `Some`,
+    /// RoPE is applied at `cache.offset()` to q and k, then k/v are appended to
+    /// (and re-read from) the cache before SDPA — the canonical decode path.
+    #[allow(non_snake_case)]
+    pub fn attend(
+        &mut self,
+        x: &Array,
+        mask: Option<&Array>,
+        cache: Option<&mut KVCache>,
+    ) -> Result<Array> {
         let shape = x.shape();
         let B = shape[0];
         let L = shape[1];
+
+        // RoPE offset: cache's current length (0 for prefill / no cache).
+        let offset = cache.as_ref().map(|c| c.offset()).unwrap_or(0);
 
         // queries = q_norm(q_proj(x).reshape(B,L,n_heads,head_dim))  [norm over last axis]
         let queries = self.q_proj.forward(x)?;
@@ -223,7 +239,7 @@ impl Attention {
         // keys = rope(k_norm(keys).transpose)
         let keys = self.k_norm.forward(&keys)?;
         let keys = keys.transpose_axes(&[0, 2, 1, 3])?;
-        let keys = self.rope.forward(&keys, 0)?;
+        let keys = self.rope.forward_at(&keys, offset)?;
 
         // values = v_norm(values).transpose  (NO rope)
         let values = self.v_norm.forward(&values)?;
@@ -231,7 +247,13 @@ impl Attention {
 
         // queries = rope(queries.transpose)
         let queries = queries.transpose_axes(&[0, 2, 1, 3])?;
-        let queries = self.rope.forward(&queries, 0)?;
+        let queries = self.rope.forward_at(&queries, offset)?;
+
+        // Append to / re-read from the KV cache for decode; pass-through for prefill.
+        let (keys, values) = match cache {
+            Some(c) => c.update_and_fetch(keys, values)?,
+            None => (keys, values),
+        };
 
         let output = scaled_dot_product_attention::<KVCache>(
             queries,
@@ -239,7 +261,7 @@ impl Attention {
             values,
             None,
             self.scale,
-            Some(SdpaMask::Array(mask)),
+            mask.map(SdpaMask::Array),
         )?;
         let output = output.transpose_axes(&[0, 2, 1, 3])?.reshape(&[B, L, -1])?;
 

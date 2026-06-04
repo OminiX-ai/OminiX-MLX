@@ -19,6 +19,7 @@
 use std::collections::HashMap;
 
 use mlx_rs::{ops::multiply, Array};
+use mlx_rs_core::cache::KVCache;
 
 use crate::attention::Attention;
 use crate::config::{ModelArgs, QuantConfig};
@@ -70,6 +71,31 @@ impl TransformerBlock {
         let residual = x;
         let h = self.input_layernorm.forward(x)?;
         let h = self.self_attn.forward(&h, mask)?;
+        let h = self.post_attention_layernorm.forward(&h)?;
+        let h = residual.add(&h)?;
+
+        let residual = h.clone();
+        let hh = self.pre_feedforward_layernorm.forward(&h)?;
+        let hh = self.mlp.forward(&hh)?;
+        let hh = self.post_feedforward_layernorm.forward(&hh)?;
+        let hh = residual.add(&hh)?;
+
+        Ok(multiply(&hh, &self.layer_scalar)?)
+    }
+
+    /// Cache-aware forward for single-token (or chunked) decode. Identical to
+    /// [`TransformerBlock::forward`] except attention threads `cache` (and the
+    /// RoPE offset derived from it) through [`Attention::attend`]. `mask` is
+    /// optional — `None` lets SDPA run unmasked (single-token decode).
+    pub fn forward_cached(
+        &mut self,
+        x: &Array,
+        mask: Option<&Array>,
+        cache: &mut KVCache,
+    ) -> Result<Array> {
+        let residual = x;
+        let h = self.input_layernorm.forward(x)?;
+        let h = self.self_attn.attend(&h, mask, Some(cache))?;
         let h = self.post_attention_layernorm.forward(&h)?;
         let h = residual.add(&h)?;
 
