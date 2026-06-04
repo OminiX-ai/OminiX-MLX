@@ -165,15 +165,20 @@ struct Attention {
 2. 贪婪解码(temp=0)首 32 token 与参考一致。
 3. `examples/chat_gemma4.rs` 跑通对话:**必须套用仓库的 chat template / `tokenizer_config`(BOS、`<start_of_turn>` 等),不能用裸 prompt**,否则即便权重正确也会输出格式错乱。记录峰值内存、tok/s、实测可用上下文上限。
 
-## 8. 风险与未决项(M0 spike 定论)
-- R1 proportional RoPE 本地实现(分母 head_dim、前 64 维旋转、余 identity)逐元素对齐参考(§5.5)
-- R2 norm 数量/命名(四 vs 二 layernorm)——RMSNorm 公式已由源码定为标准 gamma(§5.2)
-- R3 global 层 v_proj=None 为预期行为(源码确认),**降级**为 M0 仅本地复核(§5.4)
-- R4 attention scaling 已由源码定为 1.0(§5.4);M0 仅复核
-- R5 embedding normalizer 取值 √3840(§5.3)
-- R6 4bit/混合精度键名、scales/biases 布局与自写加载器兼容(§6)
-- R7 `layer_scalar` 作用点已由源码定为层末整体乘(§5.7);M0 仅复核
-- R8 滑窗边界是 1024 还是含当前 token 的 1025,需与参考逐 token 对齐(§5.8)
+## 8. 风险与未决项 — **M0 已全部定论(2026-06-04)**
+
+M0 实测参考 = mlx-vlm 0.6.1 gemma4(同一 4bit 权重);单层 forward 对齐:
+**layer 0(sliding)max-abs-diff 8.58e-6、layer 5(global)5.72e-6**(满量级 std≈1.3–1.5)。
+
+- R1 ✅ proportional RoPE 正确:`rotated_dims=2*int(0.25*512//2)=128`(非 64),64 个频率,分母 = 完整 head_dim 512,rotate-half(每个 half 的前 64);layer 5 逐元素对齐 5.72e-6。`fast::rope` 的 `freqs` 用 base^(+exp)(kernel 内部取倒数);`rope.rs::proportional_inv_freq` 是 base^(−exp) 的 inv_freq 形式,仅作公式文档,勿直接喂 `fast::rope`。
+- R2 ✅ 每层 **4 个 layernorm**(input/post_attention/pre_feedforward/post_feedforward);全部标准 gamma RMSNorm(含 q/k_norm),v_norm 为 no-scale。
+- R3 ✅ global 层**无 v_proj**(weight index 确认):value = raw k_proj 输出过 v_norm、不过 RoPE。
+- R4 ✅ attention scaling = **1.0**(源码 + 对齐确认)。
+- R5 ✅ embedding normalizer = **√hidden_size**(mlx-vlm `embed_scale=61.968=√3840`)。M1 用。
+- R6 ✅ 混合精度:attn q/k/o = 4bit、mlp gate/up/down = 8bit、group_size=64、affine;`quant_for` + 自写 loader 兼容。
+- R7 ✅ `layer_scalar`:层 forward 末尾整层乘(两次 residual 后);每层均有该权重。
+- R8 ⏸ 滑窗边界:`create_causal_mask` 可见带 = `q-window..q`(window+1 列),mask.rs 单测已锁定;长上下文真实滑窗留待 M1/M2(M0 在 L=6<window 下未触发)。
+  - **M1 必修**:golden dump 脚本的 mask 是 `create_causal_mask().astype(f32)`,被 mlx SDPA 当**加性** mask(非真正因果)。M0 双方用同一 mask 故对齐成立、且不影响 R1(RoPE 在 SDPA 前已对齐);但 M1 重新 dump(更长 L / 真实滑窗)前须把脚本改成正确的加性 −inf mask,parity 才反映真实注意力。
 
 ## 9. 里程碑
 1. **M0 权重/配置 spike**(评审建议):解析 `config.json` + `model.safetensors.index.json`;分别实例化 layer 0(sliding)与 layer 5(full),逐键确认存在、每模块 bits/group_size 正确(MLP 8bit/其余 4bit)、global 层 v_proj=None 路径可跑;layer 0/5 最小 forward 与参考对齐;**仅估算** KV 内存(完整 48 层前向前无法可信测上下文上限)。产出 R1–R8 结论。**不求完整生成、不实测上下文上限**。
