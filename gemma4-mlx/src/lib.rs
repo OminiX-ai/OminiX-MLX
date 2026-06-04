@@ -4,6 +4,7 @@ pub mod attention;
 pub mod block;
 pub mod config;
 pub mod error;
+pub mod generate;
 pub mod mask;
 pub mod mlp;
 pub mod model;
@@ -12,4 +13,5 @@ pub mod rope;
 pub mod weights;
 
 pub use error::{Error, Result};
+pub use generate::generate_greedy;
 pub use model::{load_model, Gemma4TextModel};
