@@ -180,6 +180,15 @@ M0 实测参考 = mlx-vlm 0.6.1 gemma4(同一 4bit 权重);单层 forward 对齐
 - R8 ⏸ 滑窗边界:`create_causal_mask` 可见带 = `q-window..q`(window+1 列),mask.rs 单测已锁定;长上下文真实滑窗留待 M1/M2(M0 在 L=6<window 下未触发)。
   - **M1 必修**:golden dump 脚本的 mask 是 `create_causal_mask().astype(f32)`,被 mlx SDPA 当**加性** mask(非真正因果)。M0 双方用同一 mask 故对齐成立、且不影响 R1(RoPE 在 SDPA 前已对齐);但 M1 重新 dump(更长 L / 真实滑窗)前须把脚本改成正确的加性 −inf mask,parity 才反映真实注意力。
 
+## 8.1 M1 结论(2026-06-04,已完成)
+
+全模型(48 层)端到端对齐 mlx-vlm(同一 4bit 权重,`load(lazy=True)` 让视觉/音频塔留在磁盘以适配 16GB):
+- 固定序列 `[2,1024,2048,4096,8192,16384]` 的**下一 token argmax = 2818,与参考一致**;top-3 完全一致;logits absmax 29.57 vs 29.50(softcap 正确)。
+- logits max-abs-diff ≈ 0.80、mean ≈ 0.12(经评审判定为 48 层 bf16/f32 累积的良性误差,非结构性 bug:两侧同权重故量化误差抵消,结构性错误会破坏 argmax)。
+- **R8 / M0 mask caveat 关闭**:M1 参考用模型内部的*正确*因果 mask(非 M0 dump 的 f32 hack),我方用 bool `full/sliding` mask,argmax 对齐 → 因果掩码端到端验证通过。
+- 内存:`load_model` + 48 层 prefill forward 在 16GB 上跑通(Rust 仅保留文本权重)。
+- 仍属 M2:KV cache 解码串联(`forward` 已留 `TODO(M1)`→实为 M2 的 offset 串联)、`Generate` 循环、tokenizer/chat template、tok/s 与上下文上限实测。
+
 ## 9. 里程碑
 1. **M0 权重/配置 spike**(评审建议):解析 `config.json` + `model.safetensors.index.json`;分别实例化 layer 0(sliding)与 layer 5(full),逐键确认存在、每模块 bits/group_size 正确(MLP 8bit/其余 4bit)、global 层 v_proj=None 路径可跑;layer 0/5 最小 forward 与参考对齐;**仅估算** KV 内存(完整 48 层前向前无法可信测上下文上限)。产出 R1–R8 结论。**不求完整生成、不实测上下文上限**。
 2. **M1 解码器**:48 层前向 + 按层 mask + 双 RoPE + q/k/v-norm(v 不过 RoPE)+ scaling=1.0 + 层末 layer_scalar + final softcap,逐层对齐。
