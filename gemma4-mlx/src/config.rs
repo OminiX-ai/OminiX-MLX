@@ -1,5 +1,7 @@
 //! Gemma 4 text config parsing.
+use std::collections::HashMap;
 use serde::Deserialize;
+use serde_json::Value;
 use crate::error::{Error, Result};
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -127,6 +129,48 @@ impl ModelArgs {
     }
 }
 
+#[derive(Debug, Clone)]
+pub struct QuantConfig {
+    pub default_bits: i32,
+    pub default_group_size: i32,
+    /// Full weight prefix -> (bits, group_size)
+    overrides: HashMap<String, (i32, i32)>,
+}
+
+impl QuantConfig {
+    /// Accepts either `quantization` or `quantization_config`; returns Ok(None) if neither present.
+    pub fn from_config_str(s: &str) -> Result<Option<Self>> {
+        let v: Value = serde_json::from_str(s)?;
+        let q = v.get("quantization").or_else(|| v.get("quantization_config"));
+        let Some(q) = q else { return Ok(None) };
+        let obj = q.as_object().ok_or_else(|| Error::Config("quantization not object".into()))?;
+
+        let default_bits = obj.get("bits").and_then(|x| x.as_i64()).unwrap_or(4) as i32;
+        let default_group_size = obj.get("group_size").and_then(|x| x.as_i64()).unwrap_or(64) as i32;
+
+        let mut overrides = HashMap::new();
+        for (k, val) in obj {
+            // Only nested {bits, group_size} objects are per-module overrides.
+            if let Some(o) = val.as_object() {
+                if let (Some(b), Some(g)) = (o.get("bits").and_then(|x| x.as_i64()),
+                                             o.get("group_size").and_then(|x| x.as_i64())) {
+                    if k != "mode" {
+                        overrides.insert(k.clone(), (b as i32, g as i32));
+                    }
+                }
+            }
+        }
+        Ok(Some(QuantConfig { default_bits, default_group_size, overrides }))
+    }
+
+    /// (bits, group_size). `prefix` is the module prefix without .weight/.scales/.biases.
+    pub fn quant_for(&self, prefix: &str) -> (i32, i32) {
+        self.overrides.get(prefix)
+            .copied()
+            .unwrap_or((self.default_bits, self.default_group_size))
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -161,5 +205,15 @@ mod tests {
         assert_eq!(a.rope_global.rope_type, RopeType::Proportional);
         assert_eq!(a.rope_global.theta, 1_000_000.0);
         assert!((a.rope_global.partial_rotary_factor - 0.25).abs() < 1e-6);
+    }
+
+    #[test]
+    fn quant_for_resolves_per_module_overrides() {
+        let path = concat!(env!("CARGO_MANIFEST_DIR"), "/tests/fixtures/config.text.json");
+        let s = std::fs::read_to_string(path).unwrap();
+        let q = QuantConfig::from_config_str(&s).unwrap().unwrap();
+        assert_eq!(q.quant_for("language_model.model.layers.5.self_attn.q_proj"), (4, 64));
+        assert_eq!(q.quant_for("language_model.model.layers.5.mlp.gate_proj"), (8, 64));
+        assert_eq!(q.quant_for("language_model.model.layers.5.mlp.up_proj"), (8, 64));
     }
 }

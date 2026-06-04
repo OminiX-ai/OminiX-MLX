@@ -25,5 +25,11 @@
       "full_attention": { "partial_rotary_factor": 0.25, "rope_theta": 1000000.0, "rope_type": "proportional" },
       "sliding_attention": { "rope_theta": 10000.0, "rope_type": "default" }
     }
+  },
+  "quantization": {
+    "group_size": 64, "bits": 4, "mode": "affine",
+    "language_model.model.layers.5.mlp.gate_proj": { "group_size": 64, "bits": 8 },
+    "language_model.model.layers.5.mlp.down_proj": { "group_size": 64, "bits": 8 },
+    "language_model.model.layers.5.mlp.up_proj": { "group_size": 64, "bits": 8 }
   }
 }
