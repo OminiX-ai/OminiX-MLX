@@ -71,6 +71,42 @@ pub fn get_weight(weights: &HashMap<String, Array>, key: &str) -> Result<Array> 
         .ok_or_else(|| Error::WeightNotFound(key.to_string()))
 }
 
+/// Build a frozen `nn::QuantizedEmbedding` from pre-loaded weight tensors.
+///
+/// Expects the following keys in `weights`:
+/// - `{prefix}.weight`
+/// - `{prefix}.scales`
+/// - `{prefix}.biases`
+///
+/// The `group_size` and `bits` should come from `QuantConfig::quant_for(prefix)`.
+/// The returned embedding is frozen and can also serve as the output-projection
+/// (`lm_head`) via `as_linear`.
+pub fn make_quantized_embedding(
+    weights: &HashMap<String, Array>,
+    prefix: &str,
+    group_size: i32,
+    bits: i32,
+) -> Result<nn::QuantizedEmbedding> {
+    let weight = get_weight(weights, &format!("{prefix}.weight"))?;
+    let scales = get_weight(weights, &format!("{prefix}.scales"))?;
+    let biases = get_weight(weights, &format!("{prefix}.biases"))?;
+
+    let inner = nn::Embedding {
+        weight: Param::new(weight),
+    };
+
+    let mut qe = nn::QuantizedEmbedding {
+        group_size,
+        bits,
+        scales: Param::new(scales),
+        biases: Param::new(biases),
+        inner,
+    };
+    qe.freeze_parameters(true);
+
+    Ok(qe)
+}
+
 /// Build a frozen `nn::QuantizedLinear` from pre-loaded weight tensors.
 ///
 /// Expects the following keys in `weights`:
