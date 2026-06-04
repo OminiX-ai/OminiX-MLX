@@ -17,10 +17,5 @@ tokenizers = "0.21"
 [dev-dependencies]
 anyhow = "1"
 
-[[example]]
-name = "inspect_gemma4"
-path = "examples/inspect_gemma4.rs"
-
-[[example]]
-name = "layer_parity"
-path = "examples/layer_parity.rs"
+# Examples (inspect_gemma4, layer_parity) are added in Task 7/8 and
+# auto-discovered by cargo from examples/*.rs — no [[example]] entries needed.
