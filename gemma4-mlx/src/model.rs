@@ -3,6 +3,7 @@
 use std::path::Path;
 
 use mlx_rs::{module::Module, nn, ops::indexing::IndexOp, Array};
+use mlx_rs_core::cache::{KVCache, KeyValueCache};
 
 use crate::block::TransformerBlock;
 use crate::config::{LayerKind, ModelArgs, QuantConfig};
@@ -23,6 +24,41 @@ pub struct Gemma4TextModel {
 }
 
 impl Gemma4TextModel {
+    /// Create one fresh KVCache per layer. Offsets start at 0.
+    pub fn new_caches(&self) -> Vec<KVCache> {
+        (0..self.layers.len()).map(|_| KVCache::new()).collect()
+    }
+
+    /// Cached forward for prefill (L>1, fresh caches) AND decode (L==1, warm caches).
+    /// `caches` must have one entry per layer.
+    #[allow(non_snake_case)]
+    pub fn forward_cached(&mut self, tokens: &Array, caches: &mut [KVCache], last_only: bool) -> Result<Array> {
+        let L = tokens.shape()[1];
+        let mut h = self.embed_tokens.forward(tokens)?;
+        h = h.multiply(&Array::from_f32(self.embed_scale))?;
+
+        for (i, layer) in self.layers.iter_mut().enumerate() {
+            let off = caches[i].offset();
+            let mask = decode_mask(self.layer_types[i], L, off, self.sliding_window)?;
+            h = layer.forward_cached(&h, mask.as_ref(), &mut caches[i])?;
+        }
+
+        h = self.norm.forward(&h)?;
+
+        if last_only {
+            h = h.index((.., -1_i32.., ..));
+        }
+
+        let mut logits = self.embed_tokens.as_linear(&h)?;
+
+        if self.final_logit_softcapping > 0.0 {
+            let cap = Array::from_f32(self.final_logit_softcapping);
+            logits = mlx_rs::ops::tanh(&logits.divide(&cap)?)?.multiply(&cap)?;
+        }
+
+        Ok(logits)
+    }
+
     /// Forward pass: tokens [B, L] → logits [B, *, vocab_size].
     ///
     /// `last_only`: if true, slice hidden to the last position before the lm_head projection,
@@ -107,4 +143,31 @@ pub fn load_model(model_dir: impl AsRef<Path>) -> Result<Gemma4TextModel> {
         layer_types: args.layer_types.clone(),
         sliding_window: args.sliding_window,
     })
+}
+
+/// Per-layer attention mask given query length L at cache offset `off`.
+///
+/// Prefill (L>1): always return a mask — causal for Global, windowed-causal for Sliding.
+/// Decode  (L==1): Global layers see all cached keys → no mask (SDPA runs unmasked);
+///                 Sliding layers restrict to the last `window` keys → explicit mask.
+#[allow(non_snake_case)]
+fn decode_mask(kind: LayerKind, L: i32, off: i32, window: i32) -> Result<Option<Array>> {
+    if L > 1 {
+        // Prefill: causal mask over the fresh sequence (off==0 on a cold cache).
+        Ok(Some(match kind {
+            LayerKind::Global  => full_causal_mask(L, off)?,
+            LayerKind::Sliding => sliding_window_mask(L, off, window)?,
+        }))
+    } else {
+        // Decode (L==1): single query at absolute position `off`.
+        // Global: attends to all cached keys [0..off] → no mask needed.
+        // Sliding: query at `off` must only see keys in [off-window, off] →
+        //   sliding_window_mask(1, off, window) produces shape [1, off+1] where
+        //   visible[0, k] = (off >= k) && (off <= k + window)
+        //                 = k in [off-window, off]   ✓
+        match kind {
+            LayerKind::Global  => Ok(None),
+            LayerKind::Sliding => Ok(Some(sliding_window_mask(1, off, window)?)),
+        }
+    }
 }
