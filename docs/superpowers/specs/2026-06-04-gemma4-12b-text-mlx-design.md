@@ -1,6 +1,6 @@
 # Gemma 4 12B (文本) MLX 接入设计
 
-- 日期: 2026-06-04(rev4,纳入三轮代码评审 + HF/vLLM 源码核实)
+- 日期: 2026-06-04(rev5,四轮代码评审 + HF/vLLM/本库源码核实,可进 M0)
 - 分支: `feat/gemma4-12b`
 - 范围: **纯文本先行**(视觉/音频多模态留待后续阶段)
 - 目标 crate: 新建 `gemma4-mlx`(参照 `qwen3-mlx` 结构,但**不复用其量化加载器**,见 §6)
@@ -69,8 +69,9 @@ gemma4-mlx/src/
 
 **对外接口:**
 ```rust
-pub fn load_model(model_dir: &str) -> Result<Gemma4TextModel>;
-pub fn get_model_args(model_dir: &str) -> Result<ModelArgs>;
+pub fn load_model(model_dir: impl AsRef<Path>) -> Result<Gemma4TextModel>;
+pub fn get_model_args(model_dir: impl AsRef<Path>) -> Result<ModelArgs>;
+// (用 impl AsRef<Path>,与本库其他 crate 一致)
 pub use mlx_rs_core::{cache::{KVCache, KeyValueCache}, load_tokenizer};
 // Generate:镜像 qwen3-mlx 的自有 Generate<'a, C>(model.rs:744 模式),
 // 而非 core builder(后者需实现 mlx-rs-core::ModelInput/ModelOutput,本期不做)。
@@ -115,7 +116,7 @@ struct Attention {
   4. `value_in = if v_proj.is_some() { v_proj(x) } else { raw_kv }`(global 层取 raw k_proj 输出,**不是最终 k**)
   5. `v = v_norm(value_in)`(**v 不过 RoPE**)
 - 16×256=4096 ≠ hidden 3840 → q/o 维度独立,按 head_dim×heads 设定。
-- q/k/v norm 均作用于 head_dim 维。
+- **reshape 顺序**:投影后先 reshape 成 `[B, L, heads, head_dim]`,q/k/v norm 在**最后一维(head_dim)**上做,再 transpose 成 `[B, heads, L, head_dim]` 进 attention。global q 输出 16×512=8192,reshape 维度尤需对齐。
 
 ### 5.5 rope.rs — 双 RoPE(方案②A,本地)
 - 滑窗层:`nn::Rope` dims=256 θ=10000 default(可直接复用)。
@@ -134,14 +135,16 @@ struct Attention {
 - **`layer_scalar`(源码已定)**:在 decoder layer forward **末尾**、attention residual 与 MLP residual 都完成后,对整层输出乘标量:`hidden_states *= layer_scalar`。12B `hidden_size_per_layer_input=0`、`enable_moe_block=false`,无 PLE/MoE 分支,文本路径就是两次 residual 后整层乘 `layer_scalar`。
 
 ### 5.8 Mask 构造(方案①A,但按层类型 + 修正 decode)
-- 全局层:全因果 mask。
-- 滑窗层:因果 + 窗口 1024 带状 mask。
-- **关键修正(评审 #5)**:`create_attention_mask` 在 `T==1`(decode)返回 `None`;在不截断 KV 的方案下,滑窗层 decode 步必须**显式构造单步滑窗 mask**(对超出窗口的历史置 -inf),否则会错误看到全历史。prefill 与 decode 各自按层类型生成 mask;不复用单一全局 mask。
+- **统一用本库 `create_causal_mask` 的 bool 语义**(`true`=可见,`false`=屏蔽),不混用 -inf 加性 mask;经 `SdpaMask::Array` 传入 fast SDPA。
+- 全局层:`create_causal_mask(N, offset, None, None)`(全因果)。
+- 滑窗层:`create_causal_mask(N, offset, Some(1024), None)` —— 该 helper **已支持 window_size**,直接复用,无需手搓带状矩阵。
+- **关键修正(评审 #5)**:`create_attention_mask` 在 `T==1`(decode)对无 `max_size` 的 cache 返回 `None`;在不截断 KV 的方案下,滑窗层 decode 步必须**显式构造单步滑窗 bool mask**(`create_causal_mask(1, offset, Some(1024), None)`,屏蔽窗口外历史),否则会错误看到全历史。prefill 与 decode 各自按层类型生成 mask;不复用单一全局 mask。
 - 备选:给滑窗层用带 `max_size=1024` 的 cache,让 `create_attention_mask` 自动加窗(归入 M3)。
 - **R8**:窗口边界(可见 1024 还是含当前 token 的 1025)须与参考实现逐 token 对齐确认。
 
 ### 5.9 KV cache
 - 每层一个标准增长 `KVCache`(全局 1 KV head;滑窗 8 KV head)。窗口语义靠 §5.8 的 mask 实现。
+- **写入时机(防止 cache 到 raw tensor)**:进 cache 的 K 是 **k_norm + RoPE 之后**的张量;进 cache 的 V 是 **v_norm 之后**的张量;global 层的 V 源自 raw k_proj 但**不过 RoPE**(§5.4)。即 cache 存的是 attention 直接消费的 K/V,不是投影原始输出。
 
 ### 5.10 输出
 - `final_norm` → tied embedding 反投影 → **`final_logit_softcapping`**:`logits = 30 * tanh(logits/30)`,在采样前应用。
@@ -173,9 +176,9 @@ struct Attention {
 - R8 滑窗边界是 1024 还是含当前 token 的 1025,需与参考逐 token 对齐(§5.8)
 
 ## 9. 里程碑
-1. **M0 权重/配置 spike**(评审建议):解析 `config.json` + `model.safetensors.index.json`;分别实例化 layer 0(sliding)与 layer 5(full),逐键确认存在、每模块 bits/group_size 正确(MLP 8bit/其余 4bit)、global 层 v_proj=None 路径可跑;实测加载峰值内存与可用上下文。产出 R1–R8 结论。**不求完整生成**。
+1. **M0 权重/配置 spike**(评审建议):解析 `config.json` + `model.safetensors.index.json`;分别实例化 layer 0(sliding)与 layer 5(full),逐键确认存在、每模块 bits/group_size 正确(MLP 8bit/其余 4bit)、global 层 v_proj=None 路径可跑;layer 0/5 最小 forward 与参考对齐;**仅估算** KV 内存(完整 48 层前向前无法可信测上下文上限)。产出 R1–R8 结论。**不求完整生成、不实测上下文上限**。
 2. **M1 解码器**:48 层前向 + 按层 mask + 双 RoPE + q/k/v-norm(v 不过 RoPE)+ scaling=1.0 + 层末 layer_scalar + final softcap,逐层对齐。
-3. **M2 生成**:自有 `Generate`,端到端贪婪解码与参考一致,`chat_gemma4.rs` 跑通。
+3. **M2 生成**:自有 `Generate`,端到端贪婪解码与参考一致,`chat_gemma4.rs` 跑通;**实测可用上下文上限**、峰值内存、tok/s。
 4. **M3(可选)**:滑窗 RotatingKVCache(长上下文)、proportional RoPE 提升到 mlx-rs-core。
 
 ## 10. 后续阶段(本期外)
