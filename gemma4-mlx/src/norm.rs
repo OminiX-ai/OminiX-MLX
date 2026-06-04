@@ -1,4 +1,8 @@
 //! Gemma 4 RMSNorm: standard gamma (weight*norm) or no-scale (pure norm, for v_norm).
+//!
+//! TODO(parity, M1): HF `Gemma4RMSNorm` upcasts to f32 (`_norm(x.float())`) before
+//! computing variance, then casts back. We compute in the input dtype — fine for f32
+//! (the M0 reference dump runs in f32); if bf16-activation parity drifts vs HF, upcast here.
 
 use mlx_rs::{Array, error::Exception, ops::rsqrt};
 
