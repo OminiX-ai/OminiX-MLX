@@ -1,18 +1,17 @@
 //! Gemma 4 full text model: embed (×√hidden) → 48 blocks → final norm → tied lm_head → softcap.
-//! TODO(M1-Task3): forward pass is implemented in Task 3.
 
 use std::path::Path;
 
-use mlx_rs::nn;
+use mlx_rs::{module::Module, nn, ops::indexing::IndexOp, Array};
 
 use crate::block::TransformerBlock;
 use crate::config::{LayerKind, ModelArgs, QuantConfig};
 use crate::error::{Error, Result};
+use crate::mask::{full_causal_mask, sliding_window_mask};
 use crate::norm::GemmaRmsNorm;
 use crate::weights::{get_weight, load_all_weights, make_quantized_embedding};
 
-/// Gemma 4 full text model (struct only; forward is Task 3).
-#[allow(dead_code)] // TODO(M1-Task3): all fields used by forward; remove this attr then.
+/// Gemma 4 full text model.
 pub struct Gemma4TextModel {
     pub(crate) embed_tokens: nn::QuantizedEmbedding,
     pub(crate) embed_scale: f32,
@@ -21,6 +20,53 @@ pub struct Gemma4TextModel {
     pub(crate) final_logit_softcapping: f32,
     pub(crate) layer_types: Vec<LayerKind>,
     pub(crate) sliding_window: i32,
+}
+
+impl Gemma4TextModel {
+    /// Forward pass: tokens [B, L] → logits [B, *, vocab_size].
+    ///
+    /// `last_only`: if true, slice hidden to the last position before the lm_head projection,
+    /// returning logits of shape [B, 1, vocab_size] rather than [B, L, vocab_size].
+    pub fn forward(&mut self, tokens: &Array, last_only: bool) -> Result<Array> {
+        // Embed tokens and scale by √hidden_size.
+        let mut h = self.embed_tokens.forward(tokens)?; // [B, L, hidden]
+        h = h.multiply(&Array::from_f32(self.embed_scale))?;
+
+        let seq_len = h.shape()[1]; // L
+
+        // Build both mask variants once; choose per-layer below.
+        let full_mask = full_causal_mask(seq_len, 0)?;
+        let sliding_mask = sliding_window_mask(seq_len, 0, self.sliding_window)?;
+
+        // Per-layer forward with the appropriate mask kind.
+        for i in 0..self.layers.len() {
+            let mask = match self.layer_types[i] {
+                LayerKind::Global => &full_mask,
+                LayerKind::Sliding => &sliding_mask,
+            };
+            h = self.layers[i].forward(&h, mask)?;
+        }
+
+        // Final layer norm.
+        h = self.norm.forward(&h)?;
+
+        // Optionally keep only the last token's hidden state → [B, 1, hidden].
+        if last_only {
+            h = h.index((.., -1_i32.., ..));
+        }
+
+        // Tied output projection: embed_tokens.as_linear → [B, *, vocab_size].
+        let mut logits = self.embed_tokens.as_linear(&h)?;
+
+        // Logit soft-capping: logits = cap * tanh(logits / cap).
+        if self.final_logit_softcapping > 0.0 {
+            let cap = Array::from_f32(self.final_logit_softcapping);
+            logits = mlx_rs::ops::tanh(&logits.divide(&cap)?)?
+                .multiply(&cap)?;
+        }
+
+        Ok(logits)
+    }
 }
 
 /// Load the full Gemma 4 text model from `model_dir`.
