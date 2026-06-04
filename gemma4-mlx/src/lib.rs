@@ -6,8 +6,10 @@ pub mod config;
 pub mod error;
 pub mod mask;
 pub mod mlp;
+pub mod model;
 pub mod norm;
 pub mod rope;
 pub mod weights;
 
 pub use error::{Error, Result};
+pub use model::{load_model, Gemma4TextModel};
