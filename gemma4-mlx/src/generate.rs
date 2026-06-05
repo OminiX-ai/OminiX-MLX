@@ -1,5 +1,5 @@
 //! Greedy token generation: prefill prompt, then autoregressive decode with KV cache.
-use mlx_rs::Array;
+use mlx_rs::{ops::indexing::argmax, Array};
 use crate::model::Gemma4TextModel;
 use crate::error::Result;
 
@@ -27,16 +27,17 @@ pub fn generate_greedy(
 
 /// argmax over the last dim of a [1,1,vocab] logits array.
 fn argmax_last(logits: &Array) -> Result<i32> {
-    // Cast to f32 (model may output bfloat16), eval to materialise, then linear argmax.
-    // Pattern copied directly from examples/model_parity.rs lines 106-108.
-    let logits_f32 = logits.as_type::<f32>()?;
-    logits_f32.eval()?;
-    let values: Vec<f32> = logits_f32.as_slice::<f32>().to_vec();
-    let idx = values
-        .iter()
-        .enumerate()
-        .max_by(|(_, a), (_, b)| a.partial_cmp(b).unwrap())
-        .map(|(i, _)| i)
-        .unwrap_or(0);
-    Ok(idx as i32)
+    Ok(argmax(logits, None)?.item::<i32>())
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn argmax_last_matches_cpu_scan() {
+        let logits = Array::from_slice(&[-1.0f32, 0.25, 3.5, 3.0], &[1, 1, 4]);
+
+        assert_eq!(argmax_last(&logits).unwrap(), 2);
+    }
 }

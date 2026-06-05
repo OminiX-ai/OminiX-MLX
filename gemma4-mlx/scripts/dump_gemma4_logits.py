@@ -6,7 +6,7 @@ disk (never materialized), so only the text path is resident. Runs `language_mod
 position via the official `logits_from_hidden` (tied embed_tokens.as_linear +
 final_logit_softcapping) — exactly our Rust `Gemma4TextModel::forward(.., last_only=true)`.
 
-Usage: python scripts/dump_gemma4_logits.py <MODEL_DIR> <OUT_DIR>
+Usage: python gemma4-mlx/scripts/dump_gemma4_logits.py <MODEL_DIR> <OUT_DIR>
 Outputs:
     tokens.npy        [1, L] int32
     hidden_last.npy   [1, hidden] float32   (normed hidden at last position; fallback compare)

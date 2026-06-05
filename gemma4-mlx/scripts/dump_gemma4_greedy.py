@@ -4,7 +4,7 @@
 the growing token sequence through the text model and takes argmax of the last-position
 logits (no cache needed for small K — keeps the reference dead-simple and unambiguous).
 
-Usage: python scripts/dump_gemma4_greedy.py <MODEL_DIR> <OUT_DIR> [K]
+Usage: python gemma4-mlx/scripts/dump_gemma4_greedy.py <MODEL_DIR> <OUT_DIR> [K]
 Outputs: <OUT_DIR>/greedy_ids.json = {"prompt": [...], "greedy": [id0, id1, ...]}
 Validates our Rust `generate_greedy` token-for-token.
 """

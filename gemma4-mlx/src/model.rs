@@ -167,7 +167,31 @@ fn decode_mask(kind: LayerKind, L: i32, off: i32, window: i32) -> Result<Option<
         //                 = k in [off-window, off]   ✓
         match kind {
             LayerKind::Global  => Ok(None),
+            LayerKind::Sliding if off <= window => Ok(None),
             LayerKind::Sliding => Ok(Some(sliding_window_mask(1, off, window)?)),
         }
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn sliding_decode_before_window_needs_no_mask() {
+        let mask = decode_mask(LayerKind::Sliding, 1, 1024, 1024).unwrap();
+
+        assert!(mask.is_none());
+    }
+
+    #[test]
+    fn sliding_decode_after_window_masks_old_keys() {
+        let mask = decode_mask(LayerKind::Sliding, 1, 1025, 1024).unwrap().unwrap();
+        let v: Vec<bool> = mask.as_slice::<bool>().to_vec();
+
+        assert_eq!(v.len(), 1026);
+        assert!(!v[0]);
+        assert!(v[1]);
+        assert!(v[1025]);
     }
 }
