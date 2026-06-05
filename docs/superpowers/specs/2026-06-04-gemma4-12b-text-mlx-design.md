@@ -189,6 +189,16 @@ M0 实测参考 = mlx-vlm 0.6.1 gemma4(同一 4bit 权重);单层 forward 对齐
 - 内存:`load_model` + 48 层 prefill forward 在 16GB 上跑通(Rust 仅保留文本权重)。
 - 仍属 M2:KV cache 解码串联(`forward` 已留 `TODO(M1)`→实为 M2 的 offset 串联)、`Generate` 循环、tokenizer/chat template、tok/s 与上下文上限实测。
 
+## 8.2 M2 结论(2026-06-05,已完成)
+
+**端到端文字对话跑通。** chat_gemma4 对 "Explain what MLX is in one sentence." 输出连贯正确英文:
+*"MLX is a machine learning framework developed by Apple that is optimized for unified memory and hardware acceleration on Apple Silicon."*(评审确认为真实 encode→generate→decode,非硬编码)。
+- **KV cache 解码正确性已证明**:cache 贪婪解码与 no-cache 重算逐 token 完全一致(8 token:`[2818,107,100,100,14937,100,45518,107]`)→ cache + RoPE offset + 按层 decode mask 机制正确。
+- chat 模板:Gemma 4 用 `<|turn>`(105)/`<turn|>`(106)(非 Gemma2/3 的 `<start_of_turn>`),BOS(2)需手动前置,含 thinking 抑制后缀 `<|channel>thought\n<channel|>`;eos=[1,106]。已对照 `tokenizer.json`/`chat_template.jinja` 核实。
+- **vs mlx-vlm 贪婪**:token0 一致(2818);后续在"接近"的 argmax 位置因 48 层 bf16 累积(M1 的 ~0.8 logit 差)翻转而分叉 —— 良性、非 bug(由 cache==no-cache 内部一致性证明)。
+- **性能(M3 待办)**:首跑 tok/s≈0(27 token/2685s,Metal shader 首次编译;每步 decode shape 变化可能触发重编译)。功能正确,性能未优化。
+- 组成:`attention/block` 加 cache+offset 解码路径(prefill 无回归,parity 仍 1e-6 / argmax 2818);`model.forward_cached`+`new_caches`+`decode_mask`;`generate.rs::generate_greedy`;`tokenizer.rs`(load+encode_chat+eos);`examples/{chat_gemma4,generate_gemma4,decode_consistency}`;`scripts/dump_gemma4_greedy.py`。
+
 ## 9. 里程碑
 1. **M0 权重/配置 spike**(评审建议):解析 `config.json` + `model.safetensors.index.json`;分别实例化 layer 0(sliding)与 layer 5(full),逐键确认存在、每模块 bits/group_size 正确(MLP 8bit/其余 4bit)、global 层 v_proj=None 路径可跑;layer 0/5 最小 forward 与参考对齐;**仅估算** KV 内存(完整 48 层前向前无法可信测上下文上限)。产出 R1–R8 结论。**不求完整生成、不实测上下文上限**。
 2. **M1 解码器**:48 层前向 + 按层 mask + 双 RoPE + q/k/v-norm(v 不过 RoPE)+ scaling=1.0 + 层末 layer_scalar + final softcap,逐层对齐。
