@@ -10,8 +10,10 @@ pub mod mlp;
 pub mod model;
 pub mod norm;
 pub mod rope;
+pub mod tokenizer;
 pub mod weights;
 
 pub use error::{Error, Result};
 pub use generate::generate_greedy;
 pub use model::{load_model, Gemma4TextModel};
+pub use tokenizer::{encode_chat, eos_ids, load_tokenizer};
