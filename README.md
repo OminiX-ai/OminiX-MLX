@@ -57,6 +57,7 @@ Built for production use with zero Python dependencies at inference time.
 │ mixtral-mlx   │         │ qwen3-tts-mlx   │         │                 │
 │ mistral-mlx   │         │ gpt-sovits-mlx  │         │                 │
 │ qwen3.5-35B   │         │ step-audio2-mlx │         │                 │
+│ gemma4-mlx    │         │                 │         │                 │
 │ moxin-vlm-mlx │         │                 │         │                 │
 │ minicpm-sala   │         │                 │         │                 │
 │ deepseek-ocr2 │         │                 │         │                 │
@@ -162,6 +163,7 @@ OminiX-MLX/
 ├── mixtral-mlx/         # Mixtral 8x7B/8x22B
 ├── mistral-mlx/         # Mistral 7B
 ├── qwen3.5-35B-mlx/     # Qwen3.5-35B LLM
+├── gemma4-mlx/          # Gemma 4 12B text inference (4-bit)
 ├── moxin-vlm-mlx/       # Moxin-7B VLM (vision-language)
 ├── MiniCPM-SALA-MLX/    # MiniCPM-SALA 9B (hybrid attention, 1M context)
 ├── deepseek-ocr2-mlx/   # DeepSeek-OCR-2 (document understanding)
@@ -195,6 +197,7 @@ OminiX-MLX/
 | GLM-4.7-Flash | `glm-4.7-flash-mlx` | — | Latest GLM flash model |
 | Mixtral | `mixtral-mlx` | 8x7B, 8x22B | MoE architecture |
 | Mistral | `mistral-mlx` | 7B | Sliding window attention |
+| Gemma 4 | `gemma4-mlx` | 12B | Text-only 4-bit inference |
 | MiniCPM-SALA | `minicpm-sala-mlx` | 9B | Hybrid attention (sparse + lightning), 1M context, OpenAI-compatible API |
 
 ### Vision-Language Models (VLMs)
@@ -598,6 +601,7 @@ Benchmarks on Apple M3 Max (128GB):
 | glm4-moe-mlx | [README](glm4-moe-mlx/README.md) | GLM4-MoE |
 | mixtral-mlx | [README](mixtral-mlx/README.md) | Mixtral MoE |
 | mistral-mlx | [README](mistral-mlx/README.md) | Mistral 7B |
+| gemma4-mlx | [README](gemma4-mlx/README.md) | Gemma 4 12B text inference |
 | moxin-vlm-mlx | [README](moxin-vlm-mlx/README.md) | Moxin-7B VLM |
 | minicpm-sala-mlx | [README](MiniCPM-SALA-MLX/README.md) | MiniCPM-SALA 9B (hybrid attention, 1M context) |
 | ominix-api | [README](ominix-api/README.md) | Unified OpenAI-compatible API server (ASR + TTS + LLM + OCR) |
