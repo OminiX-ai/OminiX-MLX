@@ -372,6 +372,41 @@ impl VoiceCloner {
         })
     }
 
+    /// Swap to a different voice's fine-tuned weights, reloading ONLY the
+    /// per-voice T2S (GPT) and VITS (SoVITS) models and keeping the shared
+    /// BERT/HuBERT resident. This makes per-voice switching cheap and keeps
+    /// memory flat regardless of how many voices a server exposes — caching a
+    /// full `VoiceCloner` per voice would duplicate BERT (~1.4GB) + HuBERT
+    /// (~0.4GB) each time.
+    ///
+    /// Reference state (mel/prompt/text) is left intact; a caller that also
+    /// switches reference should call this FIRST, then set the reference. The
+    /// reloaded VITS uses the MLX backend (ONNX is per-voice and not assumed
+    /// present), so `vits_onnx` is cleared.
+    pub fn reload_voice_weights(
+        &mut self,
+        t2s_weights: &str,
+        vits_weights: &str,
+    ) -> Result<(), Error> {
+        for (label, path) in [("T2S weights", t2s_weights), ("VITS weights", vits_weights)] {
+            if !Path::new(path).exists() {
+                return Err(Error::Message(format!("{} not found: {}", label, path)));
+            }
+        }
+
+        self.t2s = load_t2s_model(t2s_weights)?;
+        self.vits = if let Some(ref pretrained_base) = self.config.vits_pretrained_base {
+            load_vits_model_with_finetuned(pretrained_base, vits_weights)?
+        } else {
+            load_vits_model(vits_weights)?
+        };
+        // Per-voice ONNX is not assumed; decode the swapped voice via MLX VITS.
+        self.vits_onnx = None;
+        self.config.t2s_weights = t2s_weights.to_string();
+        self.config.vits_weights = vits_weights.to_string();
+        Ok(())
+    }
+
     /// Create with default configuration
     pub fn with_defaults() -> Result<Self, Error> {
         Self::new(VoiceClonerConfig::default())
