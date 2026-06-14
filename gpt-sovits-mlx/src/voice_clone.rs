@@ -1772,10 +1772,7 @@ impl VoiceCloner {
     /// Vocode semantic tokens to audio
     fn vocode(&mut self, tokens: &[i32], phoneme_ids: &Array, ref_mel: &Array) -> Result<Array, Error> {
         let codes = Array::from_slice(tokens, &[1, 1, tokens.len() as i32]);
-
-        let text_ids = phoneme_ids.squeeze()
-            .map_err(|e| Error::Message(e.to_string()))?;
-        let text_for_vits = text_ids.index(mlx_rs::ops::indexing::NewAxis);
+        let text_for_vits = text_for_vits(phoneme_ids)?;
 
         let audio = self.vits.decode(&codes, &text_for_vits, Some(ref_mel), self.config.noise_scale, self.config.speed)
             .map_err(|e| Error::Message(e.to_string()))?;
@@ -1918,6 +1915,32 @@ fn is_cjk_char(c: char) -> bool {
         '\u{AC00}'..='\u{D7AF}' |  // Korean Hangul
         '\u{1100}'..='\u{11FF}'    // Korean Jamo
     )
+}
+
+fn text_for_vits(phoneme_ids: &Array) -> Result<Array, Error> {
+    match phoneme_ids.shape().len() {
+        2 => Ok(phoneme_ids.clone()),
+        1 => Ok(phoneme_ids.index(mlx_rs::ops::indexing::NewAxis)),
+        rank => Err(Error::Message(format!(
+            "VITS text expects rank 1 or 2 phoneme IDs, got rank {rank}"
+        ))),
+    }
+}
+
+#[cfg(test)]
+mod vocode_shape_tests {
+    use super::*;
+    use mlx_rs::transforms::eval;
+
+    #[test]
+    fn should_preserve_2d_vits_text_shape_when_single_phoneme() {
+        let phoneme_ids = Array::from_slice(&[42i32], &[1, 1]);
+
+        let text = text_for_vits(&phoneme_ids).expect("shape conversion should succeed");
+        eval([&text]).expect("text shape should evaluate");
+
+        assert_eq!(text.shape(), &[1, 1]);
+    }
 }
 
 /// Python-compatible `cut5` text segmentation: split at every punctuation mark,
