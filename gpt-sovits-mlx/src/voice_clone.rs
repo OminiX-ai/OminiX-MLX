@@ -1017,56 +1017,10 @@ impl VoiceCloner {
                     (slice.iter().map(|s| s * s).sum::<f32>() / slice.len() as f32).sqrt()
                 }).collect();
 
-                // Walk backwards to find the last "real speech" window
-                // Real speech: RMS > 0.03, and it's part of the main content
-                // (not an isolated burst after silence)
-                let speech_thresh = 0.05f32;  // Raised: breathing (0.02-0.04) now classified as non-speech
-                let silence_thresh = 0.02f32; // Raised: catches breathing sounds that were slipping through
-
-                // Find the cut point by detecting "silence gap after speech"
-                // Walk backwards: skip trailing silence, skip any burst, find silence gap
-                let mut w = n_windows - 1;
-
-                // Phase 1: Skip trailing silence
-                while w > 0 && rms_vals[w] < silence_thresh {
-                    w -= 1;
-                }
-                let last_energy = w; // last window with energy
-
-                // Phase 2: Check if there's a silence gap before this energy block
-                // Walk backwards through the energy block
-                while w > 0 && rms_vals[w] >= silence_thresh {
-                    w -= 1;
-                }
-                let energy_block_start = w + 1;
-
-                // Phase 3: Check if there's a silence gap here
-                let mut gap_count = 0;
-                while w > 0 && rms_vals[w] < silence_thresh {
-                    gap_count += 1;
-                    w -= 1;
-                }
-                let gap_end_window = w + 1; // first window of the silence gap
-
-                // Phase 4: Check if there's speech BEFORE the gap
-                let has_speech_before_gap = w > 2 && rms_vals[..=w].iter().any(|&r| r > speech_thresh);
-
-                // Decision: if there's a silence gap (>= 100ms = 2 windows) between
-                // speech and an isolated energy block, cut at the gap.
-                // Only cut if the burst is short (<20% of total) — long blocks are real speech.
-                let burst_len = last_energy.saturating_sub(energy_block_start) + 1;
-                let burst_is_short = burst_len < n_windows / 5;
-
-                let trim_window_idx = if gap_count >= 2 && has_speech_before_gap && burst_is_short {
-                    // Cut at the start of the silence gap, with small margin
-                    let cut_at = gap_end_window + 1; // keep 1 window into the gap for decay
-                    eprintln!("   [TRIM] Chunk {}: detected silence gap at window {} ({}ms), cutting burst ({} wins) at {}-{}",
-                             i, gap_end_window, gap_end_window * 50, burst_len, energy_block_start, last_energy);
-                    cut_at.min(n_windows)
-                } else {
-                    // No gap pattern — just trim trailing silence
-                    (last_energy + 2).min(n_windows) // +2 windows (100ms) margin
-                };
+                // Decide where to cut: protect a genuine (speech-level) final
+                // syllable while still trimming quiet T2S over-generation
+                // bursts. See `resolve_trim_window`.
+                let trim_window_idx = resolve_trim_window(&rms_vals);
 
                 let trim_pos_new = (trim_window_idx * win).min(samples.len());
 
@@ -2379,6 +2333,64 @@ fn array_to_f32_samples(audio: &Array) -> Result<Vec<f32>, Error> {
     Ok(flat.as_slice().to_vec())
 }
 
+/// Decide where (in 50ms-window units) to trim a chunk's trailing samples,
+/// given per-window RMS levels. Caller guarantees `rms_vals.len() > 4`.
+///
+/// The trailing energy block is treated as spurious T2S over-generation (and
+/// cut at the preceding silence gap) ONLY when it is both short AND sub-speech
+/// in level. A genuine final syllable is speech-level and is kept — this is the
+/// fix for the "末字被吞" failure where e.g. "今天天气真不[~100ms gap]错" had 错
+/// trimmed as if it were a noise burst. Quiet (breathing-level) trailing noise
+/// is still cut, preserving the original over-generation cleanup.
+fn resolve_trim_window(rms_vals: &[f32]) -> usize {
+    let n_windows = rms_vals.len();
+    let speech_thresh = 0.05f32; // breathing (0.02-0.04) is below this
+    let silence_thresh = 0.02f32;
+
+    // Phase 1: skip trailing silence.
+    let mut w = n_windows - 1;
+    while w > 0 && rms_vals[w] < silence_thresh {
+        w -= 1;
+    }
+    let last_energy = w;
+
+    // Phase 2: walk back through the trailing energy block.
+    while w > 0 && rms_vals[w] >= silence_thresh {
+        w -= 1;
+    }
+    let energy_block_start = w + 1;
+
+    // Phase 3: count a silence gap immediately before that block.
+    let mut gap_count = 0;
+    while w > 0 && rms_vals[w] < silence_thresh {
+        gap_count += 1;
+        w -= 1;
+    }
+    let gap_end_window = w + 1; // first window of the silence gap
+
+    // Phase 4: is there real speech before the gap?
+    let has_speech_before_gap = w > 2 && rms_vals[..=w].iter().any(|&r| r > speech_thresh);
+
+    let burst_len = last_energy.saturating_sub(energy_block_start) + 1;
+    let burst_is_short = burst_len < n_windows / 5;
+    // A genuine final syllable is speech-level; only quiet trailing blocks are
+    // real over-generation worth cutting. (`get` guards the degenerate
+    // all-silence case where the block range would be empty.)
+    let burst_max_rms = rms_vals
+        .get(energy_block_start..=last_energy)
+        .map(|s| s.iter().copied().fold(0.0f32, f32::max))
+        .unwrap_or(0.0);
+    let burst_is_speech = burst_max_rms > speech_thresh;
+
+    if gap_count >= 2 && has_speech_before_gap && burst_is_short && !burst_is_speech {
+        // Cut at the silence gap, keeping one window into it for natural decay.
+        (gap_end_window + 1).min(n_windows)
+    } else {
+        // No spurious-burst pattern — just trim trailing silence (+100ms margin).
+        (last_energy + 2).min(n_windows)
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -2394,5 +2406,44 @@ mod tests {
         let tokens = vec![1, 2, 3, 1, 2, 3, 1, 2, 3];
         assert!(detect_repetition(&tokens, 3, 3));
         assert!(!detect_repetition(&tokens, 3, 4));
+    }
+
+    // resolve_trim_window: where to cut a chunk's trailing samples (in 50ms
+    // window units) given per-window RMS. Protects genuine final syllables.
+    const SP: f32 = 0.10; // speech-level window
+    const SI: f32 = 0.005; // silence window
+    const BR: f32 = 0.03; // breathing / quiet over-gen window (sub-speech)
+
+    #[test]
+    fn keeps_a_speech_level_final_syllable_after_a_short_gap() {
+        // "今天天气真不[gap]错" — the final syllable 错 sits above speech level
+        // after a ~100ms gap. The old heuristic cut it as a "noise burst"; it
+        // must now be kept.
+        let mut rms = vec![SP; 16];
+        rms.extend_from_slice(&[SI, SI]); // ~100ms gap
+        rms.extend_from_slice(&[0.15, 0.15, 0.15]); // 错 (speech level)
+        rms.extend_from_slice(&[SI, SI, SI]); // trailing silence
+        // Keep through the final syllable (window 20) + margin, not cut at the gap.
+        assert!(resolve_trim_window(&rms) >= 21);
+    }
+
+    #[test]
+    fn cuts_a_quiet_over_generation_burst_after_a_gap() {
+        // Same shape, but the trailing block is breathing-level noise — this is
+        // the real T2S over-generation the trim was built for: cut at the gap.
+        let mut rms = vec![SP; 16];
+        rms.extend_from_slice(&[SI, SI]);
+        rms.extend_from_slice(&[BR, BR, BR]); // quiet burst
+        rms.extend_from_slice(&[SI, SI, SI]);
+        // Cut at the gap (~window 16-17), dropping the quiet burst at 18-20.
+        assert!(resolve_trim_window(&rms) <= 18);
+    }
+
+    #[test]
+    fn trims_only_trailing_silence_when_there_is_no_gap_burst() {
+        let mut rms = vec![SP; 20];
+        rms.extend_from_slice(&[SI, SI, SI, SI]); // pure trailing silence
+        let pos = resolve_trim_window(&rms);
+        assert!((20..=22).contains(&pos), "expected ~last_energy+margin, got {pos}");
     }
 }
