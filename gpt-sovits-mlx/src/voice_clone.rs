@@ -145,10 +145,17 @@ impl Default for VoiceClonerConfig {
             vits_pretrained_base: None,  // Not using finetuned weights by default
             hubert_weights: format!("{}/hubert.safetensors", model_dir),
             sample_rate: 32000,
-            top_k: 15,  // Wider candidate pool avoids breathing tokens when rep-penalty culls top choices
+            // Match the GPT-SoVITS PyTorch reference exactly. Deviating from
+            // these (previously top_k=15 / rep=1.2 to avoid "breathing" tokens)
+            // changes the AR sampling trajectory so the model reaches EOS
+            // confidence ~9-12 semantic tokens early, clipping the final
+            // syllable ("尾字被切") — worst on overfit fine-tuned GPTs. With the
+            // reference values, generated length matches PyTorch (e.g. 111 vs
+            // 102 tokens, 3.63s vs 3.33s, ref 3.71s). See infer_panel_naive.
+            top_k: 5,  // Python default (GPT-SoVITS)
             top_p: 1.0,  // No nucleus sampling (Python default)
             temperature: 1.0,  // No scaling (Python default)
-            repetition_penalty: 1.2,  // Lighter penalty — 1.35 was too aggressive, forcing silence/breathing tokens
+            repetition_penalty: 1.35,  // Python default (GPT-SoVITS)
             noise_scale: 0.5,
             speed: 1.0,
             // ONNX VITS is default for best quality (batched decode, matches Python)
@@ -791,11 +798,19 @@ impl VoiceCloner {
         let ref_mel = self.reference_mel.clone()
             .ok_or(Error::ReferenceNotSet)?;
 
-        // Split text using Python-compatible cut5 method:
-        // Split at every punctuation mark, merge short segments (< 5 chars)
-        let mut chunks = cut5_split(text);
+        // Split text at SENTENCE boundaries only (akin to GPT-SoVITS cut3).
+        // Background: PyTorch moyoyo uses cut0 (no split), but a single long AR
+        // pass grows super-linearly in latency (~16s for a 130-char reply) and
+        // can hit the 1500-token cap (~60s) and truncate. The old cut5 split at
+        // EVERY punctuation incl. commas, producing sub-sentence fragments like
+        // "第二天它又去" that destabilise the AR into phrase repeats.
+        // cut3_split is the middle ground: it splits only on true sentence
+        // terminators (。！？!? + newline), never on commas, so every chunk is a
+        // complete, stable sentence (per-sentence quality identical to PyTorch)
+        // while bounding per-pass length for long replies.
+        let mut chunks = cut3_split(text);
 
-        // Trim whitespace from chunks (cut5_split already appends 。 and filters)
+        // Trim whitespace from chunks (cut3_split already appends 。 and filters)
         for chunk in chunks.iter_mut() {
             let trimmed = chunk.trim().to_string();
             *chunk = trimmed;
@@ -956,11 +971,16 @@ impl VoiceCloner {
                 }
             }
 
+            // Post-vocode cleanup (gap compression + trailing trim + breath trim)
+            // is DISABLED by default: it was an RMS-heuristic band-aid for assumed
+            // T2S over-generation, but it clips the real final syllable ("尾字被切")
+            // on every voice (luoxiang/yangmi badly, doubao mildly). The PyTorch
+            // moyoyo pipeline does none of this — it just concatenates vocoder
+            // fragments with a fixed silence interval, and that output is correct.
+            // Set TTS_TAIL_CLEANUP=1 to re-enable the old heuristic if ever needed.
+            let tail_cleanup = std::env::var("TTS_TAIL_CLEANUP").is_ok();
             // Compress internal silence gaps within the chunk.
-            // The T2S model sometimes generates semantic tokens that decode to silence
-            // mid-sentence, creating 500-900ms dead gaps. We detect these and compress
-            // them down to a short natural pause.
-            {
+            if tail_cleanup {
                 let gap_win = (sr * 0.05) as usize; // 50ms analysis window
                 let n_gap_wins = samples.len() / gap_win;
                 let gap_silence_thresh = 0.015f32;
@@ -1043,7 +1063,7 @@ impl VoiceCloner {
             let n_windows = samples.len() / win;
             let mut trim_pos = samples.len();
 
-            if n_windows > 4 {
+            if n_windows > 4 && tail_cleanup {
                 // Compute RMS per window
                 let rms_vals: Vec<f32> = (0..n_windows).map(|w| {
                     let start = w * win;
@@ -1076,7 +1096,7 @@ impl VoiceCloner {
             // Second pass: trim trailing breathing/low-energy tail from the end
             // Walk backwards from trim_pos and remove windows that are below speech threshold
             // but above silence (i.e., breathing artifacts that the burst detector didn't catch)
-            {
+            if tail_cleanup {
                 let breath_thresh = 0.04f32; // breathing is typically 0.02-0.04 RMS
                 let min_speech_windows = 4; // keep at least 200ms of audio
                 let n_windows_trimmed = trim_pos / win;
@@ -1683,28 +1703,32 @@ impl VoiceCloner {
         };
         let mut sampler = Sampler::new(sampling_config);
 
+        // PyTorch applies the repetition penalty against the FULL `y` sequence,
+        // which on EVERY step (including the first) includes the prompt semantic
+        // tokens: infer_panel_naive does sample(logits, y, ...) with y = prompts
+        // at idx 0, then y = prompts + generated thereafter (utils.py:122-128).
+        // Seed the sampler with the prompt tokens so our penalty matches exactly.
+        for &t in &prompt_tokens {
+            sampler.add_token(t);
+        }
         // Python masks EOS during first 11 tokens (idx < 11), so we mask here (idx=0)
-        // IMPORTANT: For first token, DON'T apply penalty to prompt tokens
-        // Python's behavior: penalty is only applied to previously GENERATED tokens
-        // At step 0, there are no generated tokens yet, so no penalty
         let (mut token_id, _) = sampler.sample_with_eos_mask(&last_logits)?;
         semantic_ids = Array::from_slice(&[token_id], &[1, 1]);
         // all_tokens contains prompt + generated (Python behavior: returns prompts + new tokens to VITS)
         // This matches Python's infer_panel which returns pred_semantic that includes prompt semantic
-        let prompt_len = prompt_tokens.len();
         let mut all_tokens: Vec<i32> = prompt_tokens.clone();
         all_tokens.push(token_id);
+        // The first generated token is part of `y` for all subsequent penalty
+        // steps in PyTorch, so add it to the sampler history too.
+        sampler.add_token(token_id);
         // Track number of newly generated tokens (excluding prompt)
         let mut generated_count: usize = 1;
 
-        // Generation bounds - adjusted to match Python's token generation rate
-        // Python generates ~5-8 tokens per phoneme for natural speech
-        // Short text needs more tokens per phoneme for complete pronunciation
-        let tokens_per_phoneme = if phoneme_count <= 10 { 6.0 } else { 4.0 };
-        let _target_tokens = (phoneme_count as f32 * tokens_per_phoneme) as usize;
-        let max_tokens = (phoneme_count * 10).max(100);
-        // min_tokens: Allow EOS after generating at least 4 tokens per phoneme for short text
-        let min_tokens = (phoneme_count as f32 * if phoneme_count <= 10 { 4.0 } else { 3.0 }) as usize;
+        // PyTorch infer_panel_naive caps the AR loop at 1500 steps and otherwise
+        // stops ONLY on EOS (argmax or sampled). There is no per-phoneme length
+        // heuristic, so we don't impose one (it was clipping/short-circuiting).
+        let _ = phoneme_count;
+        let max_tokens = 1500;
 
         // Autoregressive generation
         for step in 1..max_tokens {
@@ -1736,9 +1760,12 @@ impl VoiceCloner {
             };
             token_id = sampled;
 
-            // EOS detection: match Python exactly (line 871):
-            //   if torch.argmax(logits, dim=-1)[0] == self.EOS or samples[0, 0] == self.EOS:
-            //       stop = True
+            // EOS detection — faithful port of PyTorch infer_panel_naive:871:
+            //   if argmax(logits) == EOS  OR  sampled == EOS:  stop
+            // argmax is taken on the raw logits AFTER the idx<11 EOS mask and
+            // BEFORE the repetition penalty, which is exactly how sample_internal
+            // computes `argmax_token`. PyTorch then returns y[:, :-1], i.e. it
+            // drops this final (EOS) token — we likewise do not push token_id.
             let eos_detected = token_id == eos_token || argmax_token == eos_token;
 
             if eos_detected {
@@ -1750,16 +1777,6 @@ impl VoiceCloner {
             all_tokens.push(token_id);
             sampler.add_token(token_id);
             generated_count += 1;
-
-            // Repetition detection for longer patterns (check only generated portion)
-            if generated_count > min_tokens && detect_repetition(&all_tokens[prompt_len..], 3, 8) {
-                eprintln!("   [T2S] Repetition detected at step {}", generated_count);
-                while generated_count > min_tokens && detect_repetition(&all_tokens[prompt_len..], 3, 5) {
-                    all_tokens.pop();
-                    generated_count -= 1;
-                }
-                break;
-            }
 
             semantic_ids = Array::from_slice(&[token_id], &[1, 1]);
         }
@@ -1970,6 +1987,75 @@ fn count_english_word2ph_entries(text: &str) -> usize {
     count
 }
 
+/// Sentence-level split (extends GPT-SoVITS `cut3`). Splits ONLY on true
+/// sentence terminators — `。！？!?` and newlines, NEVER commas/colons/`.` (to
+/// avoid breaking sub-sentence clauses or decimals like "18.5") — so each chunk
+/// is a complete sentence. This keeps the AR pass stable (no sub-sentence
+/// fragment repeats) while bounding per-pass length so long replies don't blow
+/// up AR latency or hit the 1500-token cap. The terminating punctuation is kept
+/// on each sentence so prosody (e.g. ？ rising tone) is preserved.
+fn cut3_split(text: &str) -> Vec<String> {
+    let text = text.trim_matches('\n').trim();
+    if text.is_empty() {
+        return vec![];
+    }
+    let enders: &[char] = &['。', '！', '？', '!', '?'];
+    let split_set: &[char] = &['，', '。', '？', '！', ',', '.', '?', '!', '~', ':', '：', '—', '…', '、', '；'];
+
+    let mut sentences: Vec<String> = Vec::new();
+    let mut cur = String::new();
+    for ch in text.chars() {
+        if ch == '\n' {
+            if !cur.trim().is_empty() {
+                sentences.push(std::mem::take(&mut cur));
+            } else {
+                cur.clear();
+            }
+        } else {
+            cur.push(ch);
+            if enders.contains(&ch) {
+                sentences.push(std::mem::take(&mut cur));
+            }
+        }
+    }
+    if !cur.trim().is_empty() {
+        sentences.push(cur);
+    }
+
+    sentences
+        .into_iter()
+        .map(|s| s.trim().to_string())
+        .filter(|s| !s.is_empty())
+        .filter(|s| s.chars().any(|c| c.is_alphanumeric() || is_cjk_char(c)))
+        .map(|mut s| {
+            if !s.ends_with(split_set) {
+                s.push('。');
+            }
+            s
+        })
+        .collect()
+}
+
+/// PyTorch moyoyo `cut0` ("不切"): no splitting. Returns the whole text as a
+/// single chunk after dropping pure-punctuation/empty input and appending a
+/// trailing "。" if it doesn't already end on a split punctuation. This matches
+/// `text_split_method="cut0"` used by every moyoyo speaker config, feeding the
+/// AR one fragment so short clauses can't destabilise into phrase repeats.
+#[allow(dead_code)]
+fn cut0_split(text: &str) -> Vec<String> {
+    let text = text.trim_matches('\n').trim();
+    if text.is_empty() || !text.chars().any(|c| c.is_alphanumeric() || is_cjk_char(c)) {
+        return vec![];
+    }
+    let splits_set: &[char] = &['，', '。', '？', '！', ',', '.', '?', '!', '~', ':', '：', '—', '…', '、', '；'];
+    let mut t = text.to_string();
+    if !t.ends_with(splits_set) {
+        t.push('。');
+    }
+    vec![t]
+}
+
+#[allow(dead_code)]
 fn cut5_split(text: &str) -> Vec<String> {
     let text = text.trim_matches('\n');
     if text.is_empty() {
