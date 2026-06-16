@@ -23,7 +23,7 @@ use mlx_rs::{
     module::{Module, Param},
     nn,
     ops::{softmax_axis, transpose_axes},
-    Array,
+    Array, Dtype,
 };
 use serde::Deserialize;
 
@@ -936,8 +936,32 @@ pub fn load_bert_weights(
     Ok(())
 }
 
-/// Load BERT model from safetensors file
+/// Load BERT model from a safetensors file with **bf16** in-memory weights.
+///
+/// bf16 halves resident memory vs f32 — this Chinese RoBERTa-large is 348M
+/// params, so ~1.3GB (f32) → ~0.7GB (bf16) — while keeping f32's *dynamic
+/// range*. That range is the whole point: the original loader force-upcast to
+/// f32 "for numerical stability" because **fp16**'s ±65504 range makes the
+/// `-1e9` attention mask overflow to NaN. bf16 shares f32's exponent range, so
+/// that failure mode does not exist. BERT here only produces conditioning
+/// features for the T2S model, which is insensitive to bf16's reduced mantissa
+/// (verified by the `bf16_bert_features_match_f32` cosine-similarity test).
+///
+/// MLX promotes `(Bfloat16, _) -> Bfloat16`, so the existing forward (which
+/// multiplies attention scores by an f32 `scale` constant) stays bf16
+/// end-to-end with no dtype mismatch and no forward-pass changes.
 pub fn load_bert_model(weights_path: impl AsRef<Path>) -> Result<BertModel, Error> {
+    load_bert_model_as(weights_path, Dtype::Bfloat16)
+}
+
+/// Same as [`load_bert_model`] but with an explicit in-memory weight dtype.
+/// Production always uses bf16 via [`load_bert_model`]; this is exposed so
+/// tests can load an f32 reference alongside the bf16 model and compare the
+/// emitted features.
+pub fn load_bert_model_as(
+    weights_path: impl AsRef<Path>,
+    dtype: Dtype,
+) -> Result<BertModel, Error> {
     let path = weights_path.as_ref();
 
     // Use large config for Chinese RoBERTa
@@ -945,13 +969,14 @@ pub fn load_bert_model(weights_path: impl AsRef<Path>) -> Result<BertModel, Erro
 
     let mut model = BertModel::new(config)?;
 
-    // Convert float16 → float32 for numerical stability
     let raw_weights = Array::load_safetensors(path)?;
     let weights: HashMap<String, Array> = raw_weights
         .into_iter()
         .map(|(k, v)| {
-            let v32 = v.as_type::<f32>().unwrap_or(v);
-            (k, v32)
+            // Cast to the requested in-memory dtype (default bf16). `as_dtype`
+            // takes a runtime `Dtype`, so we don't need to name `half::bf16`.
+            let conv = v.as_dtype(dtype).unwrap_or(v);
+            (k, conv)
         })
         .collect();
     load_bert_weights(&mut model, &weights)?;
@@ -963,6 +988,60 @@ pub fn load_bert_model(weights_path: impl AsRef<Path>) -> Result<BertModel, Erro
 mod tests {
     use super::*;
     use mlx_rs::transforms::eval;
+
+    /// bf16 BERT weights must produce essentially the same conditioning
+    /// features as the original f32 path. We load the SAME safetensors twice —
+    /// once as f32 (the old behaviour), once as bf16 (the new default) — run an
+    /// identical token sequence through both, and require very high cosine
+    /// similarity on the output features. This is what justifies halving the
+    /// resident memory: if the features match, the TTS conditioning is
+    /// unaffected.
+    ///
+    /// `#[ignore]`: needs the local ~1.3GB Chinese RoBERTa-large weights. Run
+    /// with `cargo test -p gpt-sovits-mlx bf16_bert_features_match_f32 -- --ignored --nocapture`.
+    #[test]
+    #[ignore = "needs local bert.safetensors (~1.3GB) under ~/.dora/models/primespeech/gpt-sovits-mlx/"]
+    fn bf16_bert_features_match_f32() {
+        let home = std::env::var("HOME").unwrap_or_else(|_| "/tmp".to_string());
+        let path = format!("{home}/.dora/models/primespeech/gpt-sovits-mlx/bert.safetensors");
+        if !std::path::Path::new(&path).exists() {
+            eprintln!("skip: {path} not found");
+            return;
+        }
+
+        let mut m_f32 = load_bert_model_as(&path, Dtype::Float32).expect("load f32 BERT");
+        let mut m_bf16 = load_bert_model_as(&path, Dtype::Bfloat16).expect("load bf16 BERT");
+
+        // A short [CLS] … [SEP] Chinese token sequence.
+        let ids = Array::from_slice(&[101i32, 2769, 1599, 3614, 671, 3221, 102], &[1, 7]);
+        let mut run = |m: &mut BertModel| {
+            m.forward(BertModelInput {
+                input_ids: &ids,
+                token_type_ids: None,
+                attention_mask: None,
+            })
+            .expect("BERT forward")
+        };
+        let out_f32 = run(&mut m_f32);
+        let out_bf16 = run(&mut m_bf16);
+        eval([&out_f32, &out_bf16]).unwrap();
+        assert_eq!(out_f32.shape(), out_bf16.shape());
+
+        let a: Vec<f32> = out_f32.as_type::<f32>().unwrap().as_slice().to_vec();
+        let b: Vec<f32> = out_bf16.as_type::<f32>().unwrap().as_slice().to_vec();
+        assert_eq!(a.len(), b.len());
+
+        let (mut dot, mut na, mut nb) = (0f64, 0f64, 0f64);
+        for (x, y) in a.iter().zip(b.iter()) {
+            let (x, y) = (*x as f64, *y as f64);
+            dot += x * y;
+            na += x * x;
+            nb += y * y;
+        }
+        let cos = dot / (na.sqrt() * nb.sqrt());
+        eprintln!("bf16 vs f32 BERT feature cosine similarity = {cos:.6}");
+        assert!(cos > 0.99, "bf16 BERT features diverged from f32: cos={cos}");
+    }
 
     #[test]
     fn test_bert_config_default() {
