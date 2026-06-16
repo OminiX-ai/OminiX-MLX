@@ -145,10 +145,17 @@ impl Default for VoiceClonerConfig {
             vits_pretrained_base: None,  // Not using finetuned weights by default
             hubert_weights: format!("{}/hubert.safetensors", model_dir),
             sample_rate: 32000,
-            top_k: 15,  // Wider candidate pool avoids breathing tokens when rep-penalty culls top choices
+            // Match the GPT-SoVITS PyTorch reference exactly. Deviating from
+            // these (previously top_k=15 / rep=1.2 to avoid "breathing" tokens)
+            // changes the AR sampling trajectory so the model reaches EOS
+            // confidence ~9-12 semantic tokens early, clipping the final
+            // syllable ("尾字被切") — worst on overfit fine-tuned GPTs. With the
+            // reference values, generated length matches PyTorch (e.g. 111 vs
+            // 102 tokens, 3.63s vs 3.33s, ref 3.71s). See infer_panel_naive.
+            top_k: 5,  // Python default (GPT-SoVITS)
             top_p: 1.0,  // No nucleus sampling (Python default)
             temperature: 1.0,  // No scaling (Python default)
-            repetition_penalty: 1.2,  // Lighter penalty — 1.35 was too aggressive, forcing silence/breathing tokens
+            repetition_penalty: 1.35,  // Python default (GPT-SoVITS)
             noise_scale: 0.5,
             speed: 1.0,
             // ONNX VITS is default for best quality (batched decode, matches Python)
@@ -370,6 +377,41 @@ impl VoiceCloner {
             reference_text: None,
             vits_onnx,
         })
+    }
+
+    /// Swap to a different voice's fine-tuned weights, reloading ONLY the
+    /// per-voice T2S (GPT) and VITS (SoVITS) models and keeping the shared
+    /// BERT/HuBERT resident. This makes per-voice switching cheap and keeps
+    /// memory flat regardless of how many voices a server exposes — caching a
+    /// full `VoiceCloner` per voice would duplicate BERT (~1.4GB) + HuBERT
+    /// (~0.4GB) each time.
+    ///
+    /// Reference state (mel/prompt/text) is left intact; a caller that also
+    /// switches reference should call this FIRST, then set the reference. The
+    /// reloaded VITS uses the MLX backend (ONNX is per-voice and not assumed
+    /// present), so `vits_onnx` is cleared.
+    pub fn reload_voice_weights(
+        &mut self,
+        t2s_weights: &str,
+        vits_weights: &str,
+    ) -> Result<(), Error> {
+        for (label, path) in [("T2S weights", t2s_weights), ("VITS weights", vits_weights)] {
+            if !Path::new(path).exists() {
+                return Err(Error::Message(format!("{} not found: {}", label, path)));
+            }
+        }
+
+        self.t2s = load_t2s_model(t2s_weights)?;
+        self.vits = if let Some(ref pretrained_base) = self.config.vits_pretrained_base {
+            load_vits_model_with_finetuned(pretrained_base, vits_weights)?
+        } else {
+            load_vits_model(vits_weights)?
+        };
+        // Per-voice ONNX is not assumed; decode the swapped voice via MLX VITS.
+        self.vits_onnx = None;
+        self.config.t2s_weights = t2s_weights.to_string();
+        self.config.vits_weights = vits_weights.to_string();
+        Ok(())
     }
 
     /// Create with default configuration
@@ -756,11 +798,19 @@ impl VoiceCloner {
         let ref_mel = self.reference_mel.clone()
             .ok_or(Error::ReferenceNotSet)?;
 
-        // Split text using Python-compatible cut5 method:
-        // Split at every punctuation mark, merge short segments (< 5 chars)
-        let mut chunks = cut5_split(text);
+        // Split text at SENTENCE boundaries only (akin to GPT-SoVITS cut3).
+        // Background: PyTorch moyoyo uses cut0 (no split), but a single long AR
+        // pass grows super-linearly in latency (~16s for a 130-char reply) and
+        // can hit the 1500-token cap (~60s) and truncate. The old cut5 split at
+        // EVERY punctuation incl. commas, producing sub-sentence fragments like
+        // "第二天它又去" that destabilise the AR into phrase repeats.
+        // cut3_split is the middle ground: it splits only on true sentence
+        // terminators (。！？!? + newline), never on commas, so every chunk is a
+        // complete, stable sentence (per-sentence quality identical to PyTorch)
+        // while bounding per-pass length for long replies.
+        let mut chunks = cut3_split(text);
 
-        // Trim whitespace from chunks (cut5_split already appends 。 and filters)
+        // Trim whitespace from chunks (cut3_split already appends 。 and filters)
         for chunk in chunks.iter_mut() {
             let trimmed = chunk.trim().to_string();
             *chunk = trimmed;
@@ -921,11 +971,16 @@ impl VoiceCloner {
                 }
             }
 
+            // Post-vocode cleanup (gap compression + trailing trim + breath trim)
+            // is DISABLED by default: it was an RMS-heuristic band-aid for assumed
+            // T2S over-generation, but it clips the real final syllable ("尾字被切")
+            // on every voice (luoxiang/yangmi badly, doubao mildly). The PyTorch
+            // moyoyo pipeline does none of this — it just concatenates vocoder
+            // fragments with a fixed silence interval, and that output is correct.
+            // Set TTS_TAIL_CLEANUP=1 to re-enable the old heuristic if ever needed.
+            let tail_cleanup = std::env::var("TTS_TAIL_CLEANUP").is_ok();
             // Compress internal silence gaps within the chunk.
-            // The T2S model sometimes generates semantic tokens that decode to silence
-            // mid-sentence, creating 500-900ms dead gaps. We detect these and compress
-            // them down to a short natural pause.
-            {
+            if tail_cleanup {
                 let gap_win = (sr * 0.05) as usize; // 50ms analysis window
                 let n_gap_wins = samples.len() / gap_win;
                 let gap_silence_thresh = 0.015f32;
@@ -1008,7 +1063,7 @@ impl VoiceCloner {
             let n_windows = samples.len() / win;
             let mut trim_pos = samples.len();
 
-            if n_windows > 4 {
+            if n_windows > 4 && tail_cleanup {
                 // Compute RMS per window
                 let rms_vals: Vec<f32> = (0..n_windows).map(|w| {
                     let start = w * win;
@@ -1017,56 +1072,10 @@ impl VoiceCloner {
                     (slice.iter().map(|s| s * s).sum::<f32>() / slice.len() as f32).sqrt()
                 }).collect();
 
-                // Walk backwards to find the last "real speech" window
-                // Real speech: RMS > 0.03, and it's part of the main content
-                // (not an isolated burst after silence)
-                let speech_thresh = 0.05f32;  // Raised: breathing (0.02-0.04) now classified as non-speech
-                let silence_thresh = 0.02f32; // Raised: catches breathing sounds that were slipping through
-
-                // Find the cut point by detecting "silence gap after speech"
-                // Walk backwards: skip trailing silence, skip any burst, find silence gap
-                let mut w = n_windows - 1;
-
-                // Phase 1: Skip trailing silence
-                while w > 0 && rms_vals[w] < silence_thresh {
-                    w -= 1;
-                }
-                let last_energy = w; // last window with energy
-
-                // Phase 2: Check if there's a silence gap before this energy block
-                // Walk backwards through the energy block
-                while w > 0 && rms_vals[w] >= silence_thresh {
-                    w -= 1;
-                }
-                let energy_block_start = w + 1;
-
-                // Phase 3: Check if there's a silence gap here
-                let mut gap_count = 0;
-                while w > 0 && rms_vals[w] < silence_thresh {
-                    gap_count += 1;
-                    w -= 1;
-                }
-                let gap_end_window = w + 1; // first window of the silence gap
-
-                // Phase 4: Check if there's speech BEFORE the gap
-                let has_speech_before_gap = w > 2 && rms_vals[..=w].iter().any(|&r| r > speech_thresh);
-
-                // Decision: if there's a silence gap (>= 100ms = 2 windows) between
-                // speech and an isolated energy block, cut at the gap.
-                // Only cut if the burst is short (<20% of total) — long blocks are real speech.
-                let burst_len = last_energy.saturating_sub(energy_block_start) + 1;
-                let burst_is_short = burst_len < n_windows / 5;
-
-                let trim_window_idx = if gap_count >= 2 && has_speech_before_gap && burst_is_short {
-                    // Cut at the start of the silence gap, with small margin
-                    let cut_at = gap_end_window + 1; // keep 1 window into the gap for decay
-                    eprintln!("   [TRIM] Chunk {}: detected silence gap at window {} ({}ms), cutting burst ({} wins) at {}-{}",
-                             i, gap_end_window, gap_end_window * 50, burst_len, energy_block_start, last_energy);
-                    cut_at.min(n_windows)
-                } else {
-                    // No gap pattern — just trim trailing silence
-                    (last_energy + 2).min(n_windows) // +2 windows (100ms) margin
-                };
+                // Decide where to cut: protect a genuine (speech-level) final
+                // syllable while still trimming quiet T2S over-generation
+                // bursts. See `resolve_trim_window`.
+                let trim_window_idx = resolve_trim_window(&rms_vals);
 
                 let trim_pos_new = (trim_window_idx * win).min(samples.len());
 
@@ -1087,7 +1096,7 @@ impl VoiceCloner {
             // Second pass: trim trailing breathing/low-energy tail from the end
             // Walk backwards from trim_pos and remove windows that are below speech threshold
             // but above silence (i.e., breathing artifacts that the burst detector didn't catch)
-            {
+            if tail_cleanup {
                 let breath_thresh = 0.04f32; // breathing is typically 0.02-0.04 RMS
                 let min_speech_windows = 4; // keep at least 200ms of audio
                 let n_windows_trimmed = trim_pos / win;
@@ -1694,28 +1703,32 @@ impl VoiceCloner {
         };
         let mut sampler = Sampler::new(sampling_config);
 
+        // PyTorch applies the repetition penalty against the FULL `y` sequence,
+        // which on EVERY step (including the first) includes the prompt semantic
+        // tokens: infer_panel_naive does sample(logits, y, ...) with y = prompts
+        // at idx 0, then y = prompts + generated thereafter (utils.py:122-128).
+        // Seed the sampler with the prompt tokens so our penalty matches exactly.
+        for &t in &prompt_tokens {
+            sampler.add_token(t);
+        }
         // Python masks EOS during first 11 tokens (idx < 11), so we mask here (idx=0)
-        // IMPORTANT: For first token, DON'T apply penalty to prompt tokens
-        // Python's behavior: penalty is only applied to previously GENERATED tokens
-        // At step 0, there are no generated tokens yet, so no penalty
         let (mut token_id, _) = sampler.sample_with_eos_mask(&last_logits)?;
         semantic_ids = Array::from_slice(&[token_id], &[1, 1]);
         // all_tokens contains prompt + generated (Python behavior: returns prompts + new tokens to VITS)
         // This matches Python's infer_panel which returns pred_semantic that includes prompt semantic
-        let prompt_len = prompt_tokens.len();
         let mut all_tokens: Vec<i32> = prompt_tokens.clone();
         all_tokens.push(token_id);
+        // The first generated token is part of `y` for all subsequent penalty
+        // steps in PyTorch, so add it to the sampler history too.
+        sampler.add_token(token_id);
         // Track number of newly generated tokens (excluding prompt)
         let mut generated_count: usize = 1;
 
-        // Generation bounds - adjusted to match Python's token generation rate
-        // Python generates ~5-8 tokens per phoneme for natural speech
-        // Short text needs more tokens per phoneme for complete pronunciation
-        let tokens_per_phoneme = if phoneme_count <= 10 { 6.0 } else { 4.0 };
-        let _target_tokens = (phoneme_count as f32 * tokens_per_phoneme) as usize;
-        let max_tokens = (phoneme_count * 10).max(100);
-        // min_tokens: Allow EOS after generating at least 4 tokens per phoneme for short text
-        let min_tokens = (phoneme_count as f32 * if phoneme_count <= 10 { 4.0 } else { 3.0 }) as usize;
+        // PyTorch infer_panel_naive caps the AR loop at 1500 steps and otherwise
+        // stops ONLY on EOS (argmax or sampled). There is no per-phoneme length
+        // heuristic, so we don't impose one (it was clipping/short-circuiting).
+        let _ = phoneme_count;
+        let max_tokens = 1500;
 
         // Autoregressive generation
         for step in 1..max_tokens {
@@ -1747,9 +1760,12 @@ impl VoiceCloner {
             };
             token_id = sampled;
 
-            // EOS detection: match Python exactly (line 871):
-            //   if torch.argmax(logits, dim=-1)[0] == self.EOS or samples[0, 0] == self.EOS:
-            //       stop = True
+            // EOS detection — faithful port of PyTorch infer_panel_naive:871:
+            //   if argmax(logits) == EOS  OR  sampled == EOS:  stop
+            // argmax is taken on the raw logits AFTER the idx<11 EOS mask and
+            // BEFORE the repetition penalty, which is exactly how sample_internal
+            // computes `argmax_token`. PyTorch then returns y[:, :-1], i.e. it
+            // drops this final (EOS) token — we likewise do not push token_id.
             let eos_detected = token_id == eos_token || argmax_token == eos_token;
 
             if eos_detected {
@@ -1762,16 +1778,6 @@ impl VoiceCloner {
             sampler.add_token(token_id);
             generated_count += 1;
 
-            // Repetition detection for longer patterns (check only generated portion)
-            if generated_count > min_tokens && detect_repetition(&all_tokens[prompt_len..], 3, 8) {
-                eprintln!("   [T2S] Repetition detected at step {}", generated_count);
-                while generated_count > min_tokens && detect_repetition(&all_tokens[prompt_len..], 3, 5) {
-                    all_tokens.pop();
-                    generated_count -= 1;
-                }
-                break;
-            }
-
             semantic_ids = Array::from_slice(&[token_id], &[1, 1]);
         }
 
@@ -1783,10 +1789,7 @@ impl VoiceCloner {
     /// Vocode semantic tokens to audio
     fn vocode(&mut self, tokens: &[i32], phoneme_ids: &Array, ref_mel: &Array) -> Result<Array, Error> {
         let codes = Array::from_slice(tokens, &[1, 1, tokens.len() as i32]);
-
-        let text_ids = phoneme_ids.squeeze()
-            .map_err(|e| Error::Message(e.to_string()))?;
-        let text_for_vits = text_ids.index(mlx_rs::ops::indexing::NewAxis);
+        let text_for_vits = text_for_vits(phoneme_ids)?;
 
         let audio = self.vits.decode(&codes, &text_for_vits, Some(ref_mel), self.config.noise_scale, self.config.speed)
             .map_err(|e| Error::Message(e.to_string()))?;
@@ -1931,6 +1934,32 @@ fn is_cjk_char(c: char) -> bool {
     )
 }
 
+fn text_for_vits(phoneme_ids: &Array) -> Result<Array, Error> {
+    match phoneme_ids.shape().len() {
+        2 => Ok(phoneme_ids.clone()),
+        1 => Ok(phoneme_ids.index(mlx_rs::ops::indexing::NewAxis)),
+        rank => Err(Error::Message(format!(
+            "VITS text expects rank 1 or 2 phoneme IDs, got rank {rank}"
+        ))),
+    }
+}
+
+#[cfg(test)]
+mod vocode_shape_tests {
+    use super::*;
+    use mlx_rs::transforms::eval;
+
+    #[test]
+    fn should_preserve_2d_vits_text_shape_when_single_phoneme() {
+        let phoneme_ids = Array::from_slice(&[42i32], &[1, 1]);
+
+        let text = text_for_vits(&phoneme_ids).expect("shape conversion should succeed");
+        eval([&text]).expect("text shape should evaluate");
+
+        assert_eq!(text.shape(), &[1, 1]);
+    }
+}
+
 /// Python-compatible `cut5` text segmentation: split at every punctuation mark,
 /// then merge short segments (< threshold chars) with the next segment.
 /// This matches the dora-primespeech `cut5` method + `merge_short_text_in_array(5)`.
@@ -1958,6 +1987,75 @@ fn count_english_word2ph_entries(text: &str) -> usize {
     count
 }
 
+/// Sentence-level split (extends GPT-SoVITS `cut3`). Splits ONLY on true
+/// sentence terminators — `。！？!?` and newlines, NEVER commas/colons/`.` (to
+/// avoid breaking sub-sentence clauses or decimals like "18.5") — so each chunk
+/// is a complete sentence. This keeps the AR pass stable (no sub-sentence
+/// fragment repeats) while bounding per-pass length so long replies don't blow
+/// up AR latency or hit the 1500-token cap. The terminating punctuation is kept
+/// on each sentence so prosody (e.g. ？ rising tone) is preserved.
+fn cut3_split(text: &str) -> Vec<String> {
+    let text = text.trim_matches('\n').trim();
+    if text.is_empty() {
+        return vec![];
+    }
+    let enders: &[char] = &['。', '！', '？', '!', '?'];
+    let split_set: &[char] = &['，', '。', '？', '！', ',', '.', '?', '!', '~', ':', '：', '—', '…', '、', '；'];
+
+    let mut sentences: Vec<String> = Vec::new();
+    let mut cur = String::new();
+    for ch in text.chars() {
+        if ch == '\n' {
+            if !cur.trim().is_empty() {
+                sentences.push(std::mem::take(&mut cur));
+            } else {
+                cur.clear();
+            }
+        } else {
+            cur.push(ch);
+            if enders.contains(&ch) {
+                sentences.push(std::mem::take(&mut cur));
+            }
+        }
+    }
+    if !cur.trim().is_empty() {
+        sentences.push(cur);
+    }
+
+    sentences
+        .into_iter()
+        .map(|s| s.trim().to_string())
+        .filter(|s| !s.is_empty())
+        .filter(|s| s.chars().any(|c| c.is_alphanumeric() || is_cjk_char(c)))
+        .map(|mut s| {
+            if !s.ends_with(split_set) {
+                s.push('。');
+            }
+            s
+        })
+        .collect()
+}
+
+/// PyTorch moyoyo `cut0` ("不切"): no splitting. Returns the whole text as a
+/// single chunk after dropping pure-punctuation/empty input and appending a
+/// trailing "。" if it doesn't already end on a split punctuation. This matches
+/// `text_split_method="cut0"` used by every moyoyo speaker config, feeding the
+/// AR one fragment so short clauses can't destabilise into phrase repeats.
+#[allow(dead_code)]
+fn cut0_split(text: &str) -> Vec<String> {
+    let text = text.trim_matches('\n').trim();
+    if text.is_empty() || !text.chars().any(|c| c.is_alphanumeric() || is_cjk_char(c)) {
+        return vec![];
+    }
+    let splits_set: &[char] = &['，', '。', '？', '！', ',', '.', '?', '!', '~', ':', '：', '—', '…', '、', '；'];
+    let mut t = text.to_string();
+    if !t.ends_with(splits_set) {
+        t.push('。');
+    }
+    vec![t]
+}
+
+#[allow(dead_code)]
 fn cut5_split(text: &str) -> Vec<String> {
     let text = text.trim_matches('\n');
     if text.is_empty() {
@@ -2379,6 +2477,64 @@ fn array_to_f32_samples(audio: &Array) -> Result<Vec<f32>, Error> {
     Ok(flat.as_slice().to_vec())
 }
 
+/// Decide where (in 50ms-window units) to trim a chunk's trailing samples,
+/// given per-window RMS levels. Caller guarantees `rms_vals.len() > 4`.
+///
+/// The trailing energy block is treated as spurious T2S over-generation (and
+/// cut at the preceding silence gap) ONLY when it is both short AND sub-speech
+/// in level. A genuine final syllable is speech-level and is kept — this is the
+/// fix for the "末字被吞" failure where e.g. "今天天气真不[~100ms gap]错" had 错
+/// trimmed as if it were a noise burst. Quiet (breathing-level) trailing noise
+/// is still cut, preserving the original over-generation cleanup.
+fn resolve_trim_window(rms_vals: &[f32]) -> usize {
+    let n_windows = rms_vals.len();
+    let speech_thresh = 0.05f32; // breathing (0.02-0.04) is below this
+    let silence_thresh = 0.02f32;
+
+    // Phase 1: skip trailing silence.
+    let mut w = n_windows - 1;
+    while w > 0 && rms_vals[w] < silence_thresh {
+        w -= 1;
+    }
+    let last_energy = w;
+
+    // Phase 2: walk back through the trailing energy block.
+    while w > 0 && rms_vals[w] >= silence_thresh {
+        w -= 1;
+    }
+    let energy_block_start = w + 1;
+
+    // Phase 3: count a silence gap immediately before that block.
+    let mut gap_count = 0;
+    while w > 0 && rms_vals[w] < silence_thresh {
+        gap_count += 1;
+        w -= 1;
+    }
+    let gap_end_window = w + 1; // first window of the silence gap
+
+    // Phase 4: is there real speech before the gap?
+    let has_speech_before_gap = w > 2 && rms_vals[..=w].iter().any(|&r| r > speech_thresh);
+
+    let burst_len = last_energy.saturating_sub(energy_block_start) + 1;
+    let burst_is_short = burst_len < n_windows / 5;
+    // A genuine final syllable is speech-level; only quiet trailing blocks are
+    // real over-generation worth cutting. (`get` guards the degenerate
+    // all-silence case where the block range would be empty.)
+    let burst_max_rms = rms_vals
+        .get(energy_block_start..=last_energy)
+        .map(|s| s.iter().copied().fold(0.0f32, f32::max))
+        .unwrap_or(0.0);
+    let burst_is_speech = burst_max_rms > speech_thresh;
+
+    if gap_count >= 2 && has_speech_before_gap && burst_is_short && !burst_is_speech {
+        // Cut at the silence gap, keeping one window into it for natural decay.
+        (gap_end_window + 1).min(n_windows)
+    } else {
+        // No spurious-burst pattern — just trim trailing silence (+100ms margin).
+        (last_energy + 2).min(n_windows)
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -2394,5 +2550,44 @@ mod tests {
         let tokens = vec![1, 2, 3, 1, 2, 3, 1, 2, 3];
         assert!(detect_repetition(&tokens, 3, 3));
         assert!(!detect_repetition(&tokens, 3, 4));
+    }
+
+    // resolve_trim_window: where to cut a chunk's trailing samples (in 50ms
+    // window units) given per-window RMS. Protects genuine final syllables.
+    const SP: f32 = 0.10; // speech-level window
+    const SI: f32 = 0.005; // silence window
+    const BR: f32 = 0.03; // breathing / quiet over-gen window (sub-speech)
+
+    #[test]
+    fn keeps_a_speech_level_final_syllable_after_a_short_gap() {
+        // "今天天气真不[gap]错" — the final syllable 错 sits above speech level
+        // after a ~100ms gap. The old heuristic cut it as a "noise burst"; it
+        // must now be kept.
+        let mut rms = vec![SP; 16];
+        rms.extend_from_slice(&[SI, SI]); // ~100ms gap
+        rms.extend_from_slice(&[0.15, 0.15, 0.15]); // 错 (speech level)
+        rms.extend_from_slice(&[SI, SI, SI]); // trailing silence
+        // Keep through the final syllable (window 20) + margin, not cut at the gap.
+        assert!(resolve_trim_window(&rms) >= 21);
+    }
+
+    #[test]
+    fn cuts_a_quiet_over_generation_burst_after_a_gap() {
+        // Same shape, but the trailing block is breathing-level noise — this is
+        // the real T2S over-generation the trim was built for: cut at the gap.
+        let mut rms = vec![SP; 16];
+        rms.extend_from_slice(&[SI, SI]);
+        rms.extend_from_slice(&[BR, BR, BR]); // quiet burst
+        rms.extend_from_slice(&[SI, SI, SI]);
+        // Cut at the gap (~window 16-17), dropping the quiet burst at 18-20.
+        assert!(resolve_trim_window(&rms) <= 18);
+    }
+
+    #[test]
+    fn trims_only_trailing_silence_when_there_is_no_gap_burst() {
+        let mut rms = vec![SP; 20];
+        rms.extend_from_slice(&[SI, SI, SI, SI]); // pure trailing silence
+        let pos = resolve_trim_window(&rms);
+        assert!((20..=22).contains(&pos), "expected ~last_energy+margin, got {pos}");
     }
 }
