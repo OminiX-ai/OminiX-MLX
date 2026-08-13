@@ -62,3 +62,44 @@ pub fn default_model_path() -> std::path::PathBuf {
 pub fn load_model(model_dir: impl AsRef<std::path::Path>) -> Result<Qwen3ASR, Error> {
     Qwen3ASR::load(model_dir)
 }
+
+/// Whether the linked MLX build can decode a batch correctly.
+///
+/// MLX before 0.32.0 mis-handles RoPE when the sequence length is 1 and the
+/// batch is larger than 1: rows after the first come back wrong, frequently all
+/// zeros. Verified broken on 0.30.1 (the version this workspace pins), 0.30.3,
+/// 0.30.6, 0.31.0, 0.31.1 and 0.31.2; correct on 0.32.0.
+///
+/// That is precisely the shape every batched decode step uses, so on an affected
+/// build [`Qwen3ASR::transcribe_batch`] would return fluent-looking but wrong
+/// transcripts for all but the first item — a silent corruption rather than an
+/// error. Callers should probe once at startup and fall back to single-request
+/// decoding when this returns `false`.
+///
+/// The probe runs RoPE over two identical rows at sequence length 1 and checks
+/// they come back identical, which is the exact defect rather than a version
+/// string comparison — so a patched or vendored build is judged on behaviour.
+pub fn batched_decode_supported() -> bool {
+    fn probe() -> std::result::Result<bool, mlx_rs::error::Exception> {
+        use mlx_rs::builder::Builder;
+        use mlx_rs::module::Module;
+        use mlx_rs::ops::indexing::IndexOp;
+
+        const DIMS: i32 = 8;
+        let mut rope = mlx_rs_core::initialize_rope(DIMS, 10000.0, false, &None, 4096)?;
+
+        // Two identical rows, one position: [batch 2, heads 1, seq 1, dims].
+        let ones = [1.0f32; (2 * DIMS) as usize];
+        let x = mlx_rs::Array::from_slice(&ones, &[2, 1, 1, DIMS]);
+
+        let out = rope.forward(
+            mlx_rs::nn::RopeInputBuilder::new(&x).offset(3).build()?,
+        )?;
+
+        let diff = out.index(0).subtract(out.index(1))?.abs()?.max(None)?;
+        mlx_rs::transforms::eval([&diff])?;
+        Ok(diff.item::<f32>() == 0.0)
+    }
+
+    probe().unwrap_or(false)
+}

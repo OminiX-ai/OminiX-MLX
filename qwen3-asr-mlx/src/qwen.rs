@@ -326,6 +326,23 @@ impl QwenModel {
         embeddings: &Array,
         cache: &mut Vec<Option<KVCache>>,
     ) -> std::result::Result<Array, mlx_rs::error::Exception> {
+        self.forward_embeddings_masked(embeddings, cache, None)
+    }
+
+    /// Forward pass with an explicit attention mask.
+    ///
+    /// Batched decoding left-pads prompts to a common length, so the model must
+    /// be told not to attend to the pad region. `mask` is an additive float mask
+    /// broadcastable to `[batch, n_heads, q_len, k_len]` — `0.0` where attention
+    /// is allowed and a large negative value where it is not. Passing `None`
+    /// keeps the single-sequence behaviour (causal for a prompt, unmasked for a
+    /// one-token decode step).
+    pub fn forward_embeddings_masked(
+        &mut self,
+        embeddings: &Array,
+        cache: &mut Vec<Option<KVCache>>,
+        mask: Option<&Array>,
+    ) -> std::result::Result<Array, mlx_rs::error::Exception> {
         if cache.len() != self.layers.len() {
             cache.resize_with(self.layers.len(), || Some(KVCache::new()));
         }
@@ -333,7 +350,7 @@ impl QwenModel {
         let mut h = embeddings.clone();
 
         for (layer, layer_cache) in self.layers.iter_mut().zip(cache.iter_mut()) {
-            h = layer.forward_with_cache(&h, layer_cache, None)?;
+            h = layer.forward_with_cache(&h, layer_cache, mask)?;
         }
 
         self.norm.forward(&h)

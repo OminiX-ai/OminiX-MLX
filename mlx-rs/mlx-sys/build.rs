@@ -118,6 +118,32 @@ fn download_prebuilt() -> PathBuf {
 
 // ─── Metallib placement ─────────────────────────────────────────
 
+/// Copy a runtime artifact into the cargo profile directory, next to the
+/// executable that will load it.
+fn copy_beside_executable(src: &PathBuf, name: &str) {
+    if !src.exists() {
+        return;
+    }
+    // OUT_DIR is like <workspace>/target/release/build/mlx-sys-<hash>/out;
+    // walk up to <workspace>/target/release/.
+    let out_dir = PathBuf::from(env::var("OUT_DIR").unwrap());
+    let mut dir = out_dir.as_path();
+    while let Some(parent) = dir.parent() {
+        if dir.file_name().map(|f| f == "build").unwrap_or(false) {
+            let dest = parent.join(name);
+            let src_len = fs::metadata(src).map(|m| m.len()).unwrap_or(0);
+            let dst_len = fs::metadata(&dest).map(|m| m.len()).unwrap_or(0);
+            if !dest.exists() || src_len != dst_len {
+                println!("cargo:warning=Copying {} to {}", name, dest.display());
+                let _ = fs::copy(src, &dest);
+            }
+            return;
+        }
+        dir = parent;
+    }
+    println!("cargo:warning=Could not determine target directory for {}", name);
+}
+
 fn copy_metallib_to_target_dir(metallib_src: &PathBuf) {
     if !metallib_src.exists() {
         return;
@@ -158,7 +184,34 @@ fn link_prebuilt(prebuilt_dir: &PathBuf) {
         "cargo:rustc-link-search=native={}",
         prebuilt_dir.display()
     );
-    println!("cargo:rustc-link-lib=static=mlx");
+
+    // MLX may be supplied either as a static archive or as a dylib. The dylib
+    // form is what ships in the official `mlx-metal` wheel, which is the only
+    // way to obtain a build of MLX's Metal kernels without the Metal compiler
+    // (it lives in full Xcode, not the Command Line Tools).
+    if prebuilt_dir.join("libmlx.dylib").exists() {
+        println!("cargo:rustc-link-lib=dylib=mlx");
+        if prebuilt_dir.join("libjaccl.dylib").exists() {
+            println!("cargo:rustc-link-lib=dylib=jaccl");
+        }
+        // Stage the dylibs beside the executable, as is already done for the
+        // metallib, so the build output is self-contained.
+        //
+        // Their install names are @rpath-relative, so the executable still needs
+        // an rpath. Cargo ignores `rustc-link-arg` from a *dependency's* build
+        // script, so this crate cannot add it — the top-level build must pass
+        //     RUSTFLAGS="-C link-arg=-Wl,-rpath,@loader_path"
+        // which resolves against the executable's own directory.
+        for lib in ["libmlx.dylib", "libjaccl.dylib"] {
+            let src = prebuilt_dir.join(lib);
+            if src.exists() {
+                copy_beside_executable(&src, lib);
+            }
+        }
+    } else {
+        println!("cargo:rustc-link-lib=static=mlx");
+    }
+
     println!("cargo:rustc-link-lib=static=mlxc");
 
     // gguflib may or may not be a separate archive

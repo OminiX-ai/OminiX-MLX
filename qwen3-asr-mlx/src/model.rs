@@ -697,6 +697,218 @@ impl Qwen3ASR {
         self.generate(&inputs_embeds, config)
     }
 
+    /// Transcribe several utterances in one batch.
+    ///
+    /// Decoding is the expensive half of an ASR request and, at batch 1, it is
+    /// limited by memory bandwidth rather than compute: every step streams the
+    /// full weight matrices to produce a single column of output. Running N
+    /// sequences through the same steps re-uses those reads, so throughput rises
+    /// far faster than step time.
+    ///
+    /// Prompts differ in length because utterances differ in length, so they are
+    /// **left-padded** to a common length. Left rather than right padding keeps
+    /// every sequence's final token at the same index, which means one shared
+    /// position offset drives the whole batch and the decode loop needs no
+    /// per-sequence bookkeeping. An additive mask hides the pad region.
+    ///
+    /// The audio encoder still runs per utterance — it is only ~26% of a request
+    /// and batching it would require padding mel frames through the convolutional
+    /// front-end. Decode is where the win is.
+    ///
+    /// Returns one transcript per input, in the order supplied.
+    pub fn transcribe_batch(
+        &mut self,
+        batch: &[&[f32]],
+        language: &str,
+        config: &SamplingConfig,
+    ) -> Result<Vec<String>> {
+        if batch.is_empty() {
+            return Ok(Vec::new());
+        }
+        if batch.len() == 1 {
+            // Nothing to share — avoid the padding and masking overhead entirely.
+            return Ok(vec![self.transcribe_samples_with_config(batch[0], language, config)?]);
+        }
+
+        // 1. Encode each utterance and build its prompt embeddings.
+        let mut per_item: Vec<Array> = Vec::with_capacity(batch.len());
+        for &samples in batch {
+            let mel = self.mel_frontend.compute_mel_spectrogram(samples)?;
+            let audio_features = self.audio_tower.forward_encoder(&mel)?;
+            eval([&audio_features])?;
+
+            let num_audio_tokens = audio_features.shape()[0];
+            let input_ids = self.build_prompt(num_audio_tokens, language)?;
+            let embeds = self.build_inputs_embeds(&input_ids, &audio_features)?;
+            per_item.push(embeds);
+        }
+
+        // 2. Left-pad to a common prompt length.
+        let hidden = self.config.text_config.hidden_size;
+        let max_len = per_item.iter().map(|e| e.shape()[1]).max().unwrap_or(0);
+        let mut padded: Vec<Array> = Vec::with_capacity(per_item.len());
+        let mut pad_lens: Vec<i32> = Vec::with_capacity(per_item.len());
+        for embeds in &per_item {
+            let len = embeds.shape()[1];
+            let pad = max_len - len;
+            pad_lens.push(pad);
+            if pad == 0 {
+                padded.push(embeds.clone());
+            } else {
+                let zeros = mlx_rs::ops::zeros_dtype(&[1, pad, hidden], embeds.dtype())?;
+                padded.push(mlx_rs::ops::concatenate_axis(&[&zeros, embeds], 1)?);
+            }
+        }
+        let refs: Vec<&Array> = padded.iter().collect();
+        let inputs_embeds = mlx_rs::ops::concatenate_axis(&refs, 0)?;
+        eval([&inputs_embeds])?;
+
+        self.generate_batch(&inputs_embeds, &pad_lens, max_len, config)
+    }
+
+    /// Build the additive attention mask for a left-padded batch.
+    ///
+    /// `q_len` is the number of query positions in this call (the whole prompt
+    /// during prefill, 1 per decode step) and `k_len` the number of keys visible
+    /// so far. Blocked positions get a large negative value so softmax drives
+    /// them to zero; allowed positions get 0.
+    fn padding_mask(
+        pad_lens: &[i32],
+        q_len: i32,
+        k_len: i32,
+        causal_from: i32,
+        dtype: mlx_rs::Dtype,
+    ) -> Result<Array> {
+        let b = pad_lens.len();
+        let neg = -1e9f32;
+        let mut data = vec![0.0f32; b * (q_len as usize) * (k_len as usize)];
+        for (bi, &pad) in pad_lens.iter().enumerate() {
+            for qi in 0..q_len {
+                // Absolute position of this query within the padded sequence.
+                let q_abs = causal_from + qi;
+                for ki in 0..k_len {
+                    // A query sitting in the pad region has no legal key to look
+                    // at, and a row of all -inf makes softmax produce NaN — which
+                    // would then spread through the batch. Always leave the
+                    // diagonal open so every row stays finite. Those outputs are
+                    // discarded anyway: left padding means the position we read,
+                    // the last one, is real for every sequence.
+                    if ki == q_abs {
+                        continue;
+                    }
+                    let blocked = ki < pad          // never attend to left padding
+                        || ki > q_abs;              // never attend to the future
+                    if blocked {
+                        let idx = (bi * (q_len as usize) + qi as usize) * (k_len as usize)
+                            + ki as usize;
+                        data[idx] = neg;
+                    }
+                }
+            }
+        }
+        let mask = Array::from_slice(&data, &[b as i32, 1, q_len, k_len]);
+        Ok(mask.as_dtype(dtype)?)
+    }
+
+    /// Batched autoregressive generation over a left-padded prompt batch.
+    fn generate_batch(
+        &mut self,
+        inputs_embeds: &Array,
+        pad_lens: &[i32],
+        prompt_len: i32,
+        config: &SamplingConfig,
+    ) -> Result<Vec<String>> {
+        let b = pad_lens.len();
+        let hidden = self.config.text_config.hidden_size;
+        let mut cache: Vec<Option<KVCache>> = Vec::new();
+        let mut tokens: Vec<Vec<i32>> = vec![Vec::new(); b];
+        let mut finished = vec![false; b];
+        let mut recent: Vec<std::collections::VecDeque<i32>> =
+            vec![std::collections::VecDeque::with_capacity(11); b];
+
+        // Prefill: causal within the real tokens, blind to the pad region.
+        let mask = Self::padding_mask(
+            pad_lens, prompt_len, prompt_len, 0, inputs_embeds.dtype(),
+        )?;
+        let hidden_states =
+            self.model.forward_embeddings_masked(inputs_embeds, &mut cache, Some(&mask))?;
+
+        let last_hidden = hidden_states.index((.., -1, ..)).reshape(&[b as i32, 1, hidden])?;
+        let logits = self.model.compute_logits(&last_hidden)?;
+        let mut next = Self::sample(&logits.index((.., -1, ..)), config)?;
+        eval([&next])?;
+        let mut current: Vec<i32> = Self::token_column(&next, b)?;
+
+        for _ in 0..config.max_tokens {
+            for i in 0..b {
+                if finished[i] {
+                    continue;
+                }
+                let tok = current[i];
+                if self.eos_token_ids.contains(&tok) {
+                    finished[i] = true;
+                    continue;
+                }
+                // Same degenerate-repetition guard as the single-sequence path.
+                recent[i].push_back(tok);
+                if recent[i].len() > 10 {
+                    recent[i].pop_front();
+                }
+                if recent[i].len() >= 10 && recent[i].iter().all(|&t| t == tok) {
+                    finished[i] = true;
+                    continue;
+                }
+                tokens[i].push(tok);
+            }
+            if finished.iter().all(|&f| f) {
+                break;
+            }
+
+            // Finished rows keep stepping with a harmless token; their output is
+            // discarded, which costs nothing extra because the batch steps anyway.
+            let feed: Vec<i32> = (0..b)
+                .map(|i| if finished[i] { 0 } else { current[i] })
+                .collect();
+            let token_array = Array::from_slice(&feed, &[b as i32, 1]);
+            let h = self.model.get_token_embeddings(&token_array)?;
+
+            let k_len = prompt_len + tokens.iter().map(|t| t.len()).max().unwrap_or(0) as i32;
+            let step_mask = Self::padding_mask(
+                pad_lens, 1, k_len, k_len - 1, h.dtype(),
+            )?;
+            let hidden_states =
+                self.model.forward_embeddings_masked(&h, &mut cache, Some(&step_mask))?;
+
+            let last_hidden = hidden_states.index((.., -1, ..)).reshape(&[b as i32, 1, hidden])?;
+            let logits = self.model.compute_logits(&last_hidden)?;
+            next = Self::sample(&logits.index((.., -1, ..)), config)?;
+            eval([&next])?;
+            current = Self::token_column(&next, b)?;
+        }
+
+        tokens.iter().map(|t| self.decode_tokens(t)).collect()
+    }
+
+    /// Read a sampled `[batch]` (or `[batch, 1]`) token array back to host ints.
+    fn token_column(sampled: &Array, b: usize) -> Result<Vec<i32>> {
+        // argmax yields an unsigned index and `categorical` an integer type, so
+        // normalise before reading rather than assuming either.
+        let flat = sampled
+            .reshape(&[-1])?
+            .as_dtype(mlx_rs::Dtype::Int32)?;
+        let slice: &[i32] = flat
+            .try_as_slice::<i32>()
+            .map_err(|e| Error::Inference(format!("Failed to read sampled tokens: {}", e)))?;
+        if slice.len() != b {
+            return Err(Error::Inference(format!(
+                "Sampler returned {} tokens for a batch of {}",
+                slice.len(),
+                b
+            )));
+        }
+        Ok(slice.to_vec())
+    }
+
     /// Build prompt token IDs.
     fn build_prompt(&self, num_audio_tokens: i32, language: &str) -> Result<Array> {
         let tokenizer = self.tokenizer.as_ref()
