@@ -28,6 +28,7 @@ use mlx_rs::{
     array,
     builder::Builder,
     error::Exception,
+    fast,
     module::Module,
     nn::{LayerNorm, LayerNormBuilder, Linear, LinearBuilder, RmsNorm},
     ops,
@@ -462,25 +463,27 @@ impl KleinDoubleBlock {
         let combined_v = ops::concatenate_axis(&[&txt_v, &img_v], 1)?;
 
         // Transpose for attention: [batch, seq, heads, head_dim] -> [batch, heads, seq, head_dim]
-        let img_q = img_q.transpose_axes(&[0, 2, 1, 3])?;
-        let txt_q = txt_q.transpose_axes(&[0, 2, 1, 3])?;
+        // P1.3: single combined-KV attention pass — concat queries on the
+        // sequence axis so one SDPA call covers both streams, then split.
+        let joint_q = ops::concatenate_axis(&[&txt_q, &img_q], 1)?;
+        let joint_q = joint_q.transpose_axes(&[0, 2, 1, 3])?;
         let combined_k = combined_k.transpose_axes(&[0, 2, 1, 3])?;
         let combined_v = combined_v.transpose_axes(&[0, 2, 1, 3])?;
 
-        // Scaled dot-product attention
-        let scale = (self.head_dim as f32).sqrt();
+        // P1.1: fused SDPA — one kernel instead of matmul/scale/softmax/matmul,
+        // and no materialized K^T transpose.
+        let scale = (self.head_dim as f32).sqrt().recip();
+        let attn_out = fast::scaled_dot_product_attention(
+            &joint_q,
+            &combined_k,
+            &combined_v,
+            scale,
+            None,
+        )?;
 
-        // Image attends to combined K/V
-        let img_attn = ops::matmul(&img_q, &combined_k.transpose_axes(&[0, 1, 3, 2])?)?;
-        let img_attn = ops::divide(&img_attn, &array!(scale))?;
-        let img_attn = ops::softmax_axis(&img_attn, -1, None)?;
-        let img_attn_out = ops::matmul(&img_attn, &combined_v)?;
-
-        // Text attends to combined K/V
-        let txt_attn = ops::matmul(&txt_q, &combined_k.transpose_axes(&[0, 1, 3, 2])?)?;
-        let txt_attn = ops::divide(&txt_attn, &array!(scale))?;
-        let txt_attn = ops::softmax_axis(&txt_attn, -1, None)?;
-        let txt_attn_out = ops::matmul(&txt_attn, &combined_v)?;
+        // Split combined output back into txt and img streams
+        let txt_attn_out = attn_out.index((.., .., ..txt_seq, ..));
+        let img_attn_out = attn_out.index((.., .., txt_seq.., ..));
 
         // Transpose back and reshape: [batch, heads, seq, head_dim] -> [batch, seq, hidden]
         let img_attn_out = img_attn_out.transpose_axes(&[0, 2, 1, 3])?;

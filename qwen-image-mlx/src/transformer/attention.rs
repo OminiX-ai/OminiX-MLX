@@ -5,6 +5,7 @@
 use mlx_macros::ModuleParameters;
 use mlx_rs::builder::Builder;
 use mlx_rs::error::Exception;
+use mlx_rs::fast::{self, ScaledDotProductAttentionMask};
 use mlx_rs::module::Module;
 use mlx_rs::nn::{Linear, LinearBuilder, RmsNorm, RmsNormBuilder};
 use mlx_rs::ops;
@@ -130,23 +131,20 @@ impl QwenTransformerAttention {
         let joint_k = ops::concatenate_axis(&[&txt_k, &img_k], 2)?;
         let joint_v = ops::concatenate_axis(&[&txt_v, &img_v], 2)?;
 
-        // Scaled dot-product attention
+        // P1.1: fused SDPA — one kernel instead of matmul/scale/softmax/matmul,
+        // and no materialized K^T transpose. Additive mask maps directly.
         let scale = (self.head_dim as f32).sqrt().recip();
-        let scale_arr = Array::from_f32(scale);
-
-        // Q @ K^T
-        let k_t = joint_k.transpose_axes(&[0, 1, 3, 2])?;
-        let mut attn_weights = ops::matmul(&joint_q, &k_t)?;
-        attn_weights = ops::multiply(&attn_weights, &scale_arr)?;
-
-        // Apply mask if present
-        if let Some(m) = mask {
-            attn_weights = ops::add(&attn_weights, m)?;
-        }
-
-        // Softmax and apply to V
-        attn_weights = ops::softmax_axis(&attn_weights, -1, None)?;
-        let output = ops::matmul(&attn_weights, &joint_v)?;
+        let output = if let Some(m) = mask {
+            fast::scaled_dot_product_attention(
+                &joint_q,
+                &joint_k,
+                &joint_v,
+                scale,
+                ScaledDotProductAttentionMask::Array(m),
+            )?
+        } else {
+            fast::scaled_dot_product_attention(&joint_q, &joint_k, &joint_v, scale, None)?
+        };
 
         // Transpose back: [B, heads, seq, head_dim] -> [B, seq, heads * head_dim]
         let batch = output.dim(0);

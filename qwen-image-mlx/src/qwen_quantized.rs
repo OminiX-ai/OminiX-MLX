@@ -8,6 +8,7 @@ use std::rc::Rc;
 use mlx_macros::ModuleParameters;
 use mlx_rs::builder::Builder;
 use mlx_rs::error::Exception;
+use mlx_rs::fast::{self, ScaledDotProductAttentionMask};
 use mlx_rs::module::{Module, ModuleParameters, Param};
 use mlx_rs::nn::{RmsNorm, RmsNormBuilder};
 use mlx_rs::nn::{QuantizedLinear, QuantizedLinearBuilder};
@@ -213,26 +214,30 @@ impl QwenAttention {
         let k = joint_k.transpose_axes(&[0, 2, 1, 3])?;
         let v = joint_v.transpose_axes(&[0, 2, 1, 3])?;
 
+        // P1.1: fused SDPA — one kernel instead of matmul/scale/softmax/matmul,
+        // and no materialized K^T transpose.
         let scale = 1.0 / (self.head_dim as f32).sqrt();
-        let attn_scores = ops::matmul(&q, &k.transpose_axes(&[0, 1, 3, 2])?)?;
-        let mut attn_scores = ops::multiply(&attn_scores, &Array::from_f32(scale))?;
 
-        // Apply attention mask if provided
-        if let Some(mask) = encoder_hidden_states_mask {
+        // Build additive mask if provided: 0 for real tokens, -1e9 for padding
+        let out = if let Some(mask) = encoder_hidden_states_mask {
             let img_seq = img_modulated.dim(1);
             let ones_img = Array::ones::<f32>(&[batch, img_seq])?;
             let joint_mask = ops::concatenate_axis(&[mask, &ones_img], 1)?;
-            // Convert to additive mask: 0 for real tokens, -1e9 for padding
             let additive_mask = ops::multiply(
                 &ops::subtract(&Array::from_f32(1.0), &joint_mask)?,
                 &Array::from_f32(-1e9),
             )?;
             let additive_mask = additive_mask.reshape(&[batch, 1, 1, txt_seq + img_seq])?;
-            attn_scores = ops::add(&attn_scores, &additive_mask)?;
-        }
-
-        let attn = mlx_rs::ops::softmax_axis(&attn_scores, -1, None)?;
-        let out = ops::matmul(&attn, &v)?;
+            fast::scaled_dot_product_attention(
+                &q,
+                &k,
+                &v,
+                scale,
+                ScaledDotProductAttentionMask::Array(&additive_mask),
+            )?
+        } else {
+            fast::scaled_dot_product_attention(&q, &k, &v, scale, None)?
+        };
 
         // Transpose back and reshape
         let out = out.transpose_axes(&[0, 2, 1, 3])?;
