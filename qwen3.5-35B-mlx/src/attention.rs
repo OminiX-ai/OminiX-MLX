@@ -1,12 +1,6 @@
 use mlx_rs::{
-    builder::Builder,
-    error::Exception,
-    macros::ModuleParameters,
-    module::Module,
-    nn,
-    ops::indexing::IndexOp,
-    quantization::MaybeQuantized,
-    Array,
+    builder::Builder, error::Exception, macros::ModuleParameters, module::Module, nn,
+    ops::indexing::IndexOp, quantization::MaybeQuantized, Array,
 };
 use mlx_rs_core::{
     cache::{KVCache, KeyValueCache},
@@ -55,6 +49,77 @@ impl Module<GatedAttentionInput<'_>> for GatedAttention {
 
     #[allow(non_snake_case)]
     fn forward(&mut self, input: GatedAttentionInput<'_>) -> Result<Self::Output, Self::Error> {
+        self.forward_rotary(input, None)
+    }
+
+    fn training_mode(&mut self, _mode: bool) {}
+}
+
+/// Apply explicit multimodal RoPE to the rotary prefix, preserving the suffix.
+/// Qwen uses split-half pairing, not adjacent real/imaginary pairs.
+pub fn apply_rotary(x: &Array, cos: &Array, sin: &Array) -> Result<Array, Exception> {
+    if x.ndim() != 4 || cos.ndim() != 4 || cos.shape() != sin.shape() {
+        return Err(Exception::custom(
+            "Expected rank-four multimodal rotary inputs",
+        ));
+    }
+    let dim = cos.shape()[3];
+    if dim <= 0
+        || dim % 2 != 0
+        || dim > x.shape()[3]
+        || cos.shape()[2] != x.shape()[2]
+        || !(cos.shape()[0] == 1 || cos.shape()[0] == x.shape()[0])
+        || !(cos.shape()[1] == 1 || cos.shape()[1] == x.shape()[1])
+    {
+        return Err(Exception::custom("Invalid multimodal rotary dimensions"));
+    }
+    let a = x.index((.., .., .., ..dim / 2));
+    let b = x.index((.., .., .., dim / 2..dim));
+    let rotated = mlx_rs::ops::concatenate_axis(&[&b.negative()?, &a], -1)?;
+    let prefix = x
+        .index((.., .., .., ..dim))
+        .multiply(cos)?
+        .add(rotated.multiply(sin)?)?;
+    let suffix = x.index((.., .., .., dim..));
+    mlx_rs::ops::concatenate_axis(&[&prefix.as_dtype(x.dtype())?, &suffix], -1)
+}
+
+#[cfg(test)]
+mod multimodal_tests {
+    use super::apply_rotary;
+    use mlx_rs::{Array, Dtype};
+
+    #[test]
+    fn split_half_rotation_preserves_non_rotary_channels() {
+        let x = Array::from_slice(&[1f32, 2., 3., 4., 9., 10.], &[1, 1, 1, 6]);
+        let cos = Array::zeros::<f32>(&[1, 1, 1, 4]).unwrap();
+        let sin = Array::ones::<f32>(&[1, 1, 1, 4]).unwrap();
+        let y = apply_rotary(&x.as_dtype(Dtype::Bfloat16).unwrap(), &cos, &sin).unwrap();
+        assert_eq!(y.dtype(), Dtype::Bfloat16);
+        let y = y.as_dtype(Dtype::Float32).unwrap();
+        y.eval().unwrap();
+        assert_eq!(y.as_slice::<f32>(), &[-3., -4., 1., 2., 9., 10.]);
+    }
+
+    #[test]
+    fn bad_rotary_shapes_return_errors() {
+        let x = Array::zeros::<f32>(&[1, 2, 3, 8]).unwrap();
+        let scalar = Array::from_f32(0.);
+        assert!(apply_rotary(&x, &scalar, &scalar).is_err());
+        let short = Array::zeros::<f32>(&[1, 1, 2, 4]).unwrap();
+        assert!(apply_rotary(&x, &short, &short).is_err());
+        let odd = Array::zeros::<f32>(&[1, 1, 3, 3]).unwrap();
+        assert!(apply_rotary(&x, &odd, &odd).is_err());
+    }
+}
+
+impl GatedAttention {
+    #[allow(non_snake_case)]
+    pub fn forward_rotary(
+        &mut self,
+        input: GatedAttentionInput<'_>,
+        rotary: Option<(&Array, &Array)>,
+    ) -> Result<Array, Exception> {
         let GatedAttentionInput { x, mask, mut cache } = input;
 
         let shape = x.shape();
@@ -74,9 +139,9 @@ impl Module<GatedAttentionInput<'_>> for GatedAttention {
         let values = self.v_proj.forward(x)?;
 
         // Reshape and transpose to [B, heads, L, head_dim]
-        let mut queries = self.q_norm.forward(
-            &queries.transpose_axes(&[0, 2, 1, 3])?,
-        )?;
+        let mut queries = self
+            .q_norm
+            .forward(&queries.transpose_axes(&[0, 2, 1, 3])?)?;
         let mut keys = self.k_norm.forward(
             &keys
                 .reshape(&[B, L, self.n_kv_heads, -1])?
@@ -86,8 +151,20 @@ impl Module<GatedAttentionInput<'_>> for GatedAttention {
             .reshape(&[B, L, self.n_kv_heads, -1])?
             .transpose_axes(&[0, 2, 1, 3])?;
 
-        // Apply RoPE with cache offset
-        if let Some(cache) = cache.as_mut() {
+        // Image grids use explicit T/H/W positions. Text-only callers retain
+        // the original cache-offset RoPE path.
+        if let Some((cos, sin)) = rotary {
+            queries = apply_rotary(
+                &queries,
+                &cos.as_dtype(queries.dtype())?,
+                &sin.as_dtype(queries.dtype())?,
+            )?;
+            keys = apply_rotary(
+                &keys,
+                &cos.as_dtype(keys.dtype())?,
+                &sin.as_dtype(keys.dtype())?,
+            )?;
+        } else if let Some(cache) = cache.as_ref() {
             let q_input = nn::RopeInputBuilder::new(&queries)
                 .offset(cache.offset())
                 .build()?;
@@ -96,13 +173,14 @@ impl Module<GatedAttentionInput<'_>> for GatedAttention {
                 .offset(cache.offset())
                 .build()?;
             keys = self.rope.forward(k_input)?;
-
-            let (k, v) = cache.update_and_fetch(keys, values)?;
-            keys = k;
-            values = v;
         } else {
             queries = self.rope.forward(nn::RopeInput::new(&queries))?;
             keys = self.rope.forward(nn::RopeInput::new(&keys))?;
+        }
+        if let Some(cache) = cache.as_mut() {
+            let (k, v) = cache.update_and_fetch(keys, values)?;
+            keys = k;
+            values = v;
         }
 
         // Scaled dot-product attention
@@ -123,8 +201,6 @@ impl Module<GatedAttentionInput<'_>> for GatedAttention {
 
         self.o_proj.forward(&gated)
     }
-
-    fn training_mode(&mut self, _mode: bool) {}
 }
 
 impl GatedAttention {
@@ -155,8 +231,7 @@ impl GatedAttention {
             .eps(config.rms_norm_eps)
             .build()?;
 
-        let rope_dims =
-            (head_dim as f32 * config.rope_parameters.partial_rotary_factor) as i32;
+        let rope_dims = (head_dim as f32 * config.rope_parameters.partial_rotary_factor) as i32;
         let rope = initialize_rope(
             rope_dims,
             config.rope_parameters.rope_theta,

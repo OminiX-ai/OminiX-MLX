@@ -46,19 +46,31 @@ impl TransformerBlock {
         mask: Option<&Array>,
         cache: &mut HybridCache,
     ) -> Result<Array, Exception> {
+        self.forward_rotary(x, mask, cache, None)
+    }
+
+    pub fn forward_rotary(
+        &mut self,
+        x: &Array,
+        mask: Option<&Array>,
+        cache: &mut HybridCache,
+        rotary: Option<(&Array, &Array)>,
+    ) -> Result<Array, Exception> {
         let normed = self.input_layernorm.forward(x)?;
 
         let attn_out = match (&mut self.attention, cache) {
-            (AttentionLayer::FullAttention(attn), HybridCache::KV(kv_cache)) => {
-                attn.forward(GatedAttentionInput {
-                    x: &normed,
-                    mask,
-                    cache: Some(kv_cache),
-                })?
-            }
+            (AttentionLayer::FullAttention(attn), HybridCache::KV(kv_cache)) => attn
+                .forward_rotary(
+                    GatedAttentionInput {
+                        x: &normed,
+                        mask,
+                        cache: Some(kv_cache),
+                    },
+                    rotary,
+                )?,
             (AttentionLayer::LinearAttention(delta), HybridCache::Recurrent(rec_cache)) => {
-                let L = normed.shape()[1];
-                if L > 1 {
+                let sequence_length = normed.shape()[1];
+                if sequence_length > 1 {
                     delta.forward_prefill(&normed, rec_cache)?
                 } else {
                     delta.forward_step(&normed, rec_cache)?
@@ -68,7 +80,9 @@ impl TransformerBlock {
         };
 
         let h = x.add(attn_out)?;
-        let mlp_out = self.mlp.forward(&self.post_attention_layernorm.forward(&h)?)?;
+        let mlp_out = self
+            .mlp
+            .forward(&self.post_attention_layernorm.forward(&h)?)?;
         h.add(mlp_out)
     }
 }
@@ -97,7 +111,22 @@ impl Model {
         inputs: &Array,
         cache: &mut Vec<HybridCache>,
     ) -> Result<Array, Exception> {
-        let mut h = self.text_model.embed_tokens.forward(inputs)?;
+        let h = self.text_model.embed_tokens.forward(inputs)?;
+        self.forward_embeddings(h, cache, None)
+    }
+
+    /// Decode caller-supplied text/image embeddings with explicit multimodal RoPE.
+    /// The caller must use this checkpoint's vision tower and matching positions.
+    #[allow(non_snake_case)]
+    pub fn forward_embeddings(
+        &mut self,
+        mut h: Array,
+        cache: &mut Vec<HybridCache>,
+        rotary: Option<(&Array, &Array)>,
+    ) -> Result<Array, Exception> {
+        if h.ndim() != 3 || h.shape()[2] != self.args.text_config.hidden_size {
+            return Err(Exception::custom("Invalid multimodal embedding shape"));
+        }
 
         // Create attention mask (only needed for full attention layers)
         // Use the first KV cache offset for mask creation
@@ -129,7 +158,7 @@ impl Model {
         }
 
         for (layer, c) in self.text_model.layers.iter_mut().zip(cache.iter_mut()) {
-            h = layer.forward(&h, mask.as_ref(), c)?;
+            h = layer.forward_rotary(&h, mask.as_ref(), c, rotary)?;
         }
 
         h = self.text_model.norm.forward(&h)?;
@@ -154,7 +183,7 @@ pub struct WeightMap {
     pub weight_map: HashMap<String, String>,
 }
 
-fn load_all_weights(model_dir: &Path) -> Result<HashMap<String, Array>, Error> {
+pub(crate) fn load_all_weights(model_dir: &Path) -> Result<HashMap<String, Array>, Error> {
     let weights_index = model_dir.join("model.safetensors.index.json");
 
     if weights_index.exists() {
@@ -274,7 +303,11 @@ pub fn load_model(model_dir: impl AsRef<Path>) -> Result<Model, Error> {
     let quant = args.quantization();
     let (group_size, bits) = match quant {
         Some(q) => (q.group_size, q.bits),
-        None => return Err(Error::Model("Only quantized models are supported".to_string())),
+        None => {
+            return Err(Error::Model(
+                "Only quantized models are supported".to_string(),
+            ))
+        }
     };
 
     // Validate config consistency
@@ -508,14 +541,8 @@ fn load_gated_deltanet(
             weights,
             &format!("{}.conv1d.weight", attn_prefix),
         )?),
-        a_log: Param::new(get_weight(
-            weights,
-            &format!("{}.A_log", attn_prefix),
-        )?),
-        dt_bias: Param::new(get_weight(
-            weights,
-            &format!("{}.dt_bias", attn_prefix),
-        )?),
+        a_log: Param::new(get_weight(weights, &format!("{}.A_log", attn_prefix))?),
+        dt_bias: Param::new(get_weight(weights, &format!("{}.dt_bias", attn_prefix))?),
         norm: load_rms_norm(
             weights,
             &format!("{}.norm.weight", attn_prefix),
