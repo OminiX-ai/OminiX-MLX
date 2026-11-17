@@ -2,6 +2,9 @@
 
 Qwen3.5-27B hybrid DeltaNet+Attention inference on Apple Silicon using MLX.
 
+For local multimodal PEAR inference and the AISLE Adora Nano integration, see
+[the PEAR runtime guide](tools/README.md).
+
 Qwen3.5-27B is a 27-billion parameter dense language model with a novel **hybrid architecture**: 48 layers of **Gated DeltaNet** (linear attention with fixed-size recurrent state) interleaved with 16 layers of **Gated Full Attention** (standard attention with partial RoPE and sigmoid output gate). This gives the model O(1) memory complexity for 75% of its layers while retaining full quadratic attention where it matters most.
 
 ## Features

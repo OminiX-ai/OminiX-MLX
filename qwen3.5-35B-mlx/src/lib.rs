@@ -12,6 +12,7 @@ pub mod config;
 pub mod deltanet;
 pub mod mlp;
 pub mod model;
+pub mod vision;
 
 pub use cache::HybridCache;
 pub use config::ModelArgs;
