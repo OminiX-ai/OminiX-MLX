@@ -102,6 +102,7 @@ class VisionModel:
             max_tokens=max_tokens,
             temperature=temperature,
             top_p=top_p,
+            enable_thinking=thinking,
         )
 
 
@@ -318,9 +319,12 @@ def main():
     parser.add_argument(
         "--model", type=Path, required=True, help="Local multimodal MLX checkpoint"
     )
+    parser.add_argument(
+        "--host", choices=["127.0.0.1", "localhost"], default="127.0.0.1"
+    )
     parser.add_argument("--port", type=int, default=8080)
     args = parser.parse_args()
-    with LocalServer(("127.0.0.1", args.port), Handler) as server:
+    with LocalServer((args.host, args.port), Handler) as server:
         server.engine = VisionModel(args.model.expanduser().resolve())
         print(
             f"Serving {server.engine.name} on 127.0.0.1:{server.server_port}",
