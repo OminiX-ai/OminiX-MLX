@@ -1,8 +1,6 @@
 --- a/scripts/serve_qwen38_multitenant.py
 +++ b/scripts/serve_qwen38_multitenant.py
-@@ -14,6 +14,16 @@
- 
- 
+@@ -16,2 +16,12 @@
  def main() -> int:
 +    if "--vision" in sys.argv[1:]:
 +        # Use one local VLM for both text and image-bearing review requests.
@@ -15,5 +13,3 @@
 +        return 0
 +
      use_repository_runtime()
-     if __package__:
-         from .tenant_dflash_cache import install, secure_server_args
