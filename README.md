@@ -204,6 +204,7 @@ OminiX-MLX/
 
 | Model | Crate | Sizes | Notes |
 |-------|-------|-------|-------|
+| Qwen3.8-27B | [Local image chat](qwen38-vision/) | 27B | Ordered inline images and streaming Chat Completions using MLX-VLM |
 | Moxin-7B VLM | `moxin-vlm-mlx` | 7B | DINOv2 + SigLIP + Mistral-7B, 8-bit quantization, 30 tok/s |
 
 ### Speech Recognition (ASR)
