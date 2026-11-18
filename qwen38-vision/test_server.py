@@ -26,7 +26,9 @@ def picture(color):
 class Probe:
     name = "test-model"
 
-    def generate(self, messages, images, max_tokens, temperature, top_p, thinking):
+    def generate(
+        self, messages, images, max_tokens, temperature, top_p, thinking, effort
+    ):
         for text in (["check", "</think>"] if thinking else []) + [
             str([image.getpixel((0, 0)) for image in images]) if images else "text"
         ]:
@@ -110,6 +112,12 @@ class Protocol(unittest.TestCase):
         self.assertEqual(chunks[1]["choices"][0]["delta"], {"content": "[(255, 0, 0)]"})
         self.assertEqual(chunks[-2]["choices"][0]["finish_reason"], "stop")
         self.assertEqual(chunks[-1]["usage"]["total_tokens"], 12)
+
+    def test_openai_reasoning_none_disables_thinking(self):
+        message = json.loads(self.post("hello", reasoning_effort="none"))["choices"][0][
+            "message"
+        ]
+        self.assertEqual(message, {"role": "assistant", "content": "text"})
 
     def test_invalid_input_returns_client_error(self):
         for url in (

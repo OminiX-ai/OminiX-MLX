@@ -16,7 +16,9 @@ python qwen38-vision/server.py --model ./models/Qwen3.8-27B-8bit --port 8080
 Use the directory basename as the model ID. The service binds to IPv4
 loopback. It handles one local inference at a time. It supports text
 answers, optional thinking, token usage, streaming, and images interleaved
-with text across user turns. Model tools, URL fetching and file paths are
+with text across user turns. OpenAI-compatible clients can send
+`reasoning_effort: "none"` for a direct answer or `"low"` for brief thinking.
+The checkpoint defaults to `"xhigh"`. Model tools, URL fetching and file paths are
 outside this review endpoint. Input limits are 32 MiB of JSON and 24 million
 decoded image pixels per request.
 

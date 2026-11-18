@@ -85,7 +85,9 @@ class VisionModel:
         self.name = path.name
         self.model, self.processor = load(str(path), trust_remote_code=False)
 
-    def generate(self, messages, images, max_tokens, temperature, top_p, thinking):
+    def generate(
+        self, messages, images, max_tokens, temperature, top_p, thinking, effort
+    ):
         from mlx_vlm import stream_generate
 
         prompt = self.processor.apply_chat_template(
@@ -93,6 +95,7 @@ class VisionModel:
             tokenize=False,
             add_generation_prompt=True,
             enable_thinking=thinking,
+            reasoning_effort=effort,
         )
         yield from stream_generate(
             self.model,
@@ -176,7 +179,15 @@ class Handler(BaseHTTPRequestHandler):
             template = body.get("chat_template_kwargs", {})
             if not isinstance(template, dict):
                 raise ValueError("Invalid chat template options")
-            thinking = template.get("enable_thinking", True)
+            effort = template.get(
+                "reasoning_effort", body.get("reasoning_effort", "xhigh")
+            )
+            if effort not in ("none", "low", "medium", "high", "xhigh"):
+                raise ValueError("Unsupported reasoning_effort")
+            thinking = template.get("enable_thinking", effort != "none")
+            # Qwen names its highest level xhigh. Explicit template switches take precedence.
+            if effort in ("high", "none"):
+                effort = "xhigh"
             if type(thinking) is not bool:
                 raise ValueError("enable_thinking must be boolean")
             if type(stream) is not bool or not isinstance(options, dict):
@@ -189,7 +200,9 @@ class Handler(BaseHTTPRequestHandler):
         engine = self.server.engine
         from mlx_vlm.server.responses_state import ThinkingStreamState
 
-        result = engine.generate(chat, images, max_tokens, temperature, top_p, thinking)
+        result = engine.generate(
+            chat, images, max_tokens, temperature, top_p, thinking, effort
+        )
         splitter = ThinkingStreamState(enable_thinking=thinking)
         meta = {
             "id": "chatcmpl-" + uuid.uuid4().hex,
