@@ -1,0 +1,2 @@
+mlx-vlm==0.6.3
+Pillow>=10
