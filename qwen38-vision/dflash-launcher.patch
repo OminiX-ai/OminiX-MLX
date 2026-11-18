@@ -1,0 +1,19 @@
+--- a/scripts/serve_qwen38_multitenant.py
++++ b/scripts/serve_qwen38_multitenant.py
+@@ -14,6 +14,16 @@
+ 
+ 
+ def main() -> int:
++    if "--vision" in sys.argv[1:]:
++        # Use one local VLM for both text and image-bearing review requests.
++        import runpy
++        from pathlib import Path
++
++        sys.argv.remove("--vision")
++        entry = Path(__file__).resolve().parents[1] / "qwen38-vision" / "server.py"
++        runpy.run_path(str(entry), run_name="__main__")
++        return 0
++
+     use_repository_runtime()
+     if __package__:
+         from .tenant_dflash_cache import install, secure_server_args

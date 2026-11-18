@@ -13,6 +13,16 @@ hf download mlx-community/Qwen3.8-27B-8bit --local-dir ./models/Qwen3.8-27B-8bit
 python qwen38-vision/server.py --model ./models/Qwen3.8-27B-8bit --port 8080
 ```
 
+Existing DFlash installations that already have
+`scripts/serve_qwen38_multitenant.py` can also select image chat through that
+launcher. With this directory installed at the same repository root, run:
+
+```sh
+git apply --check qwen38-vision/dflash-launcher.patch
+git apply qwen38-vision/dflash-launcher.patch
+python scripts/serve_qwen38_multitenant.py --vision --model ./models/Qwen3.8-27B-8bit
+```
+
 Use the directory basename as the model ID. The service binds to IPv4
 loopback. It handles one local inference at a time. It supports text
 answers, optional thinking, token usage, streaming, and images interleaved
