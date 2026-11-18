@@ -603,8 +603,7 @@ Benchmarks on Apple M3 Max (128GB):
 | mixtral-mlx | [README](mixtral-mlx/README.md) | Mixtral MoE |
 | mistral-mlx | [README](mistral-mlx/README.md) | Mistral 7B |
 | gemma4-mlx | [README](gemma4-mlx/README.md) | Gemma 4 12B text inference |
-| moxin-vlm-mlx | [README](moxin-vlm-mlx/README.md) | Qwen3.8-27B | [Local image chat](qwen38-vision/) | 27B | Ordered inline images and streaming Chat Completions using MLX-VLM |
-| Moxin-7B VLM |
+| moxin-vlm-mlx | [README](moxin-vlm-mlx/README.md) | Moxin-7B VLM |
 | minicpm-sala-mlx | [README](MiniCPM-SALA-MLX/README.md) | MiniCPM-SALA 9B (hybrid attention, 1M context) |
 | ominix-api | [README](ominix-api/README.md) | Unified OpenAI-compatible API server (ASR + TTS + LLM + OCR) |
 | qwen3-tts-mlx | [README](qwen3-tts-mlx/README.md) | Qwen3-TTS (9 speakers, 12 languages, voice cloning, emotion control) |

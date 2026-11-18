@@ -5,7 +5,6 @@ import base64
 import binascii
 import io
 import json
-import math
 import time
 import uuid
 from http.server import BaseHTTPRequestHandler, HTTPServer
@@ -15,8 +14,11 @@ from PIL import Image, ImageOps
 
 MAX_BODY = 32 << 20
 MAX_PIXELS = 24_000_000
-FORMATS = {"data:image/png;base64": "PNG", "data:image/jpeg;base64": "JPEG",
-           "data:image/webp;base64": "WEBP"}
+FORMATS = {
+    "data:image/png;base64": "PNG",
+    "data:image/jpeg;base64": "JPEG",
+    "data:image/webp;base64": "WEBP",
+}
 
 
 def decode_image(url, pixels_left):
@@ -41,7 +43,11 @@ def prepare_messages(messages):
     chat, images = [], []
     pixels_left = MAX_PIXELS
     for msg in messages:
-        if not isinstance(msg, dict) or msg.get("role") not in ("system", "user", "assistant"):
+        if not isinstance(msg, dict) or msg.get("role") not in (
+            "system",
+            "user",
+            "assistant",
+        ):
             raise ValueError("Expected system, user or assistant message")
         content = msg.get("content")
         if isinstance(content, str):
@@ -57,7 +63,9 @@ def prepare_messages(messages):
                 parts.append({"type": "text", "text": part["text"]})
             elif msg["role"] == "user" and part.get("type") == "image_url":
                 ref = part.get("image_url")
-                image = decode_image(ref.get("url") if isinstance(ref, dict) else None, pixels_left)
+                image = decode_image(
+                    ref.get("url") if isinstance(ref, dict) else None, pixels_left
+                )
                 pixels_left -= image.width * image.height
                 images.append(image)
                 parts.append({"type": "image"})
@@ -81,17 +89,25 @@ class VisionModel:
         from mlx_vlm import stream_generate
 
         prompt = self.processor.apply_chat_template(
-            messages, tokenize=False, add_generation_prompt=True, enable_thinking=thinking
+            messages,
+            tokenize=False,
+            add_generation_prompt=True,
+            enable_thinking=thinking,
         )
         yield from stream_generate(
-            self.model, self.processor, prompt, image=images or None,
-            max_tokens=max_tokens, temperature=temperature, top_p=top_p,
+            self.model,
+            self.processor,
+            prompt,
+            image=images or None,
+            max_tokens=max_tokens,
+            temperature=temperature,
+            top_p=top_p,
         )
 
 
 def number(body, key, default, low, high):
     value = body.get(key, default)
-    if type(value) not in (int, float) or not math.isfinite(value) or not low <= value <= high:
+    if type(value) not in (int, float) or not low <= value <= high:
         raise ValueError(f"{key} must be between {low} and {high}")
     return value
 
@@ -112,8 +128,19 @@ class Handler(BaseHTTPRequestHandler):
 
     def do_GET(self):
         if self.path == "/v1/models":
-            self.json_response(200, {"object": "list", "data": [{
-                "id": self.server.engine.name, "object": "model", "owned_by": "local"}]})
+            self.json_response(
+                200,
+                {
+                    "object": "list",
+                    "data": [
+                        {
+                            "id": self.server.engine.name,
+                            "object": "model",
+                            "owned_by": "local",
+                        }
+                    ],
+                },
+            )
         else:
             self.error(404, "Unknown route")
 
@@ -121,10 +148,15 @@ class Handler(BaseHTTPRequestHandler):
         if self.path != "/v1/chat/completions":
             self.error(404, "Unknown route")
             return
+        if self.headers.get_content_type() != "application/json":
+            self.error(415, "Expected application/json")
+            return
         try:
             size = int(self.headers.get("Content-Length", "-1"))
             if not 0 < size <= MAX_BODY:
-                self.error(413 if size > MAX_BODY else 411, "Expected bounded Content-Length")
+                self.error(
+                    413 if size > MAX_BODY else 411, "Expected bounded Content-Length"
+                )
                 return
             body = json.loads(self.rfile.read(size))
             if not isinstance(body, dict):
@@ -158,12 +190,18 @@ class Handler(BaseHTTPRequestHandler):
 
         result = engine.generate(chat, images, max_tokens, temperature, top_p, thinking)
         splitter = ThinkingStreamState(enable_thinking=thinking)
-        meta = {"id": "chatcmpl-" + uuid.uuid4().hex, "model": engine.name,
-                "created": int(time.time()), "object": "chat.completion.chunk" if stream else "chat.completion"}
+        meta = {
+            "id": "chatcmpl-" + uuid.uuid4().hex,
+            "model": engine.name,
+            "created": int(time.time()),
+            "object": "chat.completion.chunk" if stream else "chat.completion",
+        }
         started = False
 
         def event(value):
-            self.wfile.write(b"data: " + json.dumps(value, ensure_ascii=False).encode() + b"\n\n")
+            self.wfile.write(
+                b"data: " + json.dumps(value, ensure_ascii=False).encode() + b"\n\n"
+            )
             self.wfile.flush()
 
         try:
@@ -173,7 +211,18 @@ class Handler(BaseHTTPRequestHandler):
                 self.send_header("Cache-Control", "no-cache")
                 self.end_headers()
                 started = True
-                event({**meta, "choices": [{"index": 0, "delta": {"role": "assistant"}, "finish_reason": None}]})
+                event(
+                    {
+                        **meta,
+                        "choices": [
+                            {
+                                "index": 0,
+                                "delta": {"role": "assistant"},
+                                "finish_reason": None,
+                            }
+                        ],
+                    }
+                )
             content, reasoning = [], []
             last = None
             for last in result:
@@ -184,7 +233,14 @@ class Handler(BaseHTTPRequestHandler):
                 if split.reasoning:
                     delta["reasoning_content"] = split.reasoning
                 if stream and delta:
-                    event({**meta, "choices": [{"index": 0, "delta": delta, "finish_reason": None}]})
+                    event(
+                        {
+                            **meta,
+                            "choices": [
+                                {"index": 0, "delta": delta, "finish_reason": None}
+                            ],
+                        }
+                    )
                 elif not stream:
                     content.append(split.content or "")
                     reasoning.append(split.reasoning or "")
@@ -193,14 +249,35 @@ class Handler(BaseHTTPRequestHandler):
             if splitter.buffer:
                 field = "reasoning_content" if splitter.in_thinking else "content"
                 if stream:
-                    event({**meta, "choices": [{"index": 0, "delta": {field: splitter.buffer}, "finish_reason": None}]})
+                    event(
+                        {
+                            **meta,
+                            "choices": [
+                                {
+                                    "index": 0,
+                                    "delta": {field: splitter.buffer},
+                                    "finish_reason": None,
+                                }
+                            ],
+                        }
+                    )
                 else:
-                    (reasoning if splitter.in_thinking else content).append(splitter.buffer)
+                    (reasoning if splitter.in_thinking else content).append(
+                        splitter.buffer
+                    )
             finish = last.finish_reason or "stop"
-            usage = {"prompt_tokens": last.prompt_tokens, "completion_tokens": last.generation_tokens,
-                     "total_tokens": last.total_tokens}
+            usage = {
+                "prompt_tokens": last.prompt_tokens,
+                "completion_tokens": last.generation_tokens,
+                "total_tokens": last.total_tokens,
+            }
             if stream:
-                event({**meta, "choices": [{"index": 0, "delta": {}, "finish_reason": finish}]})
+                event(
+                    {
+                        **meta,
+                        "choices": [{"index": 0, "delta": {}, "finish_reason": finish}],
+                    }
+                )
                 if options.get("include_usage"):
                     event({**meta, "choices": [], "usage": usage})
                 self.wfile.write(b"data: [DONE]\n\n")
@@ -209,8 +286,16 @@ class Handler(BaseHTTPRequestHandler):
                 message = {"role": "assistant", "content": "".join(content)}
                 if any(reasoning):
                     message["reasoning_content"] = "".join(reasoning)
-                self.json_response(200, {**meta, "choices": [{"index": 0, "message": message,
-                                    "finish_reason": finish}], "usage": usage})
+                self.json_response(
+                    200,
+                    {
+                        **meta,
+                        "choices": [
+                            {"index": 0, "message": message, "finish_reason": finish}
+                        ],
+                        "usage": usage,
+                    },
+                )
         except (BrokenPipeError, ConnectionResetError):
             pass
         except Exception as exc:
@@ -230,12 +315,17 @@ class LocalServer(HTTPServer):
 
 def main():
     parser = argparse.ArgumentParser(description=__doc__)
-    parser.add_argument("--model", type=Path, required=True, help="Local multimodal MLX checkpoint")
+    parser.add_argument(
+        "--model", type=Path, required=True, help="Local multimodal MLX checkpoint"
+    )
     parser.add_argument("--port", type=int, default=8080)
     args = parser.parse_args()
     with LocalServer(("127.0.0.1", args.port), Handler) as server:
         server.engine = VisionModel(args.model.expanduser().resolve())
-        print(f"Serving {server.engine.name} on 127.0.0.1:{server.server_port}", flush=True)
+        print(
+            f"Serving {server.engine.name} on 127.0.0.1:{server.server_port}",
+            flush=True,
+        )
         server.serve_forever()
 
 
