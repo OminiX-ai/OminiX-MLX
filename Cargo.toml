@@ -51,6 +51,7 @@ members = [
     "qwen3-tts-mlx",
     "qwen3.5-35B-mlx",
     "deepseek-ocr2-mlx",
+    "paddleocr-vl-mlx",
     "qwen3-vl-mlx",
     "gemma4-mlx",
     "xtask",

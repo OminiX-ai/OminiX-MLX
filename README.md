@@ -228,6 +228,15 @@ OminiX-MLX/
 | Model | Crate | Features | Performance |
 |-------|-------|----------|-------------|
 | DeepSeek-OCR-2 | `deepseek-ocr2-mlx` | Vision-language OCR, PDF support | — |
+| PaddleOCR-VL-1.6 | `paddleocr-vl-mlx` | Native BF16 text spotting with per-line quadrilaterals | — |
+
+With the official PaddleOCR-VL-1.6 BF16 checkpoint downloaded to a local directory:
+
+```sh
+cargo run --release -p paddleocr-vl-mlx -- --model-dir /path/to/PaddleOCR-VL-1.6 --image page-01.png page-02.png
+```
+
+The CLI loads the model once and writes one JSON record per image. Each record includes the transcription, four corners per text region in original-image pixels, and a `finished` flag indicating whether generation reached the end token. The Rust library exposes the same operation through `PaddleOcr::spot`.
 
 ### Image Generation (Supported Models)
 
