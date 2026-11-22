@@ -1,0 +1,14 @@
+[package]
+name = "paddleocr-vl"
+version = "0.1.0"
+category = "ocr"
+description = "PaddleOCR-VL-1.6 line transcription and quadrilateral text spotting"
+
+[capabilities]
+document = true
+grounding = true
+
+[models.default]
+repo = "PaddlePaddle/PaddleOCR-VL-1.6"
+size_gb = 1.9
+required = true
